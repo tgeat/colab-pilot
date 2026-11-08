@@ -1,0 +1,1330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Colab Pilot — Google Colab 虚拟机与 24h+ 接力训练可视化管控台</title>
+  <style>
+    :root {
+      --bg-primary: #0b0f19;
+      --bg-secondary: #111827;
+      --bg-card: #161f33;
+      --bg-card-inner: #0f172a;
+      --border-color: #26334d;
+      --border-highlight: #3b82f6;
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --accent-blue: #3b82f6;
+      --accent-indigo: #6366f1;
+      --accent-green: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-red: #ef4444;
+      --accent-purple: #8b5cf6;
+      --radius-lg: 14px;
+      --radius-md: 10px;
+      --radius-sm: 6px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at 15% 0%, #172554 0%, var(--bg-primary) 45%);
+      color: var(--text-primary);
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+
+    /* 顶部导航栏 */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(15, 23, 42, 0.88);
+      backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--border-color);
+      padding: 14px 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-logo {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 20px;
+      color: #fff;
+      box-shadow: 0 4px 14px rgba(59, 130, 246, 0.4);
+    }
+
+    .brand-title {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+    }
+
+    .brand-sub {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    /* 顶部全局计费与状态指标栏 */
+    .metrics-strip {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .metric-pill {
+      background: rgba(30, 41, 59, 0.75);
+      border: 1px solid var(--border-color);
+      border-radius: 999px;
+      padding: 6px 14px;
+      font-size: 12.5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .metric-pill .label {
+      color: var(--text-secondary);
+    }
+
+    .metric-pill .val {
+      font-weight: 700;
+      font-family: "JetBrains Mono", Consolas, monospace;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+
+    .dot-green {
+      background: var(--accent-green);
+      box-shadow: 0 0 8px var(--accent-green);
+    }
+
+    .dot-amber {
+      background: var(--accent-amber);
+      box-shadow: 0 0 8px var(--accent-amber);
+    }
+
+    .dot-red {
+      background: var(--accent-red);
+      box-shadow: 0 0 8px var(--accent-red);
+    }
+
+    /* 右上角操作区与加号新增按钮 */
+    .topbar-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .btn {
+      border: 1px solid var(--border-color);
+      background: #1e293b;
+      color: var(--text-primary);
+      padding: 8px 14px;
+      border-radius: var(--radius-md);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.18s ease;
+    }
+
+    .btn:hover:not(:disabled) {
+      background: #334155;
+      border-color: #475569;
+    }
+
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .btn-add-vm {
+      background: linear-gradient(135deg, #2563eb, #4f46e5);
+      border-color: #60a5fa;
+      color: #ffffff;
+      padding: 9px 18px;
+      font-size: 14px;
+      font-weight: 700;
+      box-shadow: 0 4px 16px rgba(37, 99, 235, 0.45);
+    }
+
+    .btn-add-vm:hover:not(:disabled) {
+      background: linear-gradient(135deg, #1d4ed8, #4338ca);
+      transform: translateY(-1px);
+    }
+
+    .btn-add-vm .plus-icon {
+      font-size: 18px;
+      line-height: 1;
+      font-weight: 800;
+    }
+
+    .btn-success {
+      background: rgba(16, 185, 129, 0.18);
+      border-color: rgba(16, 185, 129, 0.5);
+      color: #34d399;
+    }
+
+    .btn-success:hover:not(:disabled) {
+      background: rgba(16, 185, 129, 0.3);
+    }
+
+    .btn-warning {
+      background: rgba(245, 158, 11, 0.18);
+      border-color: rgba(245, 158, 11, 0.5);
+      color: #fbbf24;
+    }
+
+    .btn-warning:hover:not(:disabled) {
+      background: rgba(245, 158, 11, 0.3);
+    }
+
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.16);
+      border-color: rgba(239, 68, 68, 0.45);
+      color: #f87171;
+    }
+
+    .btn-danger:hover:not(:disabled) {
+      background: rgba(239, 68, 68, 0.28);
+    }
+
+    /* 主容器与独立虚拟机卡片网格 */
+    .main-container {
+      max-width: 1600px;
+      margin: 0 auto;
+      padding: 24px 28px 60px;
+    }
+
+    .vm-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(680px, 1fr));
+      gap: 22px;
+    }
+
+    @media (max-width: 768px) {
+      .vm-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* 空状态占位 */
+    .empty-state {
+      background: rgba(22, 31, 51, 0.75);
+      border: 1px dashed #334155;
+      border-radius: var(--radius-lg);
+      padding: 56px 28px;
+      text-align: center;
+      margin-top: 16px;
+    }
+
+    .empty-state h2 {
+      font-size: 20px;
+      margin-bottom: 8px;
+    }
+
+    .empty-state p {
+      color: var(--text-secondary);
+      font-size: 14px;
+      max-width: 560px;
+      margin: 0 auto 20px;
+    }
+
+    /* 单个独立虚拟机卡片 */
+    .vm-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      transition: border-color 0.2s ease;
+    }
+
+    .vm-card.relay-active {
+      border-color: #6366f1;
+      box-shadow: 0 12px 32px rgba(99, 102, 241, 0.18);
+    }
+
+    .vm-card-header {
+      padding: 16px 20px;
+      background: linear-gradient(180deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.9));
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .vm-title-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .vm-name {
+      font-size: 17px;
+      font-weight: 800;
+      font-family: "JetBrains Mono", Consolas, monospace;
+      color: #fff;
+    }
+
+    .badge {
+      padding: 3px 9px;
+      border-radius: 6px;
+      font-size: 11.5px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+    }
+
+    .badge-hw {
+      background: rgba(59, 130, 246, 0.2);
+      border: 1px solid rgba(59, 130, 246, 0.45);
+      color: #93c5fd;
+    }
+
+    .badge-shape {
+      background: rgba(139, 92, 246, 0.2);
+      border: 1px solid rgba(139, 92, 246, 0.45);
+      color: #c4b5fd;
+    }
+
+    .badge-idle {
+      background: rgba(16, 185, 129, 0.18);
+      border: 1px solid rgba(16, 185, 129, 0.4);
+      color: #34d399;
+    }
+
+    .badge-busy {
+      background: rgba(245, 158, 11, 0.2);
+      border: 1px solid rgba(245, 158, 11, 0.45);
+      color: #fbbf24;
+    }
+
+    .badge-relay {
+      background: rgba(99, 102, 241, 0.25);
+      border: 1px solid #818cf8;
+      color: #a5b4fc;
+    }
+
+    .vm-header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .vm-body {
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .section-box {
+      background: var(--bg-card-inner);
+      border: 1px solid rgba(51, 65, 85, 0.7);
+      border-radius: var(--radius-md);
+      padding: 13px 15px;
+    }
+
+    .section-title {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    /* 1. 运行状态网格 */
+    .status-kv-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+
+    .kv-item {
+      background: rgba(22, 31, 51, 0.65);
+      border: 1px solid rgba(38, 51, 77, 0.8);
+      border-radius: var(--radius-sm);
+      padding: 8px 10px;
+    }
+
+    .kv-label {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-bottom: 2px;
+    }
+
+    .kv-val {
+      font-size: 13px;
+      font-weight: 600;
+      font-family: "JetBrains Mono", Consolas, monospace;
+      color: var(--text-primary);
+      word-break: break-all;
+    }
+
+    /* 2. 资源状态仪表 */
+    .resource-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+    }
+
+    .res-item {
+      background: rgba(22, 31, 51, 0.65);
+      border: 1px solid rgba(38, 51, 77, 0.8);
+      border-radius: var(--radius-sm);
+      padding: 9px 11px;
+    }
+
+    .res-head {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      margin-bottom: 5px;
+    }
+
+    .res-name {
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+
+    .res-num {
+      font-family: "JetBrains Mono", Consolas, monospace;
+      font-weight: 700;
+    }
+
+    .progress-track {
+      width: 100%;
+      height: 7px;
+      background: #1e293b;
+      border-radius: 999px;
+      overflow: hidden;
+      margin-bottom: 4px;
+    }
+
+    .progress-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #3b82f6, #60a5fa);
+      transition: width 0.3s ease;
+    }
+
+    .progress-fill.warn {
+      background: linear-gradient(90deg, #f59e0b, #fbbf24);
+    }
+
+    .progress-fill.danger {
+      background: linear-gradient(90deg, #ef4444, #f87171);
+    }
+
+    .res-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    /* 3. 线程与进程状态表 */
+    .thread-summary-bar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 9px;
+    }
+
+    .thread-chip {
+      background: rgba(30, 41, 59, 0.9);
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-family: "JetBrains Mono", Consolas, monospace;
+    }
+
+    .proc-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11.5px;
+      font-family: "JetBrains Mono", Consolas, monospace;
+    }
+
+    .proc-table th,
+    .proc-table td {
+      padding: 5px 8px;
+      text-align: left;
+      border-bottom: 1px solid rgba(51, 65, 85, 0.5);
+    }
+
+    .proc-table th {
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    /* 4. 接力训练配置与实时日志 */
+    .relay-config-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .form-field label {
+      display: block;
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-bottom: 3px;
+    }
+
+    .form-field input,
+    .form-field select {
+      width: 100%;
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: var(--text-primary);
+      padding: 6px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+
+    .relay-btn-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+
+    .log-terminal {
+      background: #070b14;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      padding: 10px 12px;
+      height: 150px;
+      overflow-y: auto;
+      font-family: "JetBrains Mono", Consolas, monospace;
+      font-size: 11.5px;
+      color: #cbd5e1;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    /* 弹窗 Modal */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(3, 7, 18, 0.78);
+      backdrop-filter: blur(6px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 200;
+      padding: 20px;
+    }
+
+    .modal-backdrop.open {
+      display: flex;
+    }
+
+    .modal-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      width: 100%;
+      max-width: 560px;
+      padding: 22px 24px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+    }
+
+    .modal-card.wide {
+      max-width: 880px;
+    }
+
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+
+    .modal-header h3 {
+      font-size: 17px;
+      font-weight: 700;
+    }
+
+    .code-editor {
+      width: 100%;
+      height: 320px;
+      background: #090d16;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #e2e8f0;
+      font-family: "JetBrains Mono", Consolas, monospace;
+      font-size: 12.5px;
+      padding: 12px;
+      resize: vertical;
+    }
+
+    .toast-box {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 300;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-width: 440px;
+    }
+
+    .toast {
+      background: #1e293b;
+      border-left: 4px solid var(--accent-blue);
+      border-radius: 8px;
+      padding: 12px 16px;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.45);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 顶部全局状态与右上角新增虚拟机按钮 -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-logo">CP</div>
+      <div>
+        <div class="brand-title">Colab Pilot · 云端虚拟机与 24h+ 接力训练中控台</div>
+        <div class="brand-sub">Google Colab CLI + Rclone 16线程免弹窗网盘直连 · 服务端硬核验防漏关机</div>
+      </div>
+    </div>
+
+    <div class="metrics-strip">
+      <div class="metric-pill" title="Google Colab 账户剩余计算单元 (Compute Units)">
+        <span class="label">剩余计算单元:</span>
+        <span class="val" id="ccu-balance">-- CU</span>
+      </div>
+      <div class="metric-pill" title="当前每小时计算单元消耗速率">
+        <span class="dot dot-green" id="burn-dot"></span>
+        <span class="label">计费速率:</span>
+        <span class="val" id="ccu-rate">0.00 CU/h</span>
+      </div>
+      <div class="metric-pill" title="Google Colab 服务端 /tun/m/assignments 真实计费实例数">
+        <span class="label">云端计费实例:</span>
+        <span class="val" id="server-vm-count">0 台</span>
+      </div>
+      <div class="metric-pill" title="本机 Rclone Google Drive 免密授权状态">
+        <span class="dot dot-green" id="rclone-dot"></span>
+        <span class="label">Rclone 网盘:</span>
+        <span class="val" id="rclone-status">检测中...</span>
+      </div>
+    </div>
+
+    <div class="topbar-actions">
+      <button class="btn" onclick="openScriptModal()">📄 训练脚本配置 (train.py)</button>
+      <button class="btn" id="btn-refresh" onclick="fetchOverview(true)">🔄 全量刷新</button>
+      <button class="btn btn-add-vm" onclick="openAddVmModal()" title="新增一台独立的 Google Colab 云端虚拟机">
+        <span class="plus-icon">＋</span> 新增虚拟机
+      </button>
+    </div>
+  </header>
+
+  <!-- 主体内容区：每个虚拟机独立卡片 -->
+  <main class="main-container">
+    <div id="vm-container"></div>
+  </main>
+
+  <!-- 右上角 + 新增虚拟机弹窗 -->
+  <div class="modal-backdrop" id="modal-add-vm">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>＋ 新增 Google Colab 虚拟机</h3>
+        <button class="btn" onclick="closeAddVmModal()">✕</button>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:14px;">
+        <div class="form-field">
+          <label>虚拟机名称 (Session Name，留空自动生成)</label>
+          <input type="text" id="new-vm-name" placeholder="例如: relay-gpu-01" />
+        </div>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px;">
+          <div class="form-field">
+            <label>硬件加速器类型 (GPU / TPU / CPU)</label>
+            <select id="new-vm-acc">
+              <option value="T4" selected>GPU · NVIDIA T4 (推荐性价比)</option>
+              <option value="A100">GPU · NVIDIA A100 (高性能训练)</option>
+              <option value="L4">GPU · NVIDIA L4 (高显存推理/训练)</option>
+              <option value="H100">GPU · NVIDIA H100 (旗舰算力)</option>
+              <option value="G4">GPU · NVIDIA G4</option>
+              <option value="V5E1">TPU · v5e-1</option>
+              <option value="V6E1">TPU · v6e-1</option>
+              <option value="CPU">CPU · 标准计算实例</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label>内存规格 (Machine Shape)</label>
+            <select id="new-vm-hm">
+              <option value="true" selected>High-RAM (高内存规格 --high-mem)</option>
+              <option value="false">Standard (标准内存规格)</option>
+            </select>
+          </div>
+        </div>
+        <div class="section-box">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:13px; font-weight:600;">
+            <input type="checkbox" id="new-vm-autostart-relay" />
+            创建完成后立即开启 24h+ 全自动接力训练 (Relay Training)
+          </label>
+          <div style="font-size:11.5px; color:var(--text-secondary); margin-top:4px;">
+            开启后将自动上传本机 <code>rclone.conf</code> 与 <code>train.py</code>，每 30 分钟热备权重至 Google Drive，满 22.5 小时自动换棒并彻底销毁旧实例。
+          </div>
+        </div>
+        <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:6px;">
+          <button class="btn" onclick="closeAddVmModal()">取消</button>
+          <button class="btn btn-add-vm" id="btn-submit-create-vm" onclick="submitCreateVm()">🚀 立即创建虚拟机</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 训练脚本 train.py 与 requirements.txt 编辑弹窗 -->
+  <div class="modal-backdrop" id="modal-script">
+    <div class="modal-card wide">
+      <div class="modal-header">
+        <h3>📄 云端接力训练脚本 (train.py) 与依赖配置</h3>
+        <button class="btn" onclick="closeScriptModal()">✕</button>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:12px;">
+        <div>
+          <div style="font-size:12px; color:var(--text-secondary); margin-bottom:4px;">
+            <code>./train.py</code>（含 16 线程 rclone 拉取断点、原子化保存、30 分钟热备份、22.5h 安全退出交接）
+          </div>
+          <textarea class="code-editor" id="editor-train-py"></textarea>
+        </div>
+        <div>
+          <div style="font-size:12px; color:var(--text-secondary); margin-bottom:4px;">
+            <code>./requirements.txt</code>（每棒开机自动通过 <code>colab install -r requirements.txt</code> 安装）
+          </div>
+          <textarea class="code-editor" id="editor-req-txt" style="height:80px;"></textarea>
+        </div>
+        <div style="display:flex; justify-content:flex-end; gap:10px;">
+          <button class="btn" onclick="closeScriptModal()">关闭</button>
+          <button class="btn btn-add-vm" onclick="saveScripts()">💾 保存修改</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 彻底销毁虚拟机核验弹窗 -->
+  <div class="modal-backdrop" id="modal-delete-verify">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="del-modal-title">🛡️ 彻底销毁虚拟机与停止计费核验</h3>
+        <button class="btn" onclick="closeDeleteModal()">✕</button>
+      </div>
+      <div id="del-modal-body" style="font-size:13px; display:flex; flex-direction:column; gap:10px;"></div>
+      <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:16px;" id="del-modal-footer">
+        <button class="btn" onclick="closeDeleteModal()">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-box" id="toast-box"></div>
+
+  <script>
+    let latestOverview = null;
+    const userFormOverrides = {};
+
+    function showToast(msg, color = "#3b82f6") {
+      const box = document.getElementById("toast-box");
+      const el = document.createElement("div");
+      el.className = "toast";
+      el.style.borderLeftColor = color;
+      el.textContent = msg;
+      box.appendChild(el);
+      setTimeout(() => el.remove(), 4500);
+    }
+
+    function formatDuration(sec) {
+      if (!sec || sec <= 0) return "0m";
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = Math.floor(sec % 60);
+      if (h > 0) return `${h}h ${m}m`;
+      if (m > 0) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+
+    function progressClass(pct) {
+      if (pct >= 88) return "progress-fill danger";
+      if (pct >= 70) return "progress-fill warn";
+      return "progress-fill";
+    }
+
+    async function fetchOverview(forceTelemetry = false) {
+      const btn = document.getElementById("btn-refresh");
+      if (forceTelemetry && btn) btn.disabled = true;
+      try {
+        const res = await fetch(`/api/overview?refresh_telemetry=${forceTelemetry ? "1" : "0"}`);
+        const data = await res.json();
+        latestOverview = data;
+        renderTopbar(data);
+        renderVMs(data);
+      } catch (e) {
+        console.error("Failed to fetch overview:", e);
+      } finally {
+        if (forceTelemetry && btn) btn.disabled = false;
+      }
+    }
+
+    function renderTopbar(data) {
+      const ccu = data.ccu || {};
+      document.getElementById("ccu-balance").textContent =
+        ccu.balance !== null && ccu.balance !== undefined ? `${ccu.balance.toFixed(2)} CU` : "-- CU";
+
+      const rate = ccu.burn_rate_hourly || 0;
+      document.getElementById("ccu-rate").textContent = `${rate.toFixed(2)} CU/h`;
+      const burnDot = document.getElementById("burn-dot");
+      burnDot.className = rate > 0 ? "dot dot-amber" : "dot dot-green";
+
+      const activeCount = data.server_active_count || 0;
+      document.getElementById("server-vm-count").textContent = `${activeCount} 台`;
+
+      const gdrive = data.gdrive || {};
+      const rcloneDot = document.getElementById("rclone-dot");
+      const rcloneStatus = document.getElementById("rclone-status");
+      if (gdrive.rclone_authorized) {
+        rcloneDot.className = "dot dot-green";
+        const ckptTag = gdrive.has_remote_checkpoint ? " · 已有远程断点" : " · 就绪";
+        const doneTag = gdrive.has_done_flag ? " (已完成标记)" : "";
+        rcloneStatus.textContent = `gdrive 已授权${ckptTag}${doneTag}`;
+      } else {
+        rcloneDot.className = "dot dot-red";
+        rcloneStatus.textContent = "未检测到 rclone.conf";
+      }
+    }
+
+    function captureCardInputs() {
+      document.querySelectorAll("[data-vm-input]").forEach((inp) => {
+        const vm = inp.getAttribute("data-vm");
+        const field = inp.getAttribute("data-field");
+        if (!userFormOverrides[vm]) userFormOverrides[vm] = {};
+        userFormOverrides[vm][field] = inp.type === "checkbox" ? inp.checked : inp.value;
+      });
+    }
+
+    function renderVMs(data) {
+      captureCardInputs();
+      const container = document.getElementById("vm-container");
+      const vms = data.vms || [];
+
+      if (vms.length === 0) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <h2>当前暂无运行中的 Google Colab 虚拟机</h2>
+            <p>
+              服务端已核验：您账号下当前没有任何正在计费的云端实例（0.00 CU/h）。<br/>
+              点击右上角 <strong>“＋ 新增虚拟机”</strong> 按钮即可创建独立虚拟机并一键开启 24h+ 全自动跨实例接力训练。
+            </p>
+            <button class="btn btn-add-vm" onclick="openAddVmModal()">
+              <span class="plus-icon">＋</span> 新增第一台 Colab 虚拟机
+            </button>
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = `<div class="vm-grid">${vms.map((vm) => renderSingleVmCard(vm, data)).join("")}</div>`;
+    }
+
+    function renderSingleVmCard(vm, overview) {
+      const t = vm.telemetry || {};
+      const cpu = t.cpu || { model: "等待遥测采集...", cores: "-", percent: 0, load_avg: [0, 0, 0] };
+      const mem = t.memory || { used_gb: 0, total_gb: 0, percent: 0 };
+      const disk = t.disk || { used_gb: 0, total_gb: 0, percent: 0 };
+      const gpu = t.gpu || { available: false, name: vm.accelerator };
+      const th = t.threads || { total_processes: 0, total_threads: 0, processes: [] };
+      const tr = t.training || {};
+      const files = t.files || {};
+      const relay = vm.relay || {};
+      const cfg = Object.assign({}, relay.config || {}, userFormOverrides[vm.name] || {});
+
+      let badgeCls = "badge-idle";
+      if (vm.run_badge === "relay") badgeCls = "badge-relay";
+      else if (vm.run_badge === "busy") badgeCls = "badge-busy";
+
+      const uptimeSec = t.uptime_seconds || 0;
+      const maxRelaySec = (parseFloat(cfg.max_session_hours || 22.5) || 22.5) * 3600;
+      const sessionElapsed = tr.elapsed_seconds || uptimeSec;
+      const handoverPct = Math.min(100, Math.round((sessionElapsed / maxRelaySec) * 100));
+
+      const curEpoch = tr.current_epoch || 0;
+      const totEpochs = tr.total_epochs || cfg.total_epochs || 500;
+      const epochPct = totEpochs > 0 ? Math.min(100, Math.round((curEpoch / totEpochs) * 100)) : 0;
+
+      const gpuPct = gpu.available ? gpu.gpu_util_percent || 0 : 0;
+      const vramText = gpu.available
+        ? `${gpu.vram_used_mb || 0} / ${gpu.vram_total_mb || 0} MB (${gpu.vram_percent || 0}%) · ${gpu.temperature_c || 0}°C`
+        : "当前为 CPU 实例或暂未采集到 nvidia-smi";
+
+      const procRows = (th.processes || []).slice(0, 6).map((p) => `
+        <tr>
+          <td>${p.pid}</td>
+          <td><span class="badge" style="background:#1e293b;color:#93c5fd;">${p.role}</span></td>
+          <td style="color:#34d399;font-weight:700;">${p.threads} 线程</td>
+          <td>${p.cpu_percent}%</td>
+          <td>${p.rss_mb} MB</td>
+          <td>${p.state}</td>
+          <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${p.command}">${p.command}</td>
+        </tr>
+      `).join("");
+
+      const logsText = (relay.logs && relay.logs.length > 0)
+        ? relay.logs.join("\n")
+        : "暂无接力日志。点击上方「▶ 开启接力训练」即可自动上传 rclone.conf 与 train.py 开始 24h+ 无人值守接力训练。";
+
+      return `
+        <section class="vm-card ${relay.is_running ? "relay-active" : ""}" id="vm-card-${vm.name}">
+          <!-- 卡片头部：独立虚拟机标识 + 操作按钮 + 彻底销毁停止计费 -->
+          <div class="vm-card-header">
+            <div class="vm-title-group">
+              <span class="vm-name">[${vm.name}]</span>
+              <span class="badge badge-hw">${vm.accelerator}</span>
+              <span class="badge badge-shape">${vm.machine_shape}</span>
+              <span class="badge ${badgeCls}">${vm.run_state}</span>
+              ${vm.adopted_orphan ? `<span class="badge" style="background:rgba(239,68,68,0.2);color:#fca5a5;">云端孤儿实例自动纳管</span>` : ""}
+            </div>
+            <div class="vm-header-actions">
+              <button class="btn" onclick="probeSingleVm('${vm.name}')" id="btn-probe-${vm.name}" title="立即从云端采集最新资源、运行与线程状态">
+                ⚡ 刷新状态
+              </button>
+              <button class="btn btn-danger" onclick="confirmHardDeleteVm('${vm.name}', '${vm.endpoint || ""}')" title="调用 Google Colab unassign 接口并二次核验，彻底销毁虚拟机停止计费">
+                🗑️ 删除虚拟机 (彻底停费)
+              </button>
+            </div>
+          </div>
+
+          <div class="vm-body">
+            <!-- 模块一：虚拟机运行状态 -->
+            <div class="section-box">
+              <div class="section-title">
+                <span>① 运行状态 (Running Status)</span>
+                <span style="font-size:11px;font-weight:500;">
+                  Endpoint: <code>${vm.endpoint || "等待分配"}</code> ·
+                  ${vm.is_billing_on_server ? '<span style="color:#34d399;">● 云端在线计费中</span>' : '<span style="color:#94a3b8;">○ 云端未计费</span>'}
+                </span>
+              </div>
+              <div class="status-kv-grid">
+                <div class="kv-item">
+                  <div class="kv-label">实例运行时长 / 22.5h 换棒倒计时</div>
+                  <div class="kv-val">${formatDuration(uptimeSec)} (${handoverPct}%)</div>
+                </div>
+                <div class="kv-item">
+                  <div class="kv-label">接力棒次与当前阶段</div>
+                  <div class="kv-val">${relay.is_running ? `第 ${relay.round || 1} 棒 · ${relay.phase_label}` : (relay.phase_label || "未开启接力")}</div>
+                </div>
+                <div class="kv-item">
+                  <div class="kv-label">训练轮次进度 (Epoch / Loss)</div>
+                  <div class="kv-val">
+                    ${curEpoch > 0 ? `Epoch ${curEpoch}/${totEpochs} (${epochPct}%) · loss=${tr.loss ?? "-"}` : "待启动训练"}
+                  </div>
+                </div>
+                <div class="kv-item">
+                  <div class="kv-label">云端 Rclone 密钥状态</div>
+                  <div class="kv-val">${files.has_rclone_conf ? "✅ /content/rclone.conf 已就绪" : "⏳ 待上传"}</div>
+                </div>
+                <div class="kv-item">
+                  <div class="kv-label">云端本地断点 (checkpoint.pt)</div>
+                  <div class="kv-val">${files.has_checkpoint ? `✅ 已存在 (${files.checkpoint_size_mb} MB)` : "暂无本地断点"}</div>
+                </div>
+                <div class="kv-item">
+                  <div class="kv-label">距离下次 30m 网盘热备</div>
+                  <div class="kv-val">${tr.next_backup_in_seconds !== undefined ? formatDuration(tr.next_backup_in_seconds) : "--"}</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 模块二：虚拟机资源状态 -->
+            <div class="section-box">
+              <div class="section-title">
+                <span>② 资源状态 (Resource Status)</span>
+                <span style="font-size:11px;font-weight:500;">${cpu.model || ""} (${cpu.cores || "-"} vCPU)</span>
+              </div>
+              <div class="resource-grid">
+                <div class="res-item">
+                  <div class="res-head">
+                    <span class="res-name">GPU 算力与显存 (${gpu.name || vm.accelerator})</span>
+                    <span class="res-num">${gpuPct}%</span>
+                  </div>
+                  <div class="progress-track">
+                    <div class="${progressClass(gpuPct)}" style="width:${Math.min(100, gpuPct)}%"></div>
+                  </div>
+                  <div class="res-sub">${vramText}</div>
+                </div>
+
+                <div class="res-item">
+                  <div class="res-head">
+                    <span class="res-name">CPU 利用率 (Load: ${(cpu.load_avg || [0,0,0]).join(" / ")})</span>
+                    <span class="res-num">${cpu.percent || 0}%</span>
+                  </div>
+                  <div class="progress-track">
+                    <div class="${progressClass(cpu.percent || 0)}" style="width:${Math.min(100, cpu.percent || 0)}%"></div>
+                  </div>
+                  <div class="res-sub">${cpu.cores || "-"} 逻辑核心 · 实时采样</div>
+                </div>
+
+                <div class="res-item">
+                  <div class="res-head">
+                    <span class="res-name">系统内存 (RAM)</span>
+                    <span class="res-num">${mem.percent || 0}%</span>
+                  </div>
+                  <div class="progress-track">
+                    <div class="${progressClass(mem.percent || 0)}" style="width:${Math.min(100, mem.percent || 0)}%"></div>
+                  </div>
+                  <div class="res-sub">已用 ${mem.used_gb || 0} GB / 总计 ${mem.total_gb || 0} GB</div>
+                </div>
+
+                <div class="res-item">
+                  <div class="res-head">
+                    <span class="res-name">高速本地磁盘 (/content)</span>
+                    <span class="res-num">${disk.percent || 0}%</span>
+                  </div>
+                  <div class="progress-track">
+                    <div class="${progressClass(disk.percent || 0)}" style="width:${Math.min(100, disk.percent || 0)}%"></div>
+                  </div>
+                  <div class="res-sub">已用 ${disk.used_gb || 0} GB / 总计 ${disk.total_gb || 0} GB (剩余 ${disk.free_gb || 0} GB)</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 模块三：线程与进程状态 -->
+            <div class="section-box">
+              <div class="section-title">
+                <span>③ 线程与进程状态 (Thread & Process Status)</span>
+                <span style="font-size:11px;font-weight:500;">包含云端 OS 线程与本机接力守护线程</span>
+              </div>
+              <div class="thread-summary-bar">
+                <div class="thread-chip">云端总进程数: <strong>${th.total_processes || 0}</strong></div>
+                <div class="thread-chip">云端活跃总线程数: <strong style="color:#34d399;">${th.total_threads || 0}</strong></div>
+                <div class="thread-chip">
+                  train.py 进程: <strong>${th.train_process ? `PID ${th.train_process.pid} (${th.train_process.threads} 线程)` : "未运行"}</strong>
+                </div>
+                <div class="thread-chip">
+                  rclone 16线程同步: <strong>${th.rclone_process ? `PID ${th.rclone_process.pid} (${th.rclone_process.threads} 线程)` : "空闲"}</strong>
+                </div>
+                <div class="thread-chip">
+                  本机监工线程: <strong>${relay.thread_alive ? `运行中 (TID: ${relay.thread_native_id || relay.thread_ident})` : "待命"}</strong>
+                </div>
+              </div>
+              ${procRows ? `
+                <table class="proc-table">
+                  <thead>
+                    <tr>
+                      <th>PID</th>
+                      <th>角色</th>
+                      <th>线程数 (NLWP)</th>
+                      <th>CPU%</th>
+                      <th>内存</th>
+                      <th>状态</th>
+                      <th>命令行</th>
+                    </tr>
+                  </thead>
+                  <tbody>${procRows}</tbody>
+                </table>
+              ` : `<div style="font-size:12px;color:var(--text-muted);">点击右上角「⚡ 刷新状态」即可拉取云端进程与线程明细表。</div>`}
+            </div>
+
+            <!-- 模块四：开启与关闭 24h+ 全自动接力训练 -->
+            <div class="section-box">
+              <div class="section-title">
+                <span>④ 24h+ 全自动接力训练控制 (Relay Training)</span>
+                <span style="font-size:11px;font-weight:500;">Google Drive 16 线程直连 · 22.5h 主动换棒 · 30m 原子热备</span>
+              </div>
+              <div class="relay-config-row">
+                <div class="form-field">
+                  <label>换棒目标 GPU</label>
+                  <select data-vm-input data-vm="${vm.name}" data-field="gpu_type">
+                    ${["T4", "A100", "L4", "H100", "G4", "CPU"].map((g) =>
+                      `<option value="${g}" ${(cfg.gpu_type || vm.accelerator) === g ? "selected" : ""}>${g}</option>`
+                    ).join("")}
+                  </select>
+                </div>
+                <div class="form-field">
+                  <label>单棒安全时长 (小时)</label>
+                  <input type="number" step="0.5" data-vm-input data-vm="${vm.name}" data-field="max_session_hours" value="${cfg.max_session_hours ?? 22.5}" />
+                </div>
+                <div class="form-field">
+                  <label>网盘热备间隔 (分钟)</label>
+                  <input type="number" step="1" data-vm-input data-vm="${vm.name}" data-field="backup_interval_minutes" value="${cfg.backup_interval_minutes ?? 30}" />
+                </div>
+                <div class="form-field">
+                  <label>总训练轮数 (Epochs)</label>
+                  <input type="number" step="10" data-vm-input data-vm="${vm.name}" data-field="total_epochs" value="${cfg.total_epochs ?? 500}" />
+                </div>
+              </div>
+
+              <div class="relay-btn-bar">
+                <div style="display:flex; align-items:center; gap:12px; font-size:12px; color:var(--text-secondary);">
+                  <label style="display:flex; align-items:center; gap:5px; cursor:pointer;">
+                    <input type="checkbox" data-vm-input data-vm="${vm.name}" data-field="high_mem" ${cfg.high_mem !== false ? "checked" : ""} />
+                    High-RAM 高内存
+                  </label>
+                  <label style="display:flex; align-items:center; gap:5px; cursor:pointer;">
+                    <input type="checkbox" data-vm-input data-vm="${vm.name}" data-field="reset_done_flag" ${cfg.reset_done_flag ? "checked" : ""} />
+                    启动时重置网盘完成标记 (重新训练)
+                  </label>
+                </div>
+                <div style="display:flex; gap:8px;">
+                  ${relay.is_running ? `
+                    <button class="btn btn-warning" onclick="stopRelay('${vm.name}', false)">⏹ 关闭接力训练 (保留实例)</button>
+                    <button class="btn btn-danger" onclick="stopRelay('${vm.name}', true)">⏹ 关闭接力并销毁实例停费</button>
+                  ` : `
+                    <button class="btn btn-success" onclick="startRelay('${vm.name}')">▶ 开启接力训练 (24h+ 无人值守)</button>
+                  `}
+                </div>
+              </div>
+
+              <div class="log-terminal" id="log-box-${vm.name}">${logsText}</div>
+            </div>
+          </div>
+        </section>
+      `;
+    }
+
+    function openAddVmModal() {
+      document.getElementById("modal-add-vm").classList.add("open");
+    }
+
+    function closeAddVmModal() {
+      document.getElementById("modal-add-vm").classList.remove("open");
+    }
+
+    async function submitCreateVm() {
+      const btn = document.getElementById("btn-submit-create-vm");
+      const name = document.getElementById("new-vm-name").value.trim();
+      const accelerator = document.getElementById("new-vm-acc").value;
+      const high_mem = document.getElementById("new-vm-hm").value === "true";
+      const auto_start_relay = document.getElementById("new-vm-autostart-relay").checked;
+
+      btn.disabled = true;
+      btn.textContent = "⏳ 正在向 Google Colab 申请分配虚拟机...";
+      try {
+        const res = await fetch("/api/vms", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, accelerator, high_mem, auto_start_relay }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          showToast(`创建失败: ${data.error || "未知错误"}`, "#ef4444");
+        } else {
+          showToast(`✅ 虚拟机 [${data.vm.name}] 创建成功！Endpoint: ${data.vm.endpoint}`, "#10b981");
+          closeAddVmModal();
+          document.getElementById("new-vm-name").value = "";
+          await fetchOverview(true);
+        }
+      } catch (e) {
+        showToast(`请求异常: ${e.message}`, "#ef4444");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "🚀 立即创建虚拟机";
+      }
+    }
+
+    async function probeSingleVm(name) {
+      const btn = document.getElementById(`btn-probe-${name}`);
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "⏳ 采集中...";
+      }
+      try {
+        const res = await fetch(`/api/vms/${encodeURIComponent(name)}/probe`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ force_bootstrap: false }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          showToast(`⚡ 已刷新 [${name}] 的资源、运行与线程状态`, "#10b981");
+          await fetchOverview(false);
+        } else {
+          showToast(`刷新失败: ${data.error}`, "#ef4444");
+        }
+      } catch (e) {
+        showToast(`刷新异常: ${e.message}`, "#ef4444");
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "⚡ 刷新状态";
+        }
+      }
+    }
+
+    async function startRelay(name) {
+      captureCardInputs();
+      const cfg = userFormOverrides[name] || {};
+      try {
+        const res = await fetch(`/api/vms/${encodeURIComponent(name)}/relay/start`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(cfg),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          showToast(`▶ 已开启 [${name}] 的 24h+ 全自动接力训练！`, "#10b981");
+          await fetchOverview(false);
+        }
+      } catch (e) {
+        showToast(`开启接力失败: ${e.message}`, "#ef4444");
+      }
+    }
+
+    async function stopRelay(name, destroyVm) {
+      try {
+        const res = await fetch(`/api/vms/${encodeURIComponent(name)}/relay/stop`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ destroy_vm: destroyVm }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          showToast(
+            destroyVm ? `⏹ 已关闭 [${name}] 接力并彻底销毁云端实例` : `⏹ 已暂停 [${name}] 接力训练`,
+            "#f59e0b"
+          );
+          await fetchOverview(false);
+        }
+      } catch (e) {
+        showToast(`停止接力失败: ${e.message}`, "#ef4444");
+      }
+    }
+
+    function closeDeleteModal() {
+      document.getElementById("modal-delete-verify").classList.remove("open");
+    }
+
+    async function confirmHardDeleteVm(name, endpoint) {
+      const modal = document.getElementById("modal-delete-verify");
+      const body = document.getElementById("del-modal-body");
+      modal.classList.add("open");
+      body.innerHTML = `
+        <div style="color:#fbbf24; font-weight:600;">
+          ⏳ 正在对虚拟机 <code>[${name}]</code> (${endpoint || "云端实例"}) 执行四步硬销毁与计费停止核验...
+        </div>
+        <ul style="padding-left:18px; color:var(--text-secondary);">
+          <li>1. 停止本机接力监工线程与关联子进程...</li>
+          <li>2. 关闭远程 Jupyter Kernel 会话...</li>
+          <li>3. 调用 Google Colab <code>/tun/m/unassign/${endpoint}</code> 释放云端算力...</li>
+          <li>4. 重新查询 <code>/tun/m/assignments</code> 核验云端真实计费列表清零...</li>
+        </ul>
+      `;
+
+      try {
+        const res = await fetch(
+          `/api/vms/${encodeURIComponent(name)}?endpoint=${encodeURIComponent(endpoint || "")}`,
+          { method: "DELETE" }
+        );
+        const data = await res.json();
+        const stepsHtml = (data.steps || []).map((s) => `<li>${s}</li>`).join("");
+        const ccu = data.ccu_receipt || {};
+        if (data.verified_unassigned) {
+          body.innerHTML = `
+            <div style="color:#34d399; font-weight:700; font-size:14px;">
+              ✅ 彻底销毁成功！Google Colab 服务端二次核验通过，已完全停止计费。
+            </div>
+            <div class="section-box">
+              <div style="font-weight:700; margin-bottom:6px;">执行与核验流水：</div>
+              <ul style="padding-left:18px; color:var(--text-secondary); font-size:12px;">${stepsHtml}</ul>
+            </div>
+            <div class="section-box" style="font-family:monospace; font-size:12px;">
+              <div>已释放 Endpoint: ${data.endpoint || "无"}</div>
+              <div>当前云端剩余计费实例数: <strong>${ccu.active_assignments_count ?? 0} 台</strong></div>
+              <div>当前每小时计费速率: <strong style="color:#34d399;">${ccu.burn_rate_hourly ?? 0} CU/h</strong></div>
+              <div>账户剩余计算单元: <strong>${ccu.balance ?? "--"} CU</strong></div>
+            </div>
+          `;
+          showToast(`🗑️ 虚拟机 [${name}] 已彻底销毁并核验停止计费`, "#10b981");
+        } else {
+          body.innerHTML = `
+            <div style="color:#f87171; font-weight:700;">
+              ⚠️ 服务端核验发现实例可能尚未完全释放，未做假性删除！请点击重试：
+            </div>
+            <div style="font-size:12px; color:var(--text-secondary);">${data.error || ""}</div>
+            <ul style="padding-left:18px; font-size:12px;">${stepsHtml}</ul>
+          `;
+        }
+        await fetchOverview(false);
+      } catch (e) {
+        body.innerHTML = `<div style="color:#f87171;">销毁请求异常: ${e.message}</div>`;
+      }
+    }
+
+    async function openScriptModal() {
+      document.getElementById("modal-script").classList.add("open");
+      const res = await fetch("/api/files");
+      const data = await res.json();
+      if (data.ok) {
+        document.getElementById("editor-train-py").value = data.train_py || "";
+        document.getElementById("editor-req-txt").value = data.requirements_txt || "";
+      }
+    }
+
+    function closeScriptModal() {
+      document.getElementById("modal-script").classList.remove("open");
+    }
+
+    async function saveScripts() {
+      const train_py = document.getElementById("editor-train-py").value;
+      const requirements_txt = document.getElementById("editor-req-txt").value;
+      const res = await fetch("/api/files", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ train_py, requirements_txt }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        showToast("💾 已保存 train.py 与 requirements.txt，下一棒或新任务将立即生效！", "#10b981");
+        closeScriptModal();
+      }
+    }
+
+    // 首次加载与定时轮询
+    fetchOverview(false);
+    setInterval(() => fetchOverview(false), 4000);
+  </script>
+</body>
+</html>

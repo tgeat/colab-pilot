@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Colab Pilot · Colab 虚拟机与接力训练管控台",
+        "title": "Colab Pilot · 多工作区与 Colab 虚拟机实时监控仪表盘",
         "width": 1440,
         "height": 920,
         "minWidth": 1080,

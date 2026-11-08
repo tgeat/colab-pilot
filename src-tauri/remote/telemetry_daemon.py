@@ -7,6 +7,8 @@ import time
 
 TELEMETRY_FILE = "/content/.colab_pilot_telemetry.json"
 TRAINING_STATE_FILE = "/content/.colab_pilot_training_state.json"
+LLM_STATE_FILE = "/content/.colab_pilot_llm_state.json"
+WORKSPACE_META_FILE = "/content/.colab_workspace.json"
 PID_FILE = "/content/.colab_pilot_daemon.pid"
 
 
@@ -83,11 +85,13 @@ def get_gpu_info():
             return {"available": False, "name": "None (CPU Runtime)"}
         line = res.stdout.strip().splitlines()[0]
         parts = [p.strip() for p in line.split(",")]
+
         def _flt(val):
             try:
                 return float(val)
             except Exception:
                 return 0.0
+
         mem_used = _flt(parts[3]) if len(parts) > 3 else 0.0
         mem_total = _flt(parts[4]) if len(parts) > 4 else 0.0
         mem_pct = round((mem_used / mem_total) * 100.0, 1) if mem_total > 0 else 0.0
@@ -107,10 +111,66 @@ def get_gpu_info():
         return {"available": False, "name": "None (CPU Runtime)"}
 
 
+def read_proc_cwd(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except Exception:
+        return ""
+
+
+def read_proc_workspace_env(pid):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            raw = f.read()
+        for item in raw.split(b"\x00"):
+            if item.startswith(b"COLAB_WORKSPACE="):
+                return item.split(b"=", 1)[1].decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    return None
+
+
+def classify_role(cmd_s):
+    low = cmd_s.lower()
+    if "colab_pilot_daemon" in low:
+        return "telemetry"
+    if "rclone" in low:
+        return "rclone"
+    if "uv pip" in low or "pip install" in low or "apt-get" in low:
+        return "install"
+    if (
+        "vllm" in low
+        or "ollama" in low
+        or "llama-server" in low
+        or "llama_cpp" in low
+        or "llm_metrics_sidecar" in low
+        or "hf_openai_server" in low
+        or "text-generation" in low
+        or "sglang" in low
+    ):
+        return "llm"
+    if (
+        "train" in low
+        or "finetune" in low
+        or "torchrun" in low
+        or "accelerate" in low
+        or "colab_relay_adapter" in low
+    ):
+        return "train"
+    if "ipykernel_launcher" in low or "colab_kernel_launcher" in low:
+        return "kernel"
+    if ("python" in low or "pytest" in low or "bash " in low or "sh -c" in low) and "/usr/colab" not in low and "jupyter" not in low and "dap_multiplexer" not in low:
+        return "exec"
+    if "tmux" in low or ("bash" in low and "-i" in low):
+        return "shell"
+    return "system"
+
+
 def get_processes_and_threads():
     total_procs = 0
     total_threads = 0
     key_procs = []
+    detected_ws_env = None
     try:
         res = subprocess.run(
             ["ps", "-eo", "pid,nlwp,pcpu,pmem,rss,stat,etime,args", "--sort=-pcpu"],
@@ -124,6 +184,8 @@ def get_processes_and_threads():
             if len(cols) < 8:
                 continue
             pid_s, nlwp_s, pcpu_s, pmem_s, rss_s, stat_s, etime_s, cmd_s = cols
+            if "ps -eo" in cmd_s:
+                continue
             try:
                 pid = int(pid_s)
                 nlwp = int(nlwp_s)
@@ -135,24 +197,17 @@ def get_processes_and_threads():
             total_procs += 1
             total_threads += nlwp
 
+            role = classify_role(cmd_s)
+            if not detected_ws_env and role in ("train", "llm", "exec", "kernel", "shell"):
+                detected_ws_env = read_proc_workspace_env(pid)
+
             is_interesting = (
-                "train.py" in cmd_s
-                or "rclone" in cmd_s
-                or "ipykernel" in cmd_s
-                or "colab_pilot_daemon" in cmd_s
-                or pcpu >= 1.0
-                or len(key_procs) < 8
+                role in ("train", "llm", "exec", "rclone", "install", "kernel", "shell", "telemetry")
+                or pcpu >= 0.5
+                or len(key_procs) < 10
             )
-            if is_interesting and len(key_procs) < 12 and "ps -eo" not in cmd_s:
-                role = "system"
-                if "train.py" in cmd_s:
-                    role = "train"
-                elif "rclone" in cmd_s:
-                    role = "rclone"
-                elif "ipykernel" in cmd_s:
-                    role = "kernel"
-                elif "colab_pilot_daemon" in cmd_s:
-                    role = "telemetry"
+            if is_interesting and len(key_procs) < 16:
+                cwd = read_proc_cwd(pid)
                 key_procs.append({
                     "pid": pid,
                     "threads": nlwp,
@@ -162,15 +217,68 @@ def get_processes_and_threads():
                     "state": stat_s,
                     "elapsed": etime_s,
                     "role": role,
-                    "command": cmd_s[:160],
+                    "cwd": cwd,
+                    "command": cmd_s[:200],
                 })
     except Exception:
         pass
+
+    # 优先将用户任务进程排在最前面
+    priority = {
+        "train": 0,
+        "llm": 1,
+        "exec": 2,
+        "install": 3,
+        "rclone": 4,
+        "kernel": 5,
+        "shell": 6,
+        "telemetry": 7,
+        "system": 8,
+    }
+    key_procs.sort(key=lambda p: (priority.get(p["role"], 9), -p["cpu_percent"]))
+
+    active_proc = next(
+        (p for p in key_procs if p["role"] in ("train", "llm", "exec", "install", "rclone")),
+        None,
+    )
+    if not active_proc:
+        # 如果 kernel CPU 占用高，说明正在 notebook / colab exec 中运行代码
+        kern = next((p for p in key_procs if p["role"] == "kernel" and p["cpu_percent"] >= 5.0), None)
+        active_proc = kern
+
     return {
         "total_processes": total_procs,
         "total_threads": total_threads,
+        "active_process": active_proc,
+        "detected_workspace_env": detected_ws_env,
         "processes": key_procs,
     }
+
+
+def list_content_files():
+    entries = []
+    try:
+        for name in sorted(os.listdir("/content")):
+            if name.startswith(".colab_pilot") or name in ("sample_data", ".config"):
+                continue
+            full = os.path.join("/content", name)
+            try:
+                st = os.stat(full)
+                is_dir = os.path.isdir(full)
+                size_mb = round(st.st_size / (1024 * 1024), 2) if not is_dir else 0.0
+                entries.append({
+                    "name": name,
+                    "is_dir": is_dir,
+                    "size_mb": size_mb,
+                    "mtime": int(st.st_mtime),
+                })
+            except Exception:
+                continue
+            if len(entries) >= 12:
+                break
+    except Exception:
+        pass
+    return entries
 
 
 def collect_once(prev_idle, prev_total, cpu_model):
@@ -199,8 +307,25 @@ def collect_once(prev_idle, prev_total, cpu_model):
         except Exception:
             pass
 
+    llm_state = None
+    if os.path.exists(LLM_STATE_FILE):
+        try:
+            with open(LLM_STATE_FILE, "r", encoding="utf-8") as f:
+                llm_state = json.load(f)
+        except Exception:
+            pass
+
+    ws_meta = None
+    if os.path.exists(WORKSPACE_META_FILE):
+        try:
+            with open(WORKSPACE_META_FILE, "r", encoding="utf-8") as f:
+                ws_meta = json.load(f)
+        except Exception:
+            pass
+
     proc_info = get_processes_and_threads()
-    train_proc = next((p for p in proc_info["processes"] if p["role"] == "train"), None)
+    train_proc = next((p for p in proc_info["processes"] if p["role"] in ("train", "exec")), None)
+    llm_proc = next((p for p in proc_info["processes"] if p["role"] == "llm"), None)
     rclone_proc = next((p for p in proc_info["processes"] if p["role"] == "rclone"), None)
 
     payload = {
@@ -218,7 +343,9 @@ def collect_once(prev_idle, prev_total, cpu_model):
         "threads": {
             "total_processes": proc_info["total_processes"],
             "total_threads": proc_info["total_threads"],
+            "active_process": proc_info["active_process"],
             "train_process": train_proc,
+            "llm_process": llm_proc,
             "rclone_process": rclone_proc,
             "processes": proc_info["processes"],
         },
@@ -229,8 +356,13 @@ def collect_once(prev_idle, prev_total, cpu_model):
             if os.path.exists("/content/checkpoint.pt")
             else 0.0,
             "has_done_flag": os.path.exists("/content/training_done.flag"),
+            "has_results_dir": os.path.isdir("/content/results"),
+            "entries": list_content_files(),
         },
+        "workspace_meta": ws_meta,
+        "detected_workspace_env": proc_info["detected_workspace_env"],
         "training": training_state,
+        "llm": llm_state,
     }
 
     tmp = TELEMETRY_FILE + ".tmp"

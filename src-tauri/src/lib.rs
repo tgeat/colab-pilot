@@ -1,14 +1,14 @@
-//! Colab Pilot — Tauri 2 Rust 后端
+//! Colab Pilot — Tauri 2 Rust 后端（工作区与 Colab 虚拟机实时监控仪表盘）
 //!
-//! - 后台轮询：Colab 服务端计费实例、账户 CU、云端遥测快照、Google Drive 接力目录
-//! - 虚拟机生命周期：创建（colab-cli）/ 彻底销毁（colab stop + 服务端 unassign + 计费列表二次核验）
-//! - 每台虚拟机独立的 24h+ 接力训练监工任务
+//! - 后台轮询：Colab 服务端计费实例、账户 CU、云端遥测快照、colab-cli 会话与历史、Google Drive 状态
+//! - 自动探针注入：自动感知 Antigravity 通过 colab-cli 创建的实例，通过 Contents API + /colab/tty 静默注入遥测守护进程（不阻塞 Kernel，不污染 CLI 会话状态）
+//! - 工作区映射：自动将每台 Colab 虚拟机关联到对应的本地工作区（Workspace），汇总资源分配与运行状态
 
 mod cli;
 mod colab;
 mod relay;
 
-use cli::s;
+use cli::{s, CliEventView, RecentSessionView, WorkspaceInfo};
 use colab::{Assignment, Ccu, ColabClient};
 use futures::future::join_all;
 use relay::{RelayConfig, RelayHandle, RelayStatus};
@@ -36,6 +36,8 @@ pub struct EnvStatus {
     pub rclone_conf_ok: bool,
     pub token_ok: bool,
     pub workspace: String,
+    pub sessions_path: String,
+    pub history_dir: String,
 }
 
 #[derive(Serialize, Clone, Default, Debug)]
@@ -61,6 +63,7 @@ pub struct GdriveStatus {
 #[derive(Serialize, Clone, Default, Debug)]
 pub struct VmView {
     pub name: String,
+    pub workspace: WorkspaceInfo,
     pub endpoint: Option<String>,
     pub accelerator: String,
     pub variant: String,
@@ -68,8 +71,11 @@ pub struct VmView {
     pub on_server: bool,
     pub managed: bool,
     pub orphan: bool,
+    pub kernel_id: Option<String>,
+    pub session_id: Option<String>,
     pub running_task: Option<String>,
     pub last_execution: Value,
+    pub cli_events: Vec<CliEventView>,
     pub telemetry: Option<Value>,
     pub telemetry_age: Option<f64>,
     pub telemetry_error: Option<String>,
@@ -87,6 +93,8 @@ pub struct Overview {
     pub gdrive: Option<GdriveStatus>,
     pub env: EnvStatus,
     pub vms: Vec<VmView>,
+    pub recent_sessions: Vec<RecentSessionView>,
+    pub llm_bluegreen: Option<Value>,
 }
 
 #[derive(Serialize, Clone, Default, Debug)]
@@ -112,6 +120,7 @@ pub struct AppState {
     telemetry: Mutex<HashMap<String, TelemetryEntry>>,
     relays: Mutex<HashMap<String, Arc<RelayHandle>>>,
     busy: Mutex<HashMap<String, String>>,
+    probe_cooldown: Mutex<HashMap<String, Instant>>,
     gdrive: tokio::sync::Mutex<(Option<GdriveStatus>, Option<Instant>)>,
     refresh_lock: tokio::sync::Mutex<()>,
 }
@@ -173,6 +182,8 @@ impl AppState {
             rclone_conf: conf.display().to_string(),
             token_ok: ColabClient::is_authorized(),
             workspace: self.workspace.display().to_string(),
+            sessions_path: cli::sessions_path().display().to_string(),
+            history_dir: cli::history_dir().display().to_string(),
         }
     }
 }
@@ -238,6 +249,138 @@ async fn fetch_gdrive_status(dir: &str) -> GdriveStatus {
     st
 }
 
+// ───────────────────────────── 静默遥测探针部署（自动感知新实例） ─────────────────────────────
+
+const PROBE_BOOTSTRAP: &str = r#"
+import os, subprocess, sys, time
+pid_file = "/content/.colab_pilot_daemon.pid"
+alive = False
+if os.path.exists(pid_file):
+    try:
+        os.kill(int(open(pid_file).read().strip()), 0)
+        alive = True
+    except Exception:
+        alive = False
+if not alive:
+    subprocess.Popen([sys.executable, "/content/.colab_pilot_daemon.py"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(1.0)
+print("PROBE_OK", "reused" if alive else "started")
+"#;
+
+/// 使用 colab-cli 虚拟环境直接通过 /colab/tty（或 ColabRuntime）静默启动遥测守护进程，
+/// 不改写 ~/.config/colab-cli/sessions.json 与 history/*.jsonl，也不中断正在运行的训练任务。
+const SILENT_PROBE_LAUNCHER_PY: &str = r#"
+import json, sys, time
+from urllib.parse import urlparse
+
+url = sys.argv[1]
+token = sys.argv[2]
+
+started = False
+try:
+    import websocket
+    parsed = urlparse(url)
+    ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+    ws_url = f"{ws_scheme}://{parsed.netloc}/colab/tty?colab-runtime-proxy-token={token}"
+    ws = websocket.create_connection(ws_url, timeout=8)
+    cmd = (
+        "python3 -c 'import os,subprocess,sys;"
+        "pf=\"/content/.colab_pilot_daemon.pid\";"
+        "alive=False\n"
+        "try:\n"
+        " alive=os.path.exists(pf) and (os.kill(int(open(pf).read().strip()),0) or True)\n"
+        "except Exception:\n"
+        " alive=False\n"
+        "if not alive:\n"
+        " subprocess.Popen([sys.executable,\"/content/.colab_pilot_daemon.py\"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)'\n"
+    )
+    ws.send(json.dumps({"data": cmd + "\n"}))
+    time.sleep(1.2)
+    ws.close()
+    started = True
+    print("PROBE_OK via_tty")
+except Exception as e:
+    pass
+
+if not started:
+    from colab_cli.runtime import ColabRuntime
+    rt = ColabRuntime(url, token)
+    try:
+        rt.execute_code('''
+import os, subprocess, sys, time
+pid_file = "/content/.colab_pilot_daemon.pid"
+alive = False
+if os.path.exists(pid_file):
+    try:
+        os.kill(int(open(pid_file).read().strip()), 0)
+        alive = True
+    except Exception:
+        alive = False
+if not alive:
+    subprocess.Popen([sys.executable, "/content/.colab_pilot_daemon.py"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(0.8)
+''', timeout=25)
+        print("PROBE_OK via_kernel")
+    finally:
+        rt.stop()
+"#;
+
+pub async fn deploy_probe_for_assignment(app: &Arc<AppState>, a: &Assignment) -> anyhow::Result<()> {
+    app.client
+        .contents_upload(a, "content/.colab_pilot_daemon.py", TELEMETRY_DAEMON_PY.as_bytes())
+        .await?;
+
+    let py = cli::colab_python_bin();
+    let args = vec![
+        "-c".to_string(),
+        SILENT_PROBE_LAUNCHER_PY.to_string(),
+        a.runtime_proxy_info.url.clone(),
+        a.runtime_proxy_info.token.clone(),
+    ];
+    let out = cli::run_simple(&py, &args, Duration::from_secs(40)).await?;
+    if out.output.contains("PROBE_OK") {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "探针自动注入失败：{}",
+            out.output.trim().lines().last().unwrap_or("无输出")
+        )
+    }
+}
+
+pub async fn deploy_probe_inner(app: &Arc<AppState>, name: &str) -> anyhow::Result<()> {
+    let a = app
+        .find_assignment_by_name(name)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("服务端未找到实例 [{name}]"))?;
+    if let Ok(()) = deploy_probe_for_assignment(app, &a).await {
+        return Ok(());
+    }
+    if !cli::read_sessions().contains_key(name) {
+        anyhow::bail!("该实例不在 colab-cli 会话表中，且静默注入未响应");
+    }
+    let out = cli::run_streaming(
+        &cli::colab_bin(),
+        &s(&["exec", "-s", name, "--timeout", "60"]),
+        Some(PROBE_BOOTSTRAP.to_string()),
+        Duration::from_secs(150),
+        None,
+        None,
+        |_| {},
+    )
+    .await?;
+    if out.output.contains("PROBE_OK") {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "探针启动失败：{}",
+            out.output.trim().lines().last().unwrap_or("无输出")
+        )
+    }
+}
+
 // ───────────────────────────── 总览刷新 ─────────────────────────────
 
 async fn fetch_telemetry(app: &AppState, a: &Assignment) -> TelemetryEntry {
@@ -250,7 +393,7 @@ async fn fetch_telemetry(app: &AppState, a: &Assignment) -> TelemetryEntry {
             Ok(v) => TelemetryEntry { data: Some(v), error: None },
             Err(e) => TelemetryEntry { data: None, error: Some(format!("遥测解析失败: {e}")) },
         },
-        Ok(None) => TelemetryEntry { data: None, error: Some("未部署遥测探针".into()) },
+        Ok(None) => TelemetryEntry { data: None, error: Some("正在自动注入遥测探针…".into()) },
         Err(e) => TelemetryEntry { data: None, error: Some(e.to_string()) },
     }
 }
@@ -339,8 +482,46 @@ pub async fn refresh_overview(app: &Arc<AppState>, force_gdrive: bool) -> Overvi
             .and_then(|v| v.get("timestamp"))
             .and_then(|x| x.as_f64())
             .map(|ts| (now - ts).max(0.0));
+
+        // 自动感知新实例或探针失联实例，后台静默注入遥测守护进程
+        let needs_probe = tel.is_none() || age.map(|x| x > 25.0).unwrap_or(true);
+        if needs_probe && !busy.contains_key(&name) {
+            let should_trigger = {
+                let mut cd = app.probe_cooldown.lock().unwrap();
+                match cd.get(&a.endpoint) {
+                    Some(last) if last.elapsed() < Duration::from_secs(25) => false,
+                    _ => {
+                        cd.insert(a.endpoint.clone(), Instant::now());
+                        true
+                    }
+                }
+            };
+            if should_trigger {
+                let app_bg = app.clone();
+                let a_clone = a.clone();
+                let name_clone = name.clone();
+                app.set_busy(&name_clone, Some("probing"));
+                tokio::spawn(async move {
+                    let _ = deploy_probe_for_assignment(&app_bg, &a_clone).await;
+                    app_bg.set_busy(&name_clone, None);
+                });
+            }
+        }
+
+        let (cli_events, history_paths) = cli::read_session_events(&name, 12);
+        let workspace = cli::resolve_workspace_for_vm(
+            &name,
+            Some(&a.endpoint),
+            sess,
+            tel.as_ref(),
+            &history_paths,
+        );
+
+        let cur_busy = app.busy.lock().unwrap().get(&name).cloned();
+
         ov.vms.push(VmView {
             name: name.clone(),
+            workspace,
             endpoint: Some(a.endpoint.clone()),
             accelerator: a.hardware_label(),
             variant: a.variant_label(),
@@ -348,6 +529,14 @@ pub async fn refresh_overview(app: &Arc<AppState>, force_gdrive: bool) -> Overvi
             on_server: true,
             managed,
             orphan: !managed,
+            kernel_id: sess
+                .and_then(|v| v.get("kernel_id"))
+                .and_then(|x| x.as_str())
+                .map(|x| x.to_string()),
+            session_id: sess
+                .and_then(|v| v.get("session_id"))
+                .and_then(|x| x.as_str())
+                .map(|x| x.to_string()),
             running_task: sess
                 .and_then(|v| v.get("running"))
                 .and_then(|x| x.as_str())
@@ -356,11 +545,12 @@ pub async fn refresh_overview(app: &Arc<AppState>, force_gdrive: bool) -> Overvi
                 .and_then(|v| v.get("last_execution"))
                 .cloned()
                 .unwrap_or(Value::Null),
+            cli_events,
             telemetry: tel,
             telemetry_age: age,
             telemetry_error: terr,
             relay: app.relay(&name).map(|h| h.snapshot()),
-            busy: busy.get(&name).cloned(),
+            busy: cur_busy,
         });
         seen.push(name);
     }
@@ -376,12 +566,16 @@ pub async fn refresh_overview(app: &Arc<AppState>, force_gdrive: bool) -> Overvi
     for (name, h) in relay_names {
         if !seen.contains(&name) && h.is_running() {
             let cfg = h.snapshot().config;
+            let (cli_events, history_paths) = cli::read_session_events(&name, 12);
+            let workspace = cli::resolve_workspace_for_vm(&name, None, None, None, &history_paths);
             ov.vms.push(VmView {
                 name: name.clone(),
+                workspace,
                 accelerator: cfg.gpu_type.clone(),
                 variant: "GPU".into(),
                 high_ram: cfg.high_mem,
                 managed: true,
+                cli_events,
                 relay: Some(h.snapshot()),
                 busy: busy.get(&name).cloned(),
                 ..Default::default()
@@ -389,30 +583,16 @@ pub async fn refresh_overview(app: &Arc<AppState>, force_gdrive: bool) -> Overvi
             seen.push(name);
         }
     }
-    for (name, what) in &busy {
-        if !seen.contains(name) && what == "creating" {
-            ov.vms.push(VmView {
-                name: name.clone(),
-                accelerator: "…".into(),
-                busy: Some(what.clone()),
-                managed: true,
-                ..Default::default()
-            });
-        }
-    }
-    ov.vms.sort_by(|a, b| a.name.cmp(&b.name));
+    ov.vms.sort_by(|a, b| a.workspace.name.cmp(&b.workspace.name).then(a.name.cmp(&b.name)));
+    ov.recent_sessions = cli::read_recent_sessions(&seen, 8);
+    ov.llm_bluegreen = cli::read_llm_bluegreen_state();
 
     *app.overview.write().await = ov.clone();
     ov
 }
 
-// ───────────────────────────── 彻底销毁（防假性删除） ─────────────────────────────
+// ───────────────────────────── 彻底销毁（保留底层能力供 CLI 测试使用） ─────────────────────────────
 
-/// 彻底销毁虚拟机并停止计费：
-/// 1. 停止本机接力监工与 colab exec 进程树；
-/// 2. `colab stop`（关闭远程 Kernel + unassign + 清理 CLI 会话）；
-/// 3. 轮询服务端 `/tun/m/assignments`，若实例仍在则直接调用 `/tun/m/unassign` 重试；
-/// 4. 仅当服务端计费列表中确认不存在该 endpoint 时才判定成功。
 pub async fn hard_terminate(
     app: &Arc<AppState>,
     name: &str,
@@ -456,7 +636,6 @@ pub async fn hard_terminate(
         return r;
     };
 
-    // 2. 官方 CLI 停止（同时关闭远程 Kernel）
     if managed && cli::colab_bin().exists() {
         match cli::run_simple(&cli::colab_bin(), &s(&["stop", "-s", name]), Duration::from_secs(120)).await {
             Ok(o) => {
@@ -467,7 +646,6 @@ pub async fn hard_terminate(
         }
     }
 
-    // 3. 服务端计费列表核验 + 直接 unassign 重试
     for attempt in 1..=6 {
         match app.client.list_assignments().await {
             Ok(list) => {
@@ -492,7 +670,6 @@ pub async fn hard_terminate(
 
     if r.verified_unassigned {
         app.telemetry.lock().unwrap().remove(&ep);
-        // 清理 colab-cli 本地会话表中的残留记录（官方 sync 逻辑会自动修剪已不在服务端的会话）
         if cli::read_sessions().contains_key(name) && cli::colab_bin().exists() {
             let _ = cli::run_simple(&cli::colab_bin(), &s(&["sessions"]), Duration::from_secs(60)).await;
             r.steps.push("已同步清理 colab-cli 本地会话表".into());
@@ -505,56 +682,6 @@ pub async fn hard_terminate(
         r.ccu = Some(c);
     }
     r
-}
-
-// ───────────────────────────── 遥测探针部署 ─────────────────────────────
-
-const PROBE_BOOTSTRAP: &str = r#"
-import os, subprocess, sys, time
-pid_file = "/content/.colab_pilot_daemon.pid"
-alive = False
-if os.path.exists(pid_file):
-    try:
-        os.kill(int(open(pid_file).read().strip()), 0)
-        alive = True
-    except Exception:
-        alive = False
-if not alive:
-    subprocess.Popen([sys.executable, "/content/.colab_pilot_daemon.py"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    time.sleep(1.0)
-print("PROBE_OK", "reused" if alive else "started")
-"#;
-
-pub async fn deploy_probe_inner(app: &Arc<AppState>, name: &str) -> anyhow::Result<()> {
-    let a = app
-        .find_assignment_by_name(name)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("服务端未找到实例 [{name}]"))?;
-    if !cli::read_sessions().contains_key(name) {
-        anyhow::bail!("该实例不在 colab-cli 会话表中（外部创建的孤儿实例），无法执行内核命令");
-    }
-    app.client
-        .contents_upload(&a, "content/.colab_pilot_daemon.py", TELEMETRY_DAEMON_PY.as_bytes())
-        .await?;
-    let out = cli::run_streaming(
-        &cli::colab_bin(),
-        &s(&["exec", "-s", name, "--timeout", "60"]),
-        Some(PROBE_BOOTSTRAP.to_string()),
-        Duration::from_secs(150),
-        None,
-        None,
-        |_| {},
-    )
-    .await?;
-    if out.output.contains("PROBE_OK") {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "探针启动失败：{}",
-            out.output.trim().lines().last().unwrap_or("无输出")
-        )
-    }
 }
 
 // ───────────────────────────── Tauri Commands ─────────────────────────────
@@ -661,12 +788,6 @@ async fn delete_vm(
 #[tauri::command]
 async fn deploy_probe(handle: AppHandle, state: AppStateRef<'_>, name: String) -> Result<(), String> {
     let app = state.inner().clone();
-    if let Some(h) = app.relay(&name) {
-        let st = h.snapshot();
-        if st.running && st.phase == "training" {
-            return Err("训练进行中，Kernel 被占用；探针已在本棒训练开始前自动部署".into());
-        }
-    }
     app.set_busy(&name, Some("probing"));
     let res = deploy_probe_inner(&app, &name).await;
     app.set_busy(&name, None);
@@ -733,7 +854,6 @@ async fn stop_relay(
             h.log(if r.verified_unassigned { "✅ 实例已彻底销毁，计费已停止" } else { "⚠️ 销毁未通过核验，请重试删除" });
             receipt = Some(r);
         } else if cli::read_sessions().contains_key(&name) {
-            // 保留实例时中断远程 Kernel 中仍在执行的 train.py
             let _ = cli::run_simple(
                 &cli::colab_bin(),
                 &s(&["restart-kernel", "-s", &name]),
@@ -816,6 +936,7 @@ fn print_overview_headless() {
             telemetry: Mutex::new(HashMap::new()),
             relays: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
+            probe_cooldown: Mutex::new(HashMap::new()),
             gdrive: tokio::sync::Mutex::new((None, None)),
             refresh_lock: tokio::sync::Mutex::new(()),
         });
@@ -824,7 +945,6 @@ fn print_overview_headless() {
     });
 }
 
-/// 调试构建专用：真实创建 CPU 实例 → 部署探针 → 读取遥测 → 彻底销毁并核验
 #[cfg(debug_assertions)]
 fn selftest_lifecycle() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -836,6 +956,7 @@ fn selftest_lifecycle() {
             telemetry: Mutex::new(HashMap::new()),
             relays: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
+            probe_cooldown: Mutex::new(HashMap::new()),
             gdrive: tokio::sync::Mutex::new((None, None)),
             refresh_lock: tokio::sync::Mutex::new(()),
         });
@@ -845,108 +966,26 @@ fn selftest_lifecycle() {
             println!("CREATE FAILED: {e}");
             return;
         }
-        println!("[2] deploying probe …");
-        match deploy_probe_inner(&state, name).await {
-            Ok(_) => println!("    probe ok"),
-            Err(e) => println!("    probe failed: {e}"),
-        }
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        println!("[2] waiting for auto-probe trigger …");
+        let _ = refresh_overview(&state, false).await;
+        tokio::time::sleep(Duration::from_secs(7)).await;
         let ov = refresh_overview(&state, false).await;
         for vm in &ov.vms {
             let t = vm.telemetry.as_ref();
             println!(
-                "[3] vm={} on_server={} managed={} cpu%={:?} mem%={:?} threads={:?} age={:?} err={:?}",
+                "[3] vm={} ws={} on_server={} cpu%={:?} mem%={:?} threads={:?} age={:?}",
                 vm.name,
+                vm.workspace.name,
                 vm.on_server,
-                vm.managed,
                 t.and_then(|t| t["cpu"]["percent"].as_f64()),
                 t.and_then(|t| t["memory"]["percent"].as_f64()),
                 t.and_then(|t| t["threads"]["total_threads"].as_i64()),
                 vm.telemetry_age,
-                vm.telemetry_error
             );
         }
-        println!("[3b] burn rate while running: {:?}", ov.ccu.as_ref().map(|c| c.burn_rate_hourly));
         println!("[4] hard terminate …");
         let r = hard_terminate(&state, name, None, true).await;
         println!("{}", serde_json::to_string_pretty(&r).unwrap());
-        let after = refresh_overview(&state, false).await;
-        println!(
-            "[5] after: server_count={} vms={} sessions_has_name={}",
-            after.server_count,
-            after.vms.len(),
-            cli::read_sessions().contains_key(name)
-        );
-    });
-}
-
-/// 调试构建专用：真实执行 2 棒跨实例接力训练端到端测试（第 1 棒训练 ~3 轮后触发限时交接并销毁 → 第 2 棒新建实例从网盘恢复断点续训至 6 轮完成 → 销毁并回收最终权重）
-#[cfg(debug_assertions)]
-fn selftest_relay() {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async {
-        let state = Arc::new(AppState {
-            client: ColabClient::new(),
-            workspace: Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf(),
-            overview: tokio::sync::RwLock::new(Overview::default()),
-            telemetry: Mutex::new(HashMap::new()),
-            relays: Mutex::new(HashMap::new()),
-            busy: Mutex::new(HashMap::new()),
-            gdrive: tokio::sync::Mutex::new((None, None)),
-            refresh_lock: tokio::sync::Mutex::new(()),
-        });
-        let name = "selftest-relay";
-        let cfg = RelayConfig {
-            gpu_type: "CPU".into(),
-            high_mem: false,
-            gdrive_dir: DEFAULT_GDRIVE_DIR.into(),
-            max_session_hours: 0.005,        // ~18 秒后触发换棒退出（约 2 棒跑完 6 轮）
-            backup_interval_minutes: 0.05,   // ~3 秒触发一次中途网盘热备
-            total_epochs: 6,                 // 共 6 轮
-            reset_done_flag: true,
-        };
-        let handle = Arc::new(RelayHandle::new(name));
-        {
-            let mut st = handle.status.lock().unwrap();
-            st.running = true;
-            st.config = cfg;
-            st.started_at = Some(chrono::Utc::now().timestamp());
-            st.phase = "starting".into();
-            st.phase_label = "正在初始化接力监工…".into();
-        }
-        state.relays.lock().unwrap().insert(name.into(), handle.clone());
-
-        let h_log = handle.clone();
-        let printer = tokio::spawn(async move {
-            let mut printed = 0usize;
-            loop {
-                let st = h_log.status.lock().unwrap().clone();
-                while printed < st.logs.len() {
-                    println!("{}", st.logs[printed]);
-                    printed += 1;
-                }
-                if !st.running {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(300)).await;
-            }
-        });
-
-        relay::run_relay(state.clone(), handle.clone()).await;
-        let _ = printer.await;
-
-        let final_st = handle.snapshot();
-        let after = refresh_overview(&state, true).await;
-        let local_ckpt = state.workspace.join(format!("checkpoint_{name}.pt"));
-        println!("====================================================");
-        println!(
-            "[RESULT] phase={} round={} server_count={} local_ckpt_exists={} local_ckpt_bytes={}",
-            final_st.phase,
-            final_st.round,
-            after.server_count,
-            local_ckpt.exists(),
-            std::fs::metadata(&local_ckpt).map(|m| m.len()).unwrap_or(0)
-        );
     });
 }
 
@@ -961,10 +1000,12 @@ pub fn run() {
         selftest_lifecycle();
         return;
     }
-    #[cfg(debug_assertions)]
-    if std::env::args().any(|a| a == "--selftest-relay") {
-        selftest_relay();
-        return;
+    // 确保开启系统代理（如 Clash 127.0.0.1:7890）时，WebView2 内部协议 http://tauri.localhost 永不走代理
+    if std::env::var_os("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").is_none() {
+        std::env::set_var(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "--proxy-bypass-list=<-loopback>;*.localhost;tauri.localhost",
+        );
     }
     tauri::Builder::default()
         .setup(|app| {
@@ -975,12 +1016,13 @@ pub fn run() {
                 telemetry: Mutex::new(HashMap::new()),
                 relays: Mutex::new(HashMap::new()),
                 busy: Mutex::new(HashMap::new()),
+                probe_cooldown: Mutex::new(HashMap::new()),
                 gdrive: tokio::sync::Mutex::new((None, None)),
                 refresh_lock: tokio::sync::Mutex::new(()),
             });
             app.manage(state.clone());
 
-            // 后台轮询：每 4 秒同步服务端计费实例、CU 与遥测并推送前端
+            // 后台轮询：每 4 秒同步服务端计费实例、CU、遥测与 CLI 历史并推送前端
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {

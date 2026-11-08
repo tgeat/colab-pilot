@@ -8,6 +8,11 @@ edition = "2021"
 name = "colab_pilot_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# 生产构建与独立 exe 运行必须开启 custom-protocol，否则 Tauri 会回退连接 devUrl (http://localhost:1420)
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

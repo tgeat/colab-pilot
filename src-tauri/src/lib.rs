@@ -118,6 +118,8 @@ pub struct AppState {
     pub workspace: PathBuf,
     overview: tokio::sync::RwLock<Overview>,
     telemetry: Mutex<HashMap<String, TelemetryEntry>>,
+    last_assignments: Mutex<Option<(Vec<Assignment>, Instant)>>,
+    last_ccu: Mutex<Option<Ccu>>,
     relays: Mutex<HashMap<String, Arc<RelayHandle>>>,
     busy: Mutex<HashMap<String, String>>,
     probe_cooldown: Mutex<HashMap<String, Instant>>,
@@ -437,23 +439,56 @@ pub async fn refresh_overview(app: &Arc<AppState>, force_gdrive: bool) -> Overvi
         match list {
             Ok(l) => {
                 ov.auth_ok = true;
+                *app.last_assignments.lock().unwrap() = Some((l.clone(), Instant::now()));
                 assignments = l;
             }
-            Err(e) => ov.error = Some(format!("{e:#}")),
+            Err(e) => {
+                let fallback = app
+                    .last_assignments
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(60))
+                    .map(|(l, _)| l.clone());
+                if let Some(cached) = fallback {
+                    ov.auth_ok = true;
+                    assignments = cached;
+                } else {
+                    ov.error = Some(format!("{e:#}"));
+                }
+            }
         }
-        if let Ok(c) = ccu {
-            ov.ccu = Some(c);
+        match ccu {
+            Ok(c) => {
+                *app.last_ccu.lock().unwrap() = Some(c.clone());
+                ov.ccu = Some(c);
+            }
+            Err(_) => {
+                ov.ccu = app.last_ccu.lock().unwrap().clone();
+            }
         }
     }
     ov.server_count = assignments.len();
 
     // 并发拉取每台在线虚拟机的遥测快照（Contents API，不占用 Kernel）
+    // 采用 Stale-While-Revalidate：单次网络抖动失败时保留上一份有效遥测快照，避免界面闪断或误触发重连探针
     let fetched = join_all(assignments.iter().map(|a| fetch_telemetry(app, a))).await;
     {
         let mut t = app.telemetry.lock().unwrap();
         t.retain(|ep, _| assignments.iter().any(|a| &a.endpoint == ep));
         for (a, entry) in assignments.iter().zip(fetched) {
-            t.insert(a.endpoint.clone(), entry);
+            match entry.data {
+                Some(_) => {
+                    t.insert(a.endpoint.clone(), entry);
+                }
+                None => {
+                    if let Some(prev) = t.get_mut(&a.endpoint) {
+                        prev.error = entry.error;
+                    } else {
+                        t.insert(a.endpoint.clone(), entry);
+                    }
+                }
+            }
         }
     }
 
@@ -483,13 +518,13 @@ pub async fn refresh_overview(app: &Arc<AppState>, force_gdrive: bool) -> Overvi
             .and_then(|x| x.as_f64())
             .map(|ts| (now - ts).max(0.0));
 
-        // 自动感知新实例或探针失联实例，后台静默注入遥测守护进程
-        let needs_probe = tel.is_none() || age.map(|x| x > 25.0).unwrap_or(true);
+        // 自动感知新实例或探针失联实例（超过 45 秒未更新），后台静默注入遥测守护进程
+        let needs_probe = tel.is_none() || age.map(|x| x > 45.0).unwrap_or(true);
         if needs_probe && !busy.contains_key(&name) {
             let should_trigger = {
                 let mut cd = app.probe_cooldown.lock().unwrap();
                 match cd.get(&a.endpoint) {
-                    Some(last) if last.elapsed() < Duration::from_secs(25) => false,
+                    Some(last) if last.elapsed() < Duration::from_secs(40) => false,
                     _ => {
                         cd.insert(a.endpoint.clone(), Instant::now());
                         true
@@ -670,6 +705,9 @@ pub async fn hard_terminate(
 
     if r.verified_unassigned {
         app.telemetry.lock().unwrap().remove(&ep);
+        if let Some((list, _)) = app.last_assignments.lock().unwrap().as_mut() {
+            list.retain(|a| a.endpoint != ep);
+        }
         if cli::read_sessions().contains_key(name) && cli::colab_bin().exists() {
             let _ = cli::run_simple(&cli::colab_bin(), &s(&["sessions"]), Duration::from_secs(60)).await;
             r.steps.push("已同步清理 colab-cli 本地会话表".into());
@@ -934,6 +972,8 @@ fn print_overview_headless() {
             workspace,
             overview: tokio::sync::RwLock::new(Overview::default()),
             telemetry: Mutex::new(HashMap::new()),
+            last_assignments: Mutex::new(None),
+            last_ccu: Mutex::new(None),
             relays: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
             probe_cooldown: Mutex::new(HashMap::new()),
@@ -954,6 +994,8 @@ fn selftest_lifecycle() {
             workspace: Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf(),
             overview: tokio::sync::RwLock::new(Overview::default()),
             telemetry: Mutex::new(HashMap::new()),
+            last_assignments: Mutex::new(None),
+            last_ccu: Mutex::new(None),
             relays: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
             probe_cooldown: Mutex::new(HashMap::new()),
@@ -1014,6 +1056,8 @@ pub fn run() {
                 workspace: resolve_workspace(app),
                 overview: tokio::sync::RwLock::new(Overview::default()),
                 telemetry: Mutex::new(HashMap::new()),
+                last_assignments: Mutex::new(None),
+                last_ccu: Mutex::new(None),
                 relays: Mutex::new(HashMap::new()),
                 busy: Mutex::new(HashMap::new()),
                 probe_cooldown: Mutex::new(HashMap::new()),

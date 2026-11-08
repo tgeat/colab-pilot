@@ -128,8 +128,11 @@ fn truncate(s: &str, n: usize) -> String {
 impl ColabClient {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(40))
-            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(12))
+            .pool_idle_timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(2)
+            .tcp_keepalive(Duration::from_secs(15))
             .build()
             .expect("failed to build http client");
         Self {
@@ -205,26 +208,43 @@ impl ColabClient {
     async fn tun_request(&self, method: Method, path: &str, xsrf: Option<&str>) -> Result<String> {
         let token = self.access_token().await?;
         let url = format!("{COLAB_DOMAIN}{path}");
-        let mut rb = self
-            .http
-            .request(method.clone(), &url)
-            .query(&[("authuser", "0")])
-            .bearer_auth(token)
-            .header("Accept", "application/json")
-            .header("X-Colab-Client-Agent", "colab-cli");
-        if let Some(x) = xsrf {
-            rb = rb.header("X-Goog-Colab-Token", x);
+        let mut last_err = None;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+            }
+            let mut rb = self
+                .http
+                .request(method.clone(), &url)
+                .query(&[("authuser", "0")])
+                .bearer_auth(&token)
+                .header("Accept", "application/json")
+                .header("X-Colab-Client-Agent", "colab-cli");
+            if let Some(x) = xsrf {
+                rb = rb.header("X-Goog-Colab-Token", x);
+            }
+            if method == Method::POST {
+                rb = rb.body(Vec::<u8>::new());
+            }
+            match rb.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    if status.is_success() {
+                        return Ok(text.strip_prefix(XSSI_PREFIX).unwrap_or(&text).to_string());
+                    }
+                    if status.is_server_error() && attempt == 0 {
+                        last_err = Some(anyhow!("HTTP {} @ {}: {}", status, path, truncate(&text, 240)));
+                        continue;
+                    }
+                    return Err(anyhow!("HTTP {} @ {}: {}", status, path, truncate(&text, 240)));
+                }
+                Err(e) => {
+                    last_err = Some(anyhow!("请求 {path} 失败: {e}"));
+                }
+            }
         }
-        if method == Method::POST {
-            rb = rb.body(Vec::<u8>::new());
-        }
-        let resp = rb.send().await.with_context(|| format!("请求 {path} 失败"))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("HTTP {} @ {}: {}", status, path, truncate(&text, 240)));
-        }
-        Ok(text.strip_prefix(XSSI_PREFIX).unwrap_or(&text).to_string())
+        Err(last_err.unwrap_or_else(|| anyhow!("请求 {path} 失败")))
     }
 
     pub async fn ccu_info(&self) -> Result<Ccu> {
@@ -260,35 +280,60 @@ impl ColabClient {
 
     /// 读取云端文件文本内容；文件不存在返回 Ok(None)
     pub async fn contents_read_text(&self, a: &Assignment, path: &str) -> Result<Option<String>> {
-        let resp = self
-            .http
-            .get(Self::contents_url(a, path))
-            .query(&[
-                ("authuser", "0"),
-                ("colab-runtime-proxy-token", a.runtime_proxy_info.token.as_str()),
-                ("content", "1"),
-            ])
-            .timeout(Duration::from_secs(12))
-            .send()
-            .await?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            return Err(anyhow!("Contents API HTTP {}", resp.status()));
-        }
-        let v: Value = resp.json().await?;
-        let content = v.get("content").cloned().unwrap_or(Value::Null);
-        let fmt = v.get("format").and_then(|f| f.as_str()).unwrap_or("text");
-        Ok(Some(match content {
-            Value::String(s) if fmt == "base64" => {
-                let bytes = base64::engine::general_purpose::STANDARD.decode(s.trim())?;
-                String::from_utf8_lossy(&bytes).to_string()
+        let url = Self::contents_url(a, path);
+        let mut last_err = None;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
             }
-            Value::String(s) => s,
-            Value::Null => String::new(),
-            other => other.to_string(),
-        }))
+            let send_res = self
+                .http
+                .get(&url)
+                .query(&[
+                    ("authuser", "0"),
+                    ("colab-runtime-proxy-token", a.runtime_proxy_info.token.as_str()),
+                    ("content", "1"),
+                ])
+                .timeout(Duration::from_secs(12))
+                .send()
+                .await;
+            let resp = match send_res {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(anyhow!("Contents API 请求失败: {e}"));
+                    continue;
+                }
+            };
+            if resp.status() == StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            if resp.status().is_server_error() && attempt == 0 {
+                last_err = Some(anyhow!("Contents API HTTP {}", resp.status()));
+                continue;
+            }
+            if !resp.status().is_success() {
+                return Err(anyhow!("Contents API HTTP {}", resp.status()));
+            }
+            let v: Value = match resp.json().await {
+                Ok(val) => val,
+                Err(e) => {
+                    last_err = Some(anyhow!("Contents API JSON 解析失败: {e}"));
+                    continue;
+                }
+            };
+            let content = v.get("content").cloned().unwrap_or(Value::Null);
+            let fmt = v.get("format").and_then(|f| f.as_str()).unwrap_or("text");
+            return Ok(Some(match content {
+                Value::String(s) if fmt == "base64" => {
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(s.trim())?;
+                    String::from_utf8_lossy(&bytes).to_string()
+                }
+                Value::String(s) => s,
+                Value::Null => String::new(),
+                other => other.to_string(),
+            }));
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("Contents API 读取超时")))
     }
 
     /// 以 base64 上传本地字节到云端路径（与 colab upload 行为一致）

@@ -1,5 +1,8 @@
 # Colab Pilot
 
+[![Built with Antigravity](https://img.shields.io/badge/Built%20with-Google%20Antigravity-4285F4?logo=google&logoColor=white)](https://antigravity.google)
+[![Powered by Gemini](https://img.shields.io/badge/AI-Google%20Gemini-8E75B2?logo=googlegemini&logoColor=white)](https://deepmind.google/technologies/gemini/)
+
 Google Colab 虚拟机管理与 24h+ 全自动接力训练桌面应用。技术栈：**Tauri 2 + React 18 + TypeScript + Rust**。
 
 ## 运行
@@ -42,3 +45,7 @@ src-tauri\target\debug\colab-pilot.exe --selftest-relay        # 仅调试构建
 ```
 
 旧版 Python/Tornado 实现保留在 `legacy/` 目录中。
+
+## 致谢 (Acknowledgments)
+
+本项目由 [Google Antigravity](https://antigravity.google) 与 [Google Gemini](https://deepmind.google/technologies/gemini/) 辅助开发完成。

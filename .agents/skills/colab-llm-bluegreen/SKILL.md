@@ -34,6 +34,12 @@ This skill standardizes Large Language Model (LLM) deployment on Google Colab ac
 4. **Make-Before-Break Parallel Hot Switchover (`<prefix>-blue` ↔ `<prefix>-green`)**:
    - While `llm-blue` serves traffic, `llm-green` is provisioned in parallel, pulls weights, and runs the **Cloud Warmup Smoke Test**.
    - Only after `llm-green` passes the warmup check (`SLOT_READY`), traffic is atomically switched (`llm-green` → `ACTIVE`, `llm-blue` → `DRAINING`) and `llm-blue` is terminated (`colab stop -s llm-blue`).
+5. **Colab Pro+ 60-Minute Idle Kernel Reaper Protection (Triple Keep-Alive)**:
+   - Because `llama-server` and `llm_metrics_sidecar.py` run as detached OS processes (`start_new_session=True`), the Jupyter Kernel returns to `execution_state: "idle"` after `deploy` completes. Even on **Colab Pro+**, Google Colab's idle reaper reclaims VMs if the Jupyter Kernel remains `idle` with `0` connections for ~60 minutes, and `runtimeProxyInfo.token` expires after 3600 seconds.
+   - [`llm_local_gateway.py`](./scripts/llm_local_gateway.py) runs a background `_keepalive_worker` every **90 seconds** that:
+     1. Calls `/tun/m/keep-alive/{endpoint}` (`X-Colab-Tunnel: Google`) to renew the Colab tunnel lease.
+     2. Refreshes `runtimeProxyInfo.token` from `/tun/m/assignments` into `~/.config/colab-cli/sessions.json`.
+     3. Sends a lightweight `pass` execution to the remote Jupyter Kernel via `ColabRuntime` to refresh `last_activity` without blocking user chat requests.
 
 ---
 

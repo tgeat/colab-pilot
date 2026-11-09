@@ -441,7 +441,41 @@ async fn fetch_telemetry(app: &AppState, a: &Assignment) -> TelemetryEntry {
         .await
     {
         Ok(Some(text)) => match serde_json::from_str::<Value>(&text) {
-            Ok(v) => TelemetryEntry { data: Some(v), error: None },
+            Ok(mut v) => {
+                // 若该实例为蓝绿 LLM 节点且本地 SSH 隧道已打通，直接合并本地隧道 <50ms 的实时计量快照
+                let slot = v
+                    .pointer("/llm/slot")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_lowercase());
+                let local_port = match slot.as_deref() {
+                    Some("blue") => Some(18081u16),
+                    Some("green") => Some(18082u16),
+                    _ => None,
+                };
+                if let Some(port) = local_port {
+                    if let Ok(client) = reqwest::Client::builder()
+                        .no_proxy()
+                        .connect_timeout(Duration::from_millis(180))
+                        .timeout(Duration::from_millis(250))
+                        .build()
+                    {
+                        if let Ok(resp) = client
+                            .get(format!("http://127.0.0.1:{port}/pilot/metrics"))
+                            .send()
+                            .await
+                        {
+                            if resp.status().is_success() {
+                                if let Ok(live_llm) = resp.json::<Value>().await {
+                                    if let Some(obj) = v.as_object_mut() {
+                                        obj.insert("llm".into(), live_llm);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                TelemetryEntry { data: Some(v), error: None }
+            }
             Err(e) => TelemetryEntry { data: None, error: Some(format!("遥测解析失败: {e}")) },
         },
         Ok(None) => TelemetryEntry { data: None, error: Some("正在自动注入遥测探针…".into()) },
@@ -458,22 +492,18 @@ pub async fn refresh_overview(app: &Arc<AppState>, force_gdrive: bool) -> Overvi
         ..Default::default()
     };
 
-    // Google Drive 状态每 30 秒后台刷新一次（不阻塞 Colab 计费与遥测轮询）
+    // Google Drive 状态始终在后台异步刷新（绝不阻塞 Colab 计费与秒级资源遥测轮询）
     {
         let mut gd = app.gdrive.lock().await;
         let stale = gd.1.map(|t| t.elapsed() > Duration::from_secs(30)).unwrap_or(true);
         if (stale || force_gdrive) && env.rclone_ok && env.rclone_conf_ok {
             gd.1 = Some(Instant::now());
-            if force_gdrive && gd.0.is_none() {
-                gd.0 = Some(fetch_gdrive_status(DEFAULT_GDRIVE_DIR).await);
-            } else {
-                let app_bg = app.clone();
-                tokio::spawn(async move {
-                    let status = fetch_gdrive_status(DEFAULT_GDRIVE_DIR).await;
-                    let mut g = app_bg.gdrive.lock().await;
-                    g.0 = Some(status);
-                });
-            }
+            let app_bg = app.clone();
+            tokio::spawn(async move {
+                let status = fetch_gdrive_status(DEFAULT_GDRIVE_DIR).await;
+                let mut g = app_bg.gdrive.lock().await;
+                g.0 = Some(status);
+            });
         }
         ov.gdrive = gd.0.clone();
     }
@@ -484,36 +514,54 @@ pub async fn refresh_overview(app: &Arc<AppState>, force_gdrive: bool) -> Overvi
     if !env.token_ok {
         ov.error = Some("未检测到 Colab 登录凭证，请在终端运行 `colab status` 完成 Google 授权".into());
     } else {
-        let (ccu, list) = tokio::join!(app.client.ccu_info(), app.client.list_assignments());
-        match list {
-            Ok(l) => {
-                ov.auth_ok = true;
-                *app.last_assignments.lock().unwrap() = Some((l.clone(), Instant::now()));
-                assignments = l;
-            }
-            Err(e) => {
-                let fallback = app
-                    .last_assignments
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(60))
-                    .map(|(l, _)| l.clone());
-                if let Some(cached) = fallback {
+        // 高频遥测优化：8 秒内直接复用已缓存的计费实例列表与 CU 信息，省去跨洋 /tun/m/ 串行等待，直奔实例遥测快照
+        let cached_fresh = if !force_gdrive {
+            app.last_assignments
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(8))
+                .map(|(l, _)| l.clone())
+        } else {
+            None
+        };
+
+        if let Some(cached_list) = cached_fresh {
+            ov.auth_ok = true;
+            assignments = cached_list;
+            ov.ccu = app.last_ccu.lock().unwrap().clone();
+        } else {
+            let (ccu, list) = tokio::join!(app.client.ccu_info(), app.client.list_assignments());
+            match list {
+                Ok(l) => {
                     ov.auth_ok = true;
-                    assignments = cached;
-                } else {
-                    ov.error = Some(format!("{e:#}"));
+                    *app.last_assignments.lock().unwrap() = Some((l.clone(), Instant::now()));
+                    assignments = l;
+                }
+                Err(e) => {
+                    let fallback = app
+                        .last_assignments
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(60))
+                        .map(|(l, _)| l.clone());
+                    if let Some(cached) = fallback {
+                        ov.auth_ok = true;
+                        assignments = cached;
+                    } else {
+                        ov.error = Some(format!("{e:#}"));
+                    }
                 }
             }
-        }
-        match ccu {
-            Ok(c) => {
-                *app.last_ccu.lock().unwrap() = Some(c.clone());
-                ov.ccu = Some(c);
-            }
-            Err(_) => {
-                ov.ccu = app.last_ccu.lock().unwrap().clone();
+            match ccu {
+                Ok(c) => {
+                    *app.last_ccu.lock().unwrap() = Some(c.clone());
+                    ov.ccu = Some(c);
+                }
+                Err(_) => {
+                    ov.ccu = app.last_ccu.lock().unwrap().clone();
+                }
             }
         }
     }
@@ -1772,13 +1820,13 @@ pub fn run() {
             });
             app.manage(state.clone());
 
-            // 后台轮询：每 4 秒同步服务端计费实例、CU、遥测与 CLI 历史并推送前端
+            // 后台高频轮询：每 1.5 秒同步云端资源遥测与实时 tok/s（计费列表每 8 秒刷新），并推送前端
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
                     let ov = refresh_overview(&state, false).await;
                     emit_overview(&handle, &ov);
-                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
                 }
             });
             Ok(())

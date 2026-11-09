@@ -128,11 +128,12 @@ fn truncate(s: &str, n: usize) -> String {
 impl ColabClient {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(12))
-            .pool_idle_timeout(Duration::from_secs(10))
-            .pool_max_idle_per_host(2)
+            .timeout(Duration::from_secs(20))
+            .connect_timeout(Duration::from_secs(8))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(8)
             .tcp_keepalive(Duration::from_secs(15))
+            .tcp_nodelay(true)
             .build()
             .expect("failed to build http client");
         Self {

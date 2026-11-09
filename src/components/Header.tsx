@@ -70,7 +70,7 @@ export function Header(props: {
             className="icon-btn"
             onClick={props.onRefresh}
             disabled={props.refreshing}
-            title="立即刷新（每 4 秒自动同步）"
+            title="立即刷新（每 1.5 秒自动高频同步）"
           >
             <RefreshCw size={15} className={props.refreshing ? "spin" : ""} />
           </button>

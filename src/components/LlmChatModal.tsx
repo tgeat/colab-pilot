@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   Check,
@@ -53,6 +53,332 @@ export function isLlmVm(vm: VmView): boolean {
   if (vm.name.startsWith("llm-")) return true;
   return false;
 }
+
+// ───────────────────────────── 轻量级流式 Markdown 渲染器 ─────────────────────────────
+
+function renderInlineMarkdown(text: string, keyPrefix = "in"): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  // 匹配行内代码 `code`、链接 [text](url)、粗斜体 ***text***、粗体 **text**、删除线 ~~text~~、斜体 *text*
+  const tokenRegex =
+    /(`[^`\n]+`|\[[^\]]+\]\([^)\s]+\)|\*\*\*[^*\n]+\*\*\*|\*\*[^*\n]+\*\*|__[^_\n]+__|~~[^~\n]+~~|\*[^*\s][^*\n]*\*)/g;
+
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let idx = 0;
+
+  while ((match = tokenRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index));
+    }
+    const raw = match[0];
+    const k = `${keyPrefix}-${idx++}`;
+
+    if (raw.startsWith("`") && raw.endsWith("`")) {
+      nodes.push(
+        <code key={k} className="md-inline-code">
+          {raw.slice(1, -1)}
+        </code>,
+      );
+    } else if (raw.startsWith("[") && raw.includes("](") && raw.endsWith(")")) {
+      const splitPos = raw.indexOf("](");
+      const label = raw.slice(1, splitPos);
+      const url = raw.slice(splitPos + 2, -1);
+      nodes.push(
+        <a key={k} href={url} target="_blank" rel="noreferrer" className="md-link">
+          {renderInlineMarkdown(label, k)}
+        </a>,
+      );
+    } else if (raw.startsWith("***") && raw.endsWith("***")) {
+      nodes.push(
+        <strong key={k}>
+          <em>{renderInlineMarkdown(raw.slice(3, -3), k)}</em>
+        </strong>,
+      );
+    } else if (
+      (raw.startsWith("**") && raw.endsWith("**")) ||
+      (raw.startsWith("__") && raw.endsWith("__"))
+    ) {
+      nodes.push(<strong key={k}>{renderInlineMarkdown(raw.slice(2, -2), k)}</strong>);
+    } else if (raw.startsWith("~~") && raw.endsWith("~~")) {
+      nodes.push(<del key={k}>{renderInlineMarkdown(raw.slice(2, -2), k)}</del>);
+    } else if (raw.startsWith("*") && raw.endsWith("*")) {
+      nodes.push(<em key={k}>{renderInlineMarkdown(raw.slice(1, -1), k)}</em>);
+    } else {
+      nodes.push(raw);
+    }
+    lastIndex = tokenRegex.lastIndex;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+  return nodes;
+}
+
+function CodeBlockCard({ lang, code }: { lang: string; code: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const onCopy = () => {
+    navigator.clipboard.writeText(code).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1400);
+    });
+  };
+
+  return (
+    <div className="md-code-card">
+      <div className="md-code-head">
+        <span className="md-code-lang">{lang || "code"}</span>
+        <button type="button" className="md-code-copy" onClick={onCopy} title="复制代码">
+          {copied ? (
+            <>
+              <Check size={12} color="var(--success)" /> 已复制
+            </>
+          ) : (
+            <>
+              <Copy size={12} /> 复制代码
+            </>
+          )}
+        </button>
+      </div>
+      <pre className="md-pre">
+        <code>{code}</code>
+      </pre>
+    </div>
+  );
+}
+
+function renderTextBlocks(markdown: string, keyPrefix: string): ReactNode[] {
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const blocks: ReactNode[] = [];
+  let i = 0;
+  let bIdx = 0;
+
+  const isTableSep = (line: string) =>
+    /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*(?::?-{3,}:?\s*)?\|?\s*$/.test(line);
+
+  const splitTableCells = (line: string) => {
+    let trimmed = line.trim();
+    if (trimmed.startsWith("|")) trimmed = trimmed.slice(1);
+    if (trimmed.endsWith("|")) trimmed = trimmed.slice(0, -1);
+    return trimmed.split("|").map((c) => c.trim());
+  };
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      i++;
+      continue;
+    }
+
+    // 1. 分割线 --- / ***
+    if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      blocks.push(<hr key={`${keyPrefix}-hr-${bIdx++}`} className="md-hr" />);
+      i++;
+      continue;
+    }
+
+    // 2. 标题 # ~ ######
+    const headingMatch = line.match(/^\s*(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const content = renderInlineMarkdown(headingMatch[2].trim(), `${keyPrefix}-h-${bIdx}`);
+      const k = `${keyPrefix}-h-${bIdx++}`;
+      if (level === 1) blocks.push(<h1 key={k} className="md-h1">{content}</h1>);
+      else if (level === 2) blocks.push(<h2 key={k} className="md-h2">{content}</h2>);
+      else if (level === 3) blocks.push(<h3 key={k} className="md-h3">{content}</h3>);
+      else blocks.push(<h4 key={k} className="md-h4">{content}</h4>);
+      i++;
+      continue;
+    }
+
+    // 3. Markdown 表格
+    if (line.includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      const headers = splitTableCells(lines[i]);
+      i += 2;
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
+        rows.push(splitTableCells(lines[i]));
+        i++;
+      }
+      const k = `${keyPrefix}-tbl-${bIdx++}`;
+      blocks.push(
+        <div key={k} className="md-table-wrap">
+          <table className="md-table">
+            <thead>
+              <tr>
+                {headers.map((h, hIdx) => (
+                  <th key={hIdx}>{renderInlineMarkdown(h, `${k}-th-${hIdx}`)}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, rIdx) => (
+                <tr key={rIdx}>
+                  {headers.map((_, cIdx) => (
+                    <td key={cIdx}>
+                      {renderInlineMarkdown(r[cIdx] ?? "", `${k}-td-${rIdx}-${cIdx}`)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      );
+      continue;
+    }
+
+    // 4. 引用块 >
+    if (/^\s*>\s?/.test(line)) {
+      const quoteLines: string[] = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+        quoteLines.push(lines[i].replace(/^\s*>\s?/, ""));
+        i++;
+      }
+      const k = `${keyPrefix}-q-${bIdx++}`;
+      blocks.push(
+        <blockquote key={k} className="md-quote">
+          {renderInlineMarkdown(quoteLines.join("\n"), k)}
+        </blockquote>,
+      );
+      continue;
+    }
+
+    // 5. 无序列表 - / * / +
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items: { checked?: boolean; text: string }[] = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+        const rawItem = lines[i].replace(/^\s*[-*+]\s+/, "");
+        const taskMatch = rawItem.match(/^\[([ xX])\]\s+(.*)$/);
+        if (taskMatch) {
+          items.push({
+            checked: taskMatch[1].toLowerCase() === "x",
+            text: taskMatch[2],
+          });
+        } else {
+          items.push({ text: rawItem });
+        }
+        i++;
+      }
+      const k = `${keyPrefix}-ul-${bIdx++}`;
+      blocks.push(
+        <ul key={k} className="md-list">
+          {items.map((it, idx) => (
+            <li key={idx} className={it.checked !== undefined ? "md-task-item" : ""}>
+              {it.checked !== undefined && (
+                <input type="checkbox" checked={it.checked} readOnly className="md-checkbox" />
+              )}
+              <span>{renderInlineMarkdown(it.text, `${k}-li-${idx}`)}</span>
+            </li>
+          ))}
+        </ul>,
+      );
+      continue;
+    }
+
+    // 6. 有序列表 1. / 2.
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, ""));
+        i++;
+      }
+      const k = `${keyPrefix}-ol-${bIdx++}`;
+      blocks.push(
+        <ol key={k} className="md-list md-ol">
+          {items.map((it, idx) => (
+            <li key={idx}>{renderInlineMarkdown(it, `${k}-oli-${idx}`)}</li>
+          ))}
+        </ol>,
+      );
+      continue;
+    }
+
+    // 7. 普通段落（合并连续普通文本行）
+    const paraLines: string[] = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() !== "" &&
+      !/^\s*(#{1,6}\s+|[-*+]\s+|\d+\.\s+|>\s?|(?:-{3,}|\*{3,}|_{3,})$)/.test(lines[i]) &&
+      !(lines[i].includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1]))
+    ) {
+      paraLines.push(lines[i]);
+      i++;
+    }
+    const k = `${keyPrefix}-p-${bIdx++}`;
+    blocks.push(
+      <p key={k} className="md-p">
+        {paraLines.map((pl, pIdx) => (
+          <span key={pIdx}>
+            {pIdx > 0 && <br />}
+            {renderInlineMarkdown(pl, `${k}-l-${pIdx}`)}
+          </span>
+        ))}
+      </p>,
+    );
+  }
+
+  return blocks;
+}
+
+function MarkdownContent({ content, streaming }: { content: string; streaming?: boolean }) {
+  // 1. 提取 <think>...</think> 深度思考块（兼容流式未闭合的 <think>）
+  let thinkText: string | null = null;
+  let mainText = content;
+  const thinkClosed = content.match(/^\s*<think>([\s\S]*?)<\/think>\s*/i);
+  if (thinkClosed) {
+    thinkText = thinkClosed[1].trim();
+    mainText = content.slice(thinkClosed[0].length);
+  } else if (/^\s*<think>/i.test(content)) {
+    thinkText = content.replace(/^\s*<think>/i, "").trim();
+    mainText = "";
+  }
+
+  // 2. 拆分围栏代码块 ```lang ... ```（支持流式输出中尚未闭合的代码块）
+  const segments: { type: "text" | "code"; lang?: string; text: string }[] = [];
+  const fenceRegex = /```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)(?:```|$)/g;
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+
+  while ((m = fenceRegex.exec(mainText)) !== null) {
+    if (m.index > lastIdx) {
+      segments.push({ type: "text", text: mainText.slice(lastIdx, m.index) });
+    }
+    segments.push({
+      type: "code",
+      lang: m[1]?.trim() || "text",
+      text: m[2].replace(/\n$/, ""),
+    });
+    lastIdx = fenceRegex.lastIndex;
+  }
+  if (lastIdx < mainText.length) {
+    segments.push({ type: "text", text: mainText.slice(lastIdx) });
+  }
+
+  return (
+    <div className="md-body">
+      {thinkText !== null && (
+        <details className="md-think" open={!!streaming && !mainText}>
+          <summary>💭 深度思考过程</summary>
+          <div className="md-think-body">{thinkText}</div>
+        </details>
+      )}
+      {segments.map((seg, idx) =>
+        seg.type === "code" ? (
+          <CodeBlockCard key={`code-${idx}`} lang={seg.lang ?? "code"} code={seg.text} />
+        ) : (
+          renderTextBlocks(seg.text, `seg-${idx}`)
+        ),
+      )}
+      {streaming && <span className="chat-cursor" />}
+    </div>
+  );
+}
+
+// ───────────────────────────── 大模型交互对话弹窗 ─────────────────────────────
 
 export function LlmChatModal(props: {
   open: boolean;
@@ -548,10 +874,11 @@ export function LlmChatModal(props: {
                     {turn.error ? (
                       <div className="chat-err-text">请求异常：{turn.error}</div>
                     ) : turn.content ? (
-                      <div className="chat-content">
-                        {turn.content}
-                        {turn.streaming && <span className="chat-cursor" />}
-                      </div>
+                      turn.role === "assistant" ? (
+                        <MarkdownContent content={turn.content} streaming={turn.streaming} />
+                      ) : (
+                        <div className="chat-content">{turn.content}</div>
+                      )
                     ) : turn.streaming ? (
                       <div className="chat-thinking">
                         <Loader2 size={14} className="spin" />
@@ -593,7 +920,7 @@ export function LlmChatModal(props: {
                         <button
                           className="chat-copy-btn"
                           onClick={() => handleCopy(turn.id, turn.content)}
-                          title="复制回复内容"
+                          title="复制回复原文"
                         >
                           {copiedId === turn.id ? (
                             <>

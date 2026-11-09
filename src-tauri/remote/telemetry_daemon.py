@@ -383,7 +383,7 @@ def main():
             idle, total, _ = collect_once(idle, total, cpu_model)
         except Exception:
             pass
-        time.sleep(2.5)
+        time.sleep(1.0)
 
 
 if __name__ == "__main__":

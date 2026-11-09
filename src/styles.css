@@ -905,3 +905,120 @@ tr.row-active td {
 .chat-send-btn {
   height: 44px; padding: 0 18px; border-radius: 11px; font-weight: 600; flex-shrink: 0;
 }
+
+/* ───────── 大模型对话 Markdown 渲染样式 (Light Theme) ───────── */
+.md-body {
+  display: flex; flex-direction: column; gap: 10px;
+  font-size: 13.5px; line-height: 1.65; color: var(--text);
+  word-break: break-word;
+}
+.md-body > *:first-child { margin-top: 0; }
+.md-body > *:last-child { margin-bottom: 0; }
+
+.md-h1, .md-h2, .md-h3, .md-h4 {
+  font-weight: 700; color: var(--text); line-height: 1.35; margin-top: 4px;
+}
+.md-h1 { font-size: 17px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+.md-h2 { font-size: 15.5px; padding-bottom: 3px; border-bottom: 1px solid var(--border); }
+.md-h3 { font-size: 14.5px; }
+.md-h4 { font-size: 13.5px; color: var(--text-2); }
+
+.md-p {
+  margin: 0;
+}
+
+.md-list {
+  margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px;
+}
+.md-list li {
+  line-height: 1.6;
+}
+.md-task-item {
+  list-style: none; margin-left: -18px; display: flex; align-items: baseline; gap: 7px;
+}
+.md-checkbox {
+  accent-color: var(--primary); transform: translateY(1px);
+}
+
+.md-quote {
+  margin: 0; padding: 8px 12px; border-left: 3.5px solid var(--primary);
+  background: var(--surface-2); border-radius: 0 8px 8px 0;
+  color: var(--text-2); font-size: 13px; white-space: pre-wrap;
+}
+
+.md-hr {
+  border: none; border-top: 1px solid var(--border); margin: 4px 0;
+}
+
+.md-inline-code {
+  font-family: var(--mono); font-size: 12.5px;
+  background: #eef2ff; color: #3749c9; border: 1px solid #dbe2ff;
+  padding: 1px 6px; border-radius: 5px;
+}
+
+.md-link {
+  color: var(--primary); text-decoration: underline; text-underline-offset: 2px; font-weight: 500;
+}
+.md-link:hover {
+  color: var(--primary-600);
+}
+
+.md-code-card {
+  border: 1px solid var(--border-strong); border-radius: 10px;
+  overflow: hidden; background: #f8f9fc; margin: 2px 0;
+}
+.md-code-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 5px 12px; background: #eef1f8; border-bottom: 1px solid var(--border);
+  font-size: 11.5px; color: var(--text-2);
+}
+.md-code-lang {
+  font-family: var(--mono); font-weight: 700; text-transform: lowercase; color: var(--primary-600);
+}
+.md-code-copy {
+  display: inline-flex; align-items: center; gap: 4px;
+  border: 1px solid var(--border-strong); background: var(--surface);
+  color: var(--text-2); border-radius: 6px; padding: 2px 8px;
+  font-size: 11px; font-weight: 600; cursor: pointer;
+}
+.md-code-copy:hover {
+  background: var(--primary-50); border-color: var(--primary); color: var(--primary-600);
+}
+.md-pre {
+  margin: 0; padding: 11px 14px; overflow-x: auto;
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.55; color: #1e293b;
+  background: #f8f9fc;
+}
+.md-pre code {
+  background: transparent; padding: 0; border-radius: 0; color: inherit; font-size: inherit;
+}
+
+.md-table-wrap {
+  overflow-x: auto; border: 1px solid var(--border); border-radius: 9px; margin: 2px 0;
+}
+.md-table {
+  width: 100%; border-collapse: collapse; font-size: 12.5px;
+}
+.md-table th {
+  background: var(--surface-2); color: var(--text); font-weight: 700;
+  padding: 7px 10px; border-bottom: 1px solid var(--border); text-align: left;
+}
+.md-table td {
+  padding: 6px 10px; border-bottom: 1px solid var(--border);
+  font-family: inherit; white-space: normal; color: var(--text-2);
+}
+.md-table tr:last-child td {
+  border-bottom: none;
+}
+
+.md-think {
+  background: var(--surface-2); border: 1px dashed var(--border-strong);
+  border-radius: 9px; padding: 6px 11px; font-size: 12px; color: var(--text-2);
+}
+.md-think > summary {
+  cursor: pointer; font-weight: 600; color: var(--muted); user-select: none;
+}
+.md-think-body {
+  margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border);
+  white-space: pre-wrap; color: var(--muted); font-size: 12px; line-height: 1.55;
+}

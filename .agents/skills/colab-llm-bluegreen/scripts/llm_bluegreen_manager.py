@@ -281,6 +281,91 @@ class Handler(BaseHTTPRequestHandler):
 ThreadedHTTPServer(("127.0.0.1", 8001), Handler).serve_forever()
 '''
 
+LLAMA_CPP_RUNNER_PY = r'''#!/usr/bin/env python3
+import glob, os, shutil, subprocess, sys, time
+
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+if not os.environ.get("HF_TOKEN"):
+    os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+
+MODEL_SPEC = sys.argv[1]
+MODEL_DIR = "/content/model"
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+llama_server_bin = "/content/llama_bin/llama-b12219/llama-server"
+if not os.path.exists(llama_server_bin):
+    print("[LlamaCpp-Engine] 正在下载并解压官方预编译 CUDA 版 llama-server (b12219)...", flush=True)
+    os.makedirs("/content/llama_bin", exist_ok=True)
+    subprocess.run(
+        "cd /content/llama_bin && "
+        "curl -fsSL https://github.com/ggml-org/llama.cpp/releases/download/b12219/llama-b12219-bin-ubuntu-cuda-12.8-x64.tar.gz | tar -xz && "
+        "curl -fsSL https://github.com/ggml-org/llama.cpp/releases/download/b12219/cudart-llama-b12219-bin-ubuntu-cuda-12.8-x64.tar.gz | tar -xz",
+        shell=True,
+        check=True,
+    )
+
+def find_primary_gguf(root_dir: str):
+    all_ggufs = sorted(glob.glob(os.path.join(root_dir, "**", "*.gguf"), recursive=True))
+    main_ggufs = [
+        p for p in all_ggufs
+        if not os.path.basename(p).startswith(("mmproj", "mtp"))
+        and "-00002-of-" not in os.path.basename(p)
+        and "-00003-of-" not in os.path.basename(p)
+    ]
+    for p in main_ggufs:
+        if "-00001-of-" in os.path.basename(p):
+            return p
+    return main_ggufs[0] if main_ggufs else None
+
+gguf_path = find_primary_gguf(MODEL_DIR)
+if not gguf_path and MODEL_SPEC != MODEL_DIR:
+    repo_id = MODEL_SPEC
+    subdir = None
+    if ":" in MODEL_SPEC and not MODEL_SPEC.startswith(("http://", "https://")):
+        repo_id, subdir = MODEL_SPEC.split(":", 1)
+    from huggingface_hub import HfApi, snapshot_download
+    api = HfApi()
+    files = api.list_repo_files(repo_id=repo_id)
+    allow_patterns = ["*.gguf"]
+    if subdir:
+        allow_patterns = [f"{subdir.rstrip('/')}/*.gguf"]
+    else:
+        for pref in ("IQ3_S/", "Q4_K_M/", "Q4_0/", "IQ3_XXS/", "IQ2_XS/", "Q2_0/"):
+            if any(f.startswith(pref) and f.endswith(".gguf") for f in files):
+                allow_patterns = [f"{pref}*.gguf"]
+                print(f"[LlamaCpp-Engine] 检测到多档位 GGUF 仓库，自动选择推荐档位: {pref.rstrip('/')}", flush=True)
+                break
+    print(f"[LlamaCpp-Engine] 正在从 HuggingFace 高速拉取 GGUF 权重: {repo_id} ({allow_patterns}) ...", flush=True)
+    t0 = time.time()
+    snapshot_download(
+        repo_id=repo_id,
+        local_dir=MODEL_DIR,
+        allow_patterns=allow_patterns,
+    )
+    print(f"[LlamaCpp-Engine] GGUF 权重拉取完成！耗时={time.time()-t0:.1f}s", flush=True)
+    gguf_path = find_primary_gguf(MODEL_DIR)
+
+if not gguf_path:
+    raise RuntimeError(f"未在 {MODEL_DIR} 中找到可用的 .gguf 模型文件")
+
+print(f"[LlamaCpp-Engine] 正在启动 llama-server 加载模型: {gguf_path} ...", flush=True)
+env = os.environ.copy()
+env["LD_LIBRARY_PATH"] = "/content/llama_bin/llama-b12219:/content/llama_bin/cudart-llama-b12219-bin-ubuntu-cuda-12.8-x64:" + env.get("LD_LIBRARY_PATH", "")
+cmd = [
+    llama_server_bin,
+    "-m", gguf_path,
+    "-a", MODEL_SPEC,
+    "-lm", "mmap",
+    "--lazy-mode", "on",
+    "-ngl", "99",
+    "-c", "32768",
+    "--reasoning-budget", "0",
+    "--host", "127.0.0.1",
+    "--port", "8001",
+]
+os.execvpe(llama_server_bin, cmd, env)
+'''
+
 
 def build_cloud_engine_boot_code(
     slot: str,
@@ -338,11 +423,20 @@ elif engine == "vllm":
     ], stdout=open(engine_log, "w"), stderr=subprocess.STDOUT, start_new_session=True)
     builtin_flag = []
 elif engine == "llama.cpp":
-    subprocess.Popen([
-        "/content/llama-server",
-        "-m", "/content/model/model.gguf",
-        "--host", "127.0.0.1", "--port", "8001"
-    ], stdout=open(engine_log, "w"), stderr=subprocess.STDOUT, start_new_session=True)
+    subprocess.run("pkill -f llama-server || true", shell=True)
+    subprocess.run("pkill -f llama_cpp_runner.py || true", shell=True)
+    subprocess.run(["uv", "pip", "install", "--system", "-q", "hf_transfer", "huggingface_hub"], check=False)
+    with open("/content/llama_cpp_runner.py", "w", encoding="utf-8") as f:
+        f.write({json.dumps(LLAMA_CPP_RUNNER_PY)})
+    env_lc = os.environ.copy()
+    env_lc["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    eng_proc = subprocess.Popen(
+        [sys.executable, "-u", "/content/llama_cpp_runner.py", "/content/model" if gdrive_model_path else model_name],
+        env=env_lc,
+        stdout=open(engine_log, "w"),
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
     builtin_flag = []
 elif engine == "transformers":
     subprocess.run(["uv", "pip", "install", "--system", "-q", "flash-linear-attention", "hf_transfer"], check=False)
@@ -382,22 +476,31 @@ subprocess.Popen(
 
 # 等待底层推理引擎 (:8001) 与计量边车 (:8000) 就绪（Colab 云端真机健康探测）
 backend_ready = (engine == "builtin")
-for i in range(450):
+probe_path = "/health" if engine == "llama.cpp" else "/v1/models"
+for i in range(1200):
     if not backend_ready:
         if "eng_proc" in locals() and eng_proc.poll() is not None:
             break
         try:
             c8001 = http.client.HTTPConnection("127.0.0.1", 8001, timeout=3)
-            c8001.request("GET", "/v1/models")
+            c8001.request("GET", probe_path)
             r8001 = c8001.getresponse()
+            _ = r8001.read()
             c8001.close()
-            if r8001.status < 500:
+            if (r8001.status == 200 if engine == "llama.cpp" else r8001.status < 500):
                 backend_ready = True
         except Exception:
-            if i % 5 == 0 and os.path.exists(engine_log):
-                tail = open(engine_log, "r", errors="ignore").read().strip().splitlines()
-                if tail:
-                    print(f"[Engine] {{tail[-1]}}", flush=True)
+            pass
+        if not backend_ready and i % 5 == 0 and os.path.exists(engine_log):
+            raw_log = open(engine_log, "r", errors="ignore").read().replace("\\r", "\\n").strip().splitlines()
+            tail_msg = raw_log[-1] if raw_log else "waiting..."
+            du_str = ""
+            if os.path.isdir("/content/model"):
+                try:
+                    du_str = " | model_dir=" + subprocess.check_output(["du", "-sh", "/content/model"], text=True).split()[0]
+                except Exception:
+                    pass
+            print(f"[Engine] {{tail_msg[-160:]}}{{du_str}}", flush=True)
     if backend_ready:
         break
     time.sleep(2.0)
@@ -525,7 +628,7 @@ def provision_and_warmup_slot(
         env_exec["PYTHONIOENCODING"] = "utf-8"
         env_exec["NO_COLOR"] = "1"
         p_exec = subprocess.Popen(
-            [colab_bin, "exec", "-s", session_name, "--timeout", "900"],
+            [colab_bin, "exec", "-s", session_name, "--timeout", "2400"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -540,9 +643,9 @@ def provision_and_warmup_slot(
         out_lines: List[str] = []
         for line in p_exec.stdout:
             out_lines.append(line)
-            if any(k in line for k in ("[Engine]", "[HF-Engine]", "SLOT_READY", "CLOUD_WARMUP_FAILED", "Error", "Traceback")):
+            if any(k in line for k in ("[Engine]", "[HF-Engine]", "[LlamaCpp-Engine]", "SLOT_READY", "CLOUD_WARMUP_FAILED", "Error", "Traceback")):
                 print("  " + line, end="", flush=True)
-        p_exec.wait(timeout=960)
+        p_exec.wait(timeout=2460)
         out = "".join(out_lines)
         for line in out.splitlines():
             if "SLOT_READY" in line:
@@ -586,13 +689,19 @@ def ensure_local_gateway(gateway_port: int = 18080) -> None:
     gw_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_local_gateway.py")
     if not os.path.exists(gw_script):
         return
+    py_exe = sys.executable
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA", "")
+        cand_pyw = os.path.join(appdata, "uv", "tools", "google-colab-cli", "Scripts", "pythonw.exe")
+        if os.path.exists(cand_pyw):
+            py_exe = cand_pyw
     kwargs: Dict[str, Any] = {"stdin": subprocess.DEVNULL, "close_fds": True}
     if os.name == "nt":
-        kwargs["creationflags"] = 0x08000000 | 0x00000200 | 0x00000008
+        kwargs["creationflags"] = 0x08000000
     else:
         kwargs["start_new_session"] = True
     subprocess.Popen(
-        [sys.executable, gw_script, "--port", str(gateway_port)],
+        [py_exe, gw_script, "--port", str(gateway_port)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         **kwargs,

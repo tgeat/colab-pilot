@@ -477,7 +477,12 @@ def make_handler(tracker: LlmTelemetryTracker):
                                     choices = j.get("choices") or []
                                     if choices:
                                         delta = choices[0].get("delta") or {}
-                                        txt = delta.get("content") or choices[0].get("text") or ""
+                                        txt = (
+                                            delta.get("content")
+                                            or delta.get("reasoning_content")
+                                            or choices[0].get("text")
+                                            or ""
+                                        )
                                         if txt:
                                             tok_inc = _estimate_tokens_from_text(txt)
                                 except Exception:

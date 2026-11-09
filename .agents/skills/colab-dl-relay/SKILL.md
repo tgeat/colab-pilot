@@ -25,6 +25,17 @@ This skill standardizes any local deep learning training script for **cross-inst
 
 ---
 
+## Fast-Path Execution & Windows PowerShell Rules
+
+1. **Omit Empty String Flags in PowerShell**:
+   - In Windows PowerShell 5.1, passing `--gdrive-dataset-dir ""` strips the empty quotes and causes `argparse` to fail with `expected one argument`. Omit `--gdrive-dataset-dir` when no remote dataset directory is needed.
+2. **Avoid Ad-Hoc `colab exec` One-Liners with Nested Quotes**:
+   - Do not construct complex `python -c "..."` strings with nested `\"` or shell pipes `||` in PowerShell. Always invoke `smoke_test_dl.py` and `dl_relay_runner.py` directly via `python -u`.
+3. **Windowless Background Processes on Windows**:
+   - When spawning background daemon processes on Windows, use `creationflags = 0x08000000` (`CREATE_NO_WINDOW`) only; never combine with `DETACHED_PROCESS (0x00000008)` which causes child console binaries (`colab.exe`, `rclone.exe`) to pop up visible flashing console windows.
+
+---
+
 ## Step-by-Step Workflow
 
 ### Step 1: Choose the Adaptation Pattern & Configure the Script
@@ -88,9 +99,9 @@ Use `colab_relay_adapter.py --wrap "<train_cmd>"` to wrap any unmodified reposit
 
 If you want to verify local tensor shapes and checkpoint save/load keys before uploading, run:
 
-```bash
-python .agents/skills/colab-dl-relay/scripts/smoke_test_dl.py \
-  --script train.py \
+```powershell
+python -u "C:\Users\86177\.gemini\config\skills\colab-dl-relay\scripts\smoke_test_dl.py" `
+  --script train.py `
   --gdrive-dir gdrive:colab_relay
 ```
 
@@ -100,19 +111,18 @@ python .agents/skills/colab-dl-relay/scripts/smoke_test_dl.py \
 
 Launch [`dl_relay_runner.py`](./scripts/dl_relay_runner.py) to execute the training on Google Colab via `colab-cli`:
 
-```bash
-python .agents/skills/colab-dl-relay/scripts/dl_relay_runner.py \
-  --session <workspace-session-name> \
-  --workspace . \
-  --script train.py \
-  --gpu T4 \
-  --high-mem \
-  --gdrive-dir gdrive:colab_relay \
-  --gdrive-dataset-dir "" \
-  --total-epochs 100 \
-  --max-session-hours 22.5 \
-  --backup-interval-minutes 30 \
-  --reset-done-flag \
+```powershell
+python -u "C:\Users\86177\.gemini\config\skills\colab-dl-relay\scripts\dl_relay_runner.py" `
+  --session <workspace-session-name> `
+  --workspace . `
+  --script train.py `
+  --gpu T4 `
+  --high-mem `
+  --gdrive-dir gdrive:colab_relay `
+  --total-epochs 100 `
+  --max-session-hours 22.5 `
+  --backup-interval-minutes 30 `
+  --reset-done-flag `
   --detach
 ```
 

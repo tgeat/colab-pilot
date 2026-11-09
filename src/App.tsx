@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AlertTriangle, ArrowRightLeft, GitCompare, History } from "lucide-react";
+import { AlertTriangle, ArrowRightLeft, GitCompare, History, MessageSquare } from "lucide-react";
 import { api, errText } from "./api";
 import type { LlmBlueGreenState, Overview, VmView } from "./types";
 import { Header } from "./components/Header";
+import { LlmChatModal } from "./components/LlmChatModal";
 import { VmCard } from "./components/VmCard";
 import { ColabIcon, ToastProvider, useToast } from "./components/ui";
 
@@ -17,9 +18,11 @@ function fmtLocalTime(iso: string | null) {
 function LlmBlueGreenBanner({
   bg,
   vms,
+  onOpenChat,
 }: {
   bg: LlmBlueGreenState | null | undefined;
   vms: VmView[];
+  onOpenChat: (target: string) => void;
 }) {
   const prefix = bg?.session_prefix ?? "llm";
   const blueVm = vms.find(
@@ -52,16 +55,28 @@ function LlmBlueGreenBanner({
     return (
       <div className={`bg-slot-card slot-${slot} ${role === "active" ? "is-active" : ""}`}>
         <div className="bg-slot-top">
-          <span className={`slot-badge slot-badge-${slot}`}>{slot.toUpperCase()}</span>
-          <span className={`slot-role slot-role-${role}`}>
-            {role === "active"
-              ? "承载流量"
-              : role === "warming"
-                ? "预热中"
-                : role === "draining"
-                  ? "排空中"
-                  : "未启用"}
-          </span>
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <span className={`slot-badge slot-badge-${slot}`}>{slot.toUpperCase()}</span>
+            <span className={`slot-role slot-role-${role}`}>
+              {role === "active"
+                ? "承载流量"
+                : role === "warming"
+                  ? "预热中"
+                  : role === "draining"
+                    ? "排空中"
+                    : "未启用"}
+            </span>
+          </div>
+          {vm && vm.on_server && (
+            <button
+              className="btn btn-sm"
+              onClick={() => onOpenChat(vm.name)}
+              title={`直接与 ${vm.name} (${slot.toUpperCase()}) 槽位进行对话测试`}
+            >
+              <MessageSquare size={13} color="var(--primary)" />
+              <span>对话此槽位</span>
+            </button>
+          )}
         </div>
 
         {vm ? (
@@ -113,6 +128,15 @@ function LlmBlueGreenBanner({
             {activeSlot.toUpperCase()} 在线
           </span>
         </div>
+
+        <button
+          className="btn btn-primary btn-sm"
+          onClick={() => onOpenChat("auto")}
+          title="打开大模型对话窗口（蓝绿热切换时自动无感路由至当前 ACTIVE 槽位）"
+        >
+          <MessageSquare size={14} />
+          <span>打开大模型对话窗口 ({activeSlot.toUpperCase()})</span>
+        </button>
       </div>
 
       <div className="bg-cluster-grid">
@@ -130,6 +154,7 @@ function Dashboard() {
   const toast = useToast();
   const [ov, setOv] = useState<Overview | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [chatTarget, setChatTarget] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -157,7 +182,12 @@ function Dashboard() {
 
   return (
     <>
-      <Header ov={ov} refreshing={refreshing} onRefresh={refresh} />
+      <Header
+        ov={ov}
+        refreshing={refreshing}
+        onRefresh={refresh}
+        onOpenLlmChat={(target) => setChatTarget(target)}
+      />
 
       <main className="main">
         {ov?.error && (
@@ -178,7 +208,11 @@ function Dashboard() {
         )}
 
         {/* LLM 蓝绿槽位（仅在存在 LLM 部署时显示） */}
-        <LlmBlueGreenBanner bg={ov?.llm_bluegreen} vms={vms} />
+        <LlmBlueGreenBanner
+          bg={ov?.llm_bluegreen}
+          vms={vms}
+          onOpenChat={(target) => setChatTarget(target)}
+        />
 
         {vms.length === 0 ? (
           <div className="empty">
@@ -191,7 +225,11 @@ function Dashboard() {
         ) : (
           <div className="vm-list">
             {vms.map((vm) => (
-              <VmCard key={vm.name} vm={vm} />
+              <VmCard
+                key={vm.name}
+                vm={vm}
+                onOpenLlmChat={(name) => setChatTarget(name)}
+              />
             ))}
           </div>
         )}
@@ -232,6 +270,13 @@ function Dashboard() {
           </details>
         )}
       </main>
+
+      <LlmChatModal
+        open={chatTarget !== null}
+        initialTarget={chatTarget ?? "auto"}
+        ov={ov}
+        onClose={() => setChatTarget(null)}
+      />
     </>
   );
 }

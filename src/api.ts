@@ -1,5 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Overview, RelayConfig, RelayStatus, TerminateReceipt, WorkspaceFiles } from "./types";
+import type {
+  LlmChatRequest,
+  LlmChatResponse,
+  Overview,
+  RelayConfig,
+  RelayStatus,
+  TerminateReceipt,
+  WorkspaceFiles,
+} from "./types";
 
 export const api = {
   getOverview: () => invoke<Overview>("get_overview"),
@@ -21,6 +29,7 @@ export const api = {
   readWorkspaceFiles: () => invoke<WorkspaceFiles>("read_workspace_files"),
   saveWorkspaceFiles: (trainPy: string, requirementsTxt: string) =>
     invoke<void>("save_workspace_files", { trainPy, requirementsTxt }),
+  streamLlmChat: (req: LlmChatRequest) => invoke<LlmChatResponse>("stream_llm_chat", { req }),
 };
 
 export function errText(e: unknown): string {

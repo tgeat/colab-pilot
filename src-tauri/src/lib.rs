@@ -8,6 +8,7 @@ mod cli;
 mod colab;
 mod relay;
 
+use anyhow::Context;
 use cli::{s, CliEventView, RecentSessionView, WorkspaceInfo};
 use colab::{Assignment, Ccu, ColabClient};
 use futures::future::join_all;
@@ -106,6 +107,54 @@ pub struct TerminateReceipt {
     pub steps: Vec<String>,
     pub ccu: Option<Ccu>,
     pub error: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Default, Debug)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct LlmChatRequest {
+    pub request_id: String,
+    pub target_vm: String,
+    pub model: Option<String>,
+    pub messages: Vec<ChatMessage>,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct LlmChatStreamEvent {
+    pub request_id: String,
+    /// "start" | "delta" | "done" | "error"
+    pub kind: String,
+    pub vm_name: String,
+    pub slot: Option<String>,
+    pub model: String,
+    pub delta: Option<String>,
+    pub ttft_ms: Option<f64>,
+    pub instant_tps: Option<f64>,
+    pub avg_tps: Option<f64>,
+    pub completion_tokens: Option<u32>,
+    pub elapsed_ms: Option<f64>,
+    pub transport: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct LlmChatResponse {
+    pub request_id: String,
+    pub vm_name: String,
+    pub slot: Option<String>,
+    pub model: String,
+    pub reply: String,
+    pub ttft_ms: f64,
+    pub avg_tps: f64,
+    pub completion_tokens: u32,
+    pub elapsed_ms: f64,
+    pub transport: String,
 }
 
 struct TelemetryEntry {
@@ -930,6 +979,663 @@ fn save_workspace_files(state: AppStateRef<'_>, train_py: String, requirements_t
     Ok(())
 }
 
+// ───────────────────────────── 大语言模型 (LLM) 流式对话网关与云端桥接 ─────────────────────────────
+
+const REMOTE_LLM_CHAT_STREAM_PY: &str = r#"
+import base64, json, sys
+
+url = sys.argv[1]
+token = sys.argv[2]
+pref_port = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 8000
+kernel_id = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+session_id = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
+
+req_raw = sys.stdin.buffer.read()
+req_b64 = base64.b64encode(req_raw).decode("ascii")
+
+remote_code = f'''
+import base64, http.client, json, sys, time
+
+raw_body = base64.b64decode({json.dumps(req_b64)})
+ports = []
+for p in ({pref_port}, 8000, 8001, 11434):
+    if p and p not in ports:
+        ports.append(p)
+
+conn = None
+resp = None
+last_err = "未能连接到云端推理端口 (8000 / 8001 / 11434)"
+for port in ports:
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=300)
+        c.request("POST", "/v1/chat/completions", body=raw_body, headers={{"Content-Type": "application/json"}})
+        r = c.getresponse()
+        if r.status < 400:
+            conn = c
+            resp = r
+            break
+        else:
+            err_txt = r.read().decode("utf-8", "ignore")[:280]
+            last_err = f"端口 {{port}} 返回 HTTP {{r.status}}: {{err_txt}}"
+            c.close()
+    except Exception as e:
+        last_err = f"端口 {{port}} 连接异常: {{e}}"
+
+if resp is None:
+    print("PILOT_ERR:" + json.dumps({{"error": last_err}}, ensure_ascii=False), flush=True)
+else:
+    ctype = (resp.getheader("Content-Type") or "").lower()
+    if "text/event-stream" in ctype:
+        while True:
+            line_b = resp.fp.readline()
+            if not line_b:
+                break
+            line = line_b.decode("utf-8", "ignore").strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if not data_str or data_str == "[DONE]":
+                if data_str == "[DONE]":
+                    break
+                continue
+            try:
+                obj = json.loads(data_str)
+                choices = obj.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {{}}
+                    piece = delta.get("content") or delta.get("reasoning_content") or choices[0].get("text") or ""
+                    if piece:
+                        print("PILOT_DELTA:" + json.dumps({{"d": piece}}, ensure_ascii=False), flush=True)
+            except Exception:
+                pass
+    else:
+        raw_resp = resp.read().decode("utf-8", "ignore")
+        if raw_resp.lstrip().startswith("data:"):
+            for ln in raw_resp.splitlines():
+                ln = ln.strip()
+                if ln.startswith("data:") and ln[5:].strip() != "[DONE]":
+                    try:
+                        obj = json.loads(ln[5:].strip())
+                        delta = (obj.get("choices") or [{{}}])[0].get("delta") or {{}}
+                        piece = delta.get("content") or delta.get("reasoning_content") or ""
+                        if piece:
+                            print("PILOT_DELTA:" + json.dumps({{"d": piece}}, ensure_ascii=False), flush=True)
+                    except Exception:
+                        pass
+        else:
+            try:
+                obj = json.loads(raw_resp)
+                choices = obj.get("choices") or []
+                if choices:
+                    msg = choices[0].get("message") or {{}}
+                    piece = msg.get("content") or choices[0].get("text") or ""
+                    if piece:
+                        print("PILOT_DELTA:" + json.dumps({{"d": piece}}, ensure_ascii=False), flush=True)
+            except Exception as e:
+                print("PILOT_ERR:" + json.dumps({{"error": f"解析云端响应失败: {{e}} ({{raw_resp[:200]}})"}}), flush=True)
+    try:
+        conn.close()
+    except Exception:
+        pass
+'''
+
+from colab_cli.runtime import ColabRuntime
+
+rt = ColabRuntime(url, token, kernel_id=kernel_id, session_id=session_id)
+try:
+    def on_out(out):
+        otype = out.get("output_type", "")
+        if otype == "stream":
+            txt = out.get("text", "")
+            if txt:
+                sys.stdout.write(txt)
+                sys.stdout.flush()
+        elif otype == "error":
+            ename = out.get("ename", "Error")
+            evalue = out.get("evalue", "")
+            sys.stdout.write("PILOT_ERR:" + json.dumps({"error": f"{ename}: {evalue}"}, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
+    rt.execute_code(remote_code, output_hook=on_out, timeout=300)
+finally:
+    rt.stop()
+"#;
+
+fn estimate_tokens(text: &str) -> u32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut cjk = 0u32;
+    let mut ascii_chars = 0u32;
+    for ch in text.chars() {
+        if ('\u{4e00}'..='\u{9fff}').contains(&ch) {
+            cjk += 1;
+        } else {
+            ascii_chars += 1;
+        }
+    }
+    let non_cjk = if ascii_chars > 0 { (ascii_chars / 4).max(1) } else { 0 };
+    (cjk + non_cjk).max(1)
+}
+
+/// 若本机存在蓝绿网关脚本且尚未启动，静默在后台拉起以预热 SSH 隧道
+fn maybe_spawn_local_gateway(workspace: &Path) {
+    let gw_script = workspace
+        .join(".agents")
+        .join("skills")
+        .join("colab-llm-bluegreen")
+        .join("scripts")
+        .join("llm_local_gateway.py");
+    if !gw_script.exists() {
+        return;
+    }
+    let py = cli::colab_python_bin();
+    let mut cmd = std::process::Command::new(py);
+    cmd.arg(gw_script)
+        .arg("--port")
+        .arg("18080")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let _ = cmd.spawn();
+}
+
+struct ResolvedLlmTarget {
+    vm_name: String,
+    slot: Option<String>,
+    model: String,
+    remote_port: u16,
+    local_tunnel_port: Option<u16>,
+    kernel_id: Option<String>,
+    session_id: Option<String>,
+}
+
+async fn resolve_llm_target(app: &Arc<AppState>, req: &LlmChatRequest) -> anyhow::Result<ResolvedLlmTarget> {
+    let mut ov = app.overview.read().await.clone();
+    if ov.vms.is_empty() {
+        ov = refresh_overview(app, false).await;
+    }
+    let bg = cli::read_llm_bluegreen_state();
+    let prefix = bg
+        .as_ref()
+        .and_then(|v| v.get("session_prefix"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("llm");
+    let bg_active_slot = bg
+        .as_ref()
+        .and_then(|v| v.get("active_slot"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_lowercase());
+    let bg_model = bg
+        .as_ref()
+        .and_then(|v| v.get("model_name"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+
+    let wanted = req.target_vm.trim();
+    let vm_opt = if wanted.is_empty() || wanted.eq_ignore_ascii_case("auto") {
+        // 1. 优先匹配蓝绿 ACTIVE 槽位在线实例
+        let by_bg = bg_active_slot.as_ref().and_then(|slot| {
+            let expected = format!("{prefix}-{slot}");
+            ov.vms.iter().find(|v| {
+                v.on_server
+                    && (v.name == expected
+                        || v.name.ends_with(&format!("-{slot}"))
+                        || v.telemetry
+                            .as_ref()
+                            .and_then(|t| t["llm"]["slot"].as_str())
+                            .map(|s| s.eq_ignore_ascii_case(slot))
+                            .unwrap_or(false))
+            })
+        });
+        // 2. 匹配任意 telemetry.llm.online == true 且 role == active 的实例
+        let by_active_llm = ov.vms.iter().find(|v| {
+            v.on_server
+                && v.telemetry
+                    .as_ref()
+                    .map(|t| {
+                        t["llm"]["online"].as_bool() == Some(true)
+                            && t["llm"]["role"].as_str().unwrap_or("active").eq_ignore_ascii_case("active")
+                    })
+                    .unwrap_or(false)
+        });
+        // 3. 匹配任意包含 LLM 遥测或 LLM 进程的在线实例
+        let by_any_llm = ov.vms.iter().find(|v| {
+            v.on_server
+                && v.telemetry
+                    .as_ref()
+                    .map(|t| t["llm"].is_object() || t["threads"]["llm_process"].is_object())
+                    .unwrap_or(false)
+        });
+        by_bg.or(by_active_llm).or(by_any_llm).or_else(|| ov.vms.iter().find(|v| v.on_server))
+    } else {
+        ov.vms.iter().find(|v| v.name == wanted)
+    };
+
+    let Some(vm) = vm_opt else {
+        anyhow::bail!("当前没有在线的大模型 Colab 实例，请先通过 colab-llm-bluegreen 或 colab new 部署实例");
+    };
+
+    let llm_tel = vm.telemetry.as_ref().and_then(|t| t.get("llm"));
+    let slot = llm_tel
+        .and_then(|l| l.get("slot"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_lowercase())
+        .or_else(|| {
+            if vm.name.ends_with("-blue") {
+                Some("blue".into())
+            } else if vm.name.ends_with("-green") {
+                Some("green".into())
+            } else {
+                None
+            }
+        });
+
+    let model = req
+        .model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| {
+            llm_tel
+                .and_then(|l| l.get("model_name"))
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        })
+        .or(bg_model)
+        .unwrap_or_else(|| "default".into());
+
+    let remote_port = llm_tel
+        .and_then(|l| l.get("port"))
+        .and_then(|x| x.as_u64())
+        .map(|p| p as u16)
+        .unwrap_or(8000);
+
+    let local_tunnel_port = match slot.as_deref() {
+        Some("blue") => Some(18081),
+        Some("green") => Some(18082),
+        _ => None,
+    };
+
+    Ok(ResolvedLlmTarget {
+        vm_name: vm.name.clone(),
+        slot,
+        model,
+        remote_port,
+        local_tunnel_port,
+        kernel_id: vm.kernel_id.clone(),
+        session_id: vm.session_id.clone(),
+    })
+}
+
+async fn try_stream_via_local_tunnel(
+    handle: &AppHandle,
+    req: &LlmChatRequest,
+    target: &ResolvedLlmTarget,
+    local_port: u16,
+    body_val: &Value,
+) -> anyhow::Result<LlmChatResponse> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_millis(650))
+        .timeout(Duration::from_secs(300))
+        .build()?;
+
+    let health_url = format!("http://127.0.0.1:{local_port}/pilot/health");
+    let h_resp = client
+        .get(&health_url)
+        .timeout(Duration::from_millis(650))
+        .send()
+        .await?;
+    if !h_resp.status().is_success() {
+        anyhow::bail!("本地 SSH 隧道端口 {local_port} 尚未就绪");
+    }
+
+    let chat_url = format!("http://127.0.0.1:{local_port}/v1/chat/completions");
+    let mut resp = client
+        .post(&chat_url)
+        .header("Content-Type", "application/json")
+        .json(body_val)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err_txt = resp.text().await.unwrap_or_default();
+        anyhow::bail!("本地隧道 HTTP {status}: {err_txt}");
+    }
+
+    let t_start = Instant::now();
+    let mut t_first: Option<Instant> = None;
+    let mut reply = String::new();
+    let mut completion_tokens = 0u32;
+    let mut buf = String::new();
+
+    while let Some(chunk) = resp.chunk().await? {
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].trim().to_string();
+            buf = buf[pos + 1..].to_string();
+            if !line.starts_with("data:") {
+                continue;
+            }
+            let data_str = line[5..].trim();
+            if data_str.is_empty() || data_str == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(data_str) {
+                let piece = v["choices"]
+                    .get(0)
+                    .and_then(|c| {
+                        c["delta"]["content"]
+                            .as_str()
+                            .or_else(|| c["delta"]["reasoning_content"].as_str())
+                            .or_else(|| c["text"].as_str())
+                    })
+                    .unwrap_or("");
+                if !piece.is_empty() {
+                    let first = *t_first.get_or_insert_with(Instant::now);
+                    let ttft_ms = first.duration_since(t_start).as_secs_f64() * 1000.0;
+                    completion_tokens += estimate_tokens(piece);
+                    reply.push_str(piece);
+                    let gen_s = first.elapsed().as_secs_f64().max(0.025);
+                    let inst_tps = (completion_tokens as f64) / gen_s;
+                    let _ = handle.emit(
+                        "llm-chat-event",
+                        LlmChatStreamEvent {
+                            request_id: req.request_id.clone(),
+                            kind: "delta".into(),
+                            vm_name: target.vm_name.clone(),
+                            slot: target.slot.clone(),
+                            model: target.model.clone(),
+                            delta: Some(piece.to_string()),
+                            ttft_ms: Some((ttft_ms * 10.0).round() / 10.0),
+                            instant_tps: Some((inst_tps * 10.0).round() / 10.0),
+                            avg_tps: Some((inst_tps * 10.0).round() / 10.0),
+                            completion_tokens: Some(completion_tokens),
+                            elapsed_ms: Some(t_start.elapsed().as_secs_f64() * 1000.0),
+                            transport: Some(format!("SSH 隧道 (:{local_port})")),
+                            error: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+    let ttft_ms = t_first
+        .map(|f| f.duration_since(t_start).as_secs_f64() * 1000.0)
+        .unwrap_or(elapsed_ms);
+    let gen_s = t_first
+        .map(|f| f.elapsed().as_secs_f64().max(0.025))
+        .unwrap_or_else(|| (elapsed_ms / 1000.0).max(0.025));
+    let avg_tps = ((completion_tokens as f64) / gen_s * 10.0).round() / 10.0;
+
+    Ok(LlmChatResponse {
+        request_id: req.request_id.clone(),
+        vm_name: target.vm_name.clone(),
+        slot: target.slot.clone(),
+        model: target.model.clone(),
+        reply,
+        ttft_ms: (ttft_ms * 10.0).round() / 10.0,
+        avg_tps,
+        completion_tokens,
+        elapsed_ms: elapsed_ms.round(),
+        transport: format!("SSH 隧道 (127.0.0.1:{local_port})"),
+    })
+}
+
+async fn stream_via_colab_runtime(
+    handle: &AppHandle,
+    a: &Assignment,
+    req: &LlmChatRequest,
+    target: &ResolvedLlmTarget,
+    body_val: &Value,
+) -> anyhow::Result<LlmChatResponse> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::process::Command;
+
+    let py = cli::colab_python_bin();
+    let mut cmd = Command::new(&py);
+    cmd.args([
+        "-u",
+        "-c",
+        REMOTE_LLM_CHAT_STREAM_PY,
+        &a.runtime_proxy_info.url,
+        &a.runtime_proxy_info.token,
+        &target.remote_port.to_string(),
+        target.kernel_id.as_deref().unwrap_or(""),
+        target.session_id.as_deref().unwrap_or(""),
+    ])
+    .env("PYTHONUTF8", "1")
+    .env("PYTHONIOENCODING", "utf-8")
+    .env("NO_COLOR", "1")
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+
+    let mut child = cmd.spawn().context("启动 ColabRuntime 流式桥接进程失败")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let payload_bytes = serde_json::to_vec(body_val)?;
+        let _ = stdin.write_all(&payload_bytes).await;
+        let _ = stdin.shutdown().await;
+    }
+
+    let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("无法读取流式桥接输出"))?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let t_start = Instant::now();
+    let mut t_first: Option<Instant> = None;
+    let mut reply = String::new();
+    let mut completion_tokens = 0u32;
+    let mut remote_err: Option<String> = None;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("PILOT_DELTA:") {
+            if let Ok(v) = serde_json::from_str::<Value>(rest) {
+                if let Some(piece) = v.get("d").and_then(|x| x.as_str()) {
+                    if !piece.is_empty() {
+                        let first = *t_first.get_or_insert_with(Instant::now);
+                        let ttft_ms = first.duration_since(t_start).as_secs_f64() * 1000.0;
+                        completion_tokens += estimate_tokens(piece);
+                        reply.push_str(piece);
+                        let gen_s = first.elapsed().as_secs_f64().max(0.025);
+                        let inst_tps = (completion_tokens as f64) / gen_s;
+                        let _ = handle.emit(
+                            "llm-chat-event",
+                            LlmChatStreamEvent {
+                                request_id: req.request_id.clone(),
+                                kind: "delta".into(),
+                                vm_name: target.vm_name.clone(),
+                                slot: target.slot.clone(),
+                                model: target.model.clone(),
+                                delta: Some(piece.to_string()),
+                                ttft_ms: Some((ttft_ms * 10.0).round() / 10.0),
+                                instant_tps: Some((inst_tps * 10.0).round() / 10.0),
+                                avg_tps: Some((inst_tps * 10.0).round() / 10.0),
+                                completion_tokens: Some(completion_tokens),
+                                elapsed_ms: Some(t_start.elapsed().as_secs_f64() * 1000.0),
+                                transport: Some(format!("Colab 直连 (:{} 边车)", target.remote_port)),
+                                error: None,
+                            },
+                        );
+                    }
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("PILOT_ERR:") {
+            if let Ok(v) = serde_json::from_str::<Value>(rest) {
+                remote_err = v.get("error").and_then(|x| x.as_str()).map(|s| s.to_string());
+            } else {
+                remote_err = Some(rest.to_string());
+            }
+        }
+    }
+
+    let _ = child.wait().await;
+    if let Some(err) = remote_err {
+        if reply.is_empty() {
+            anyhow::bail!("{err}");
+        }
+    }
+
+    let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+    let ttft_ms = t_first
+        .map(|f| f.duration_since(t_start).as_secs_f64() * 1000.0)
+        .unwrap_or(elapsed_ms);
+    let gen_s = t_first
+        .map(|f| f.elapsed().as_secs_f64().max(0.025))
+        .unwrap_or_else(|| (elapsed_ms / 1000.0).max(0.025));
+    let avg_tps = ((completion_tokens as f64) / gen_s * 10.0).round() / 10.0;
+
+    Ok(LlmChatResponse {
+        request_id: req.request_id.clone(),
+        vm_name: target.vm_name.clone(),
+        slot: target.slot.clone(),
+        model: target.model.clone(),
+        reply,
+        ttft_ms: (ttft_ms * 10.0).round() / 10.0,
+        avg_tps,
+        completion_tokens,
+        elapsed_ms: elapsed_ms.round(),
+        transport: format!("Colab 直连 (:{} 边车)", target.remote_port),
+    })
+}
+
+#[tauri::command]
+async fn stream_llm_chat(
+    handle: AppHandle,
+    state: AppStateRef<'_>,
+    req: LlmChatRequest,
+) -> Result<LlmChatResponse, String> {
+    let app = state.inner().clone();
+    let target = resolve_llm_target(&app, &req).await.map_err(|e| e.to_string())?;
+
+    let a = app
+        .find_assignment_by_name(&target.vm_name)
+        .await
+        .ok_or_else(|| format!("服务端未找到在线实例 [{}]", target.vm_name))?;
+
+    if target.local_tunnel_port.is_some() {
+        maybe_spawn_local_gateway(&app.workspace);
+    }
+
+    let _ = handle.emit(
+        "llm-chat-event",
+        LlmChatStreamEvent {
+            request_id: req.request_id.clone(),
+            kind: "start".into(),
+            vm_name: target.vm_name.clone(),
+            slot: target.slot.clone(),
+            model: target.model.clone(),
+            delta: None,
+            ttft_ms: None,
+            instant_tps: None,
+            avg_tps: None,
+            completion_tokens: Some(0),
+            elapsed_ms: Some(0.0),
+            transport: None,
+            error: None,
+        },
+    );
+
+    let body_val = serde_json::json!({
+        "model": target.model,
+        "messages": req.messages,
+        "max_tokens": req.max_tokens.unwrap_or(512),
+        "temperature": req.temperature.unwrap_or(0.7),
+        "stream": true,
+    });
+
+    // 优先使用已就绪的本机蓝绿 SSH 隧道（毫秒级直连），若隧道未就绪则无缝回退至 ColabRuntime 直连流式通道
+    let mut res = if let Some(lport) = target.local_tunnel_port {
+        match try_stream_via_local_tunnel(&handle, &req, &target, lport, &body_val).await {
+            Ok(r) if !r.reply.is_empty() => Ok(r),
+            _ => stream_via_colab_runtime(&handle, &a, &req, &target, &body_val).await,
+        }
+    } else {
+        stream_via_colab_runtime(&handle, &a, &req, &target, &body_val).await
+    };
+
+    // 对话完成后立即拉取一次该实例的最新遥测快照（同步云端边车实测 tok/s、TTFT 与曲线）并广播给仪表盘
+    if let Ok(ref mut ok_resp) = res {
+        let entry = fetch_telemetry(&app, &a).await;
+        if let Some(ref tel_val) = entry.data {
+            if let Some(sidecar_tps) = tel_val["llm"]["last_request_tps"]
+                .as_f64()
+                .filter(|&x| x > 0.0)
+                .or_else(|| tel_val["llm"]["instant_tps"].as_f64().filter(|&x| x > 0.0))
+            {
+                ok_resp.avg_tps = (sidecar_tps * 10.0).round() / 10.0;
+            }
+            if let Some(sidecar_ttft) = tel_val["llm"]["ttft_ms"].as_f64().filter(|&x| x > 0.0) {
+                ok_resp.ttft_ms = (sidecar_ttft * 10.0).round() / 10.0;
+            }
+            app.telemetry.lock().unwrap().insert(a.endpoint.clone(), entry);
+        }
+        let app_bg = app.clone();
+        let handle_bg = handle.clone();
+        tokio::spawn(async move {
+            let ov = refresh_overview(&app_bg, false).await;
+            emit_overview(&handle_bg, &ov);
+        });
+    }
+
+    match res {
+        Ok(resp) => {
+            let _ = handle.emit(
+                "llm-chat-event",
+                LlmChatStreamEvent {
+                    request_id: req.request_id.clone(),
+                    kind: "done".into(),
+                    vm_name: resp.vm_name.clone(),
+                    slot: resp.slot.clone(),
+                    model: resp.model.clone(),
+                    delta: None,
+                    ttft_ms: Some(resp.ttft_ms),
+                    instant_tps: Some(resp.avg_tps),
+                    avg_tps: Some(resp.avg_tps),
+                    completion_tokens: Some(resp.completion_tokens),
+                    elapsed_ms: Some(resp.elapsed_ms),
+                    transport: Some(resp.transport.clone()),
+                    error: None,
+                },
+            );
+            Ok(resp)
+        }
+        Err(e) => {
+            let err_str = format!("{e:#}");
+            let _ = handle.emit(
+                "llm-chat-event",
+                LlmChatStreamEvent {
+                    request_id: req.request_id.clone(),
+                    kind: "error".into(),
+                    vm_name: target.vm_name,
+                    slot: target.slot,
+                    model: target.model,
+                    delta: None,
+                    ttft_ms: None,
+                    instant_tps: None,
+                    avg_tps: None,
+                    completion_tokens: None,
+                    elapsed_ms: None,
+                    transport: None,
+                    error: Some(err_str.clone()),
+                },
+            );
+            Err(err_str)
+        }
+    }
+}
+
 // ───────────────────────────── 启动 ─────────────────────────────
 
 fn resolve_workspace(app: &tauri::App) -> PathBuf {
@@ -1086,7 +1792,8 @@ pub fn run() {
             start_relay,
             stop_relay,
             read_workspace_files,
-            save_workspace_files
+            save_workspace_files,
+            stream_llm_chat
         ])
         .run(tauri::generate_context!())
         .expect("error while running Colab Pilot");

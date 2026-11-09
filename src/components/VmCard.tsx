@@ -1,6 +1,7 @@
-import { Clock, Cloud, Cpu, Database, FolderGit2, Gauge, GitCompare, Loader2, Sparkles, Terminal } from "lucide-react";
+import { Clock, Cloud, Cpu, Database, FolderGit2, Gauge, GitCompare, Loader2, MessageSquare, Sparkles, Terminal } from "lucide-react";
 import type { LlmTelemetry, ProcInfo, TrainingTelemetry, VmView } from "../types";
 import { fmtDuration, pct, shortEndpoint } from "../format";
+import { isLlmVm } from "./LlmChatModal";
 import { KV } from "./ui";
 
 /** 云端真正在运行的任务进程（排除僵尸进程 Z 与 Kernel 本身） */
@@ -172,7 +173,15 @@ function TrainingProgressBox({ tr, hasCkpt, ckptMb }: { tr: TrainingTelemetry; h
   );
 }
 
-function LlmSupervisionBox({ llm }: { llm: LlmTelemetry }) {
+function LlmSupervisionBox({
+  llm,
+  vmName,
+  onOpenChat,
+}: {
+  llm: LlmTelemetry;
+  vmName: string;
+  onOpenChat?: (name: string) => void;
+}) {
   const slot = (llm.slot ?? "blue").toLowerCase();
   const role = (llm.role ?? "active").toLowerCase();
   const instantTps = llm.instant_tps ?? 0;
@@ -193,10 +202,22 @@ function LlmSupervisionBox({ llm }: { llm: LlmTelemetry }) {
           <span className={`slot-badge slot-badge-${slot}`}>{slot.toUpperCase()}</span>
           <span className="dim">· {llm.engine ?? "vLLM"} · {role}</span>
         </span>
-        <span className={`online-dot ${llm.online ? "is-online" : "is-offline"}`}>
-          <span className="dot pulse" />
-          {llm.online ? "在线" : "启动中"}
-        </span>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
+          <span className={`online-dot ${llm.online ? "is-online" : "is-offline"}`}>
+            <span className="dot pulse" />
+            {llm.online ? "在线" : "启动中"}
+          </span>
+          {onOpenChat && (
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={() => onOpenChat(vmName)}
+              title={`打开与 ${vmName} (${llm.model_name ?? "LLM"}) 的交互对话窗口`}
+            >
+              <MessageSquare size={13} />
+              <span>打开对话窗口</span>
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="tps-hero">
@@ -257,10 +278,17 @@ function LlmSupervisionBox({ llm }: { llm: LlmTelemetry }) {
   );
 }
 
-export function VmCard({ vm }: { vm: VmView }) {
+export function VmCard({
+  vm,
+  onOpenLlmChat,
+}: {
+  vm: VmView;
+  onOpenLlmChat?: (name: string) => void;
+}) {
   const t = vm.telemetry;
   const tr = t?.training ?? null;
   const llm = t?.llm ?? null;
+  const hasLlm = isLlmVm(vm);
   const stale = vm.telemetry_age !== null && vm.telemetry_age > 25;
 
   const gpu = t?.gpu;
@@ -296,10 +324,26 @@ export function VmCard({ vm }: { vm: VmView }) {
           </span>
           {stale && <span className="warn">遥测延迟 {vm.telemetry_age?.toFixed(0)}s</span>}
         </span>
+        {hasLlm && !llm && onOpenLlmChat && (
+          <button
+            className="btn btn-primary btn-sm"
+            onClick={() => onOpenLlmChat(vm.name)}
+            title={`打开与 ${vm.name} 的大模型对话窗口`}
+          >
+            <MessageSquare size={13} />
+            <span>大模型对话</span>
+          </button>
+        )}
       </div>
 
       <div className="vm-main">
-        {llm && <LlmSupervisionBox llm={llm} />}
+        {llm && (
+          <LlmSupervisionBox
+            llm={llm}
+            vmName={vm.name}
+            onOpenChat={onOpenLlmChat}
+          />
+        )}
         {tr && (
           <TrainingProgressBox
             tr={tr}

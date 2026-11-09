@@ -274,6 +274,49 @@ export interface WorkspaceFiles {
   requirements_txt: string;
 }
 
+export interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+export interface LlmChatRequest {
+  request_id: string;
+  target_vm: string;
+  model: string | null;
+  messages: ChatMessage[];
+  max_tokens?: number;
+  temperature?: number;
+}
+
+export interface LlmChatStreamEvent {
+  request_id: string;
+  kind: "start" | "delta" | "done" | "error";
+  vm_name: string;
+  slot: string | null;
+  model: string;
+  delta: string | null;
+  ttft_ms: number | null;
+  instant_tps: number | null;
+  avg_tps: number | null;
+  completion_tokens: number | null;
+  elapsed_ms: number | null;
+  transport: string | null;
+  error: string | null;
+}
+
+export interface LlmChatResponse {
+  request_id: string;
+  vm_name: string;
+  slot: string | null;
+  model: string;
+  reply: string;
+  ttft_ms: number;
+  avg_tps: number;
+  completion_tokens: number;
+  elapsed_ms: number;
+  transport: string;
+}
+
 export const DEFAULT_RELAY: RelayConfig = {
   gpu_type: "T4",
   high_mem: true,

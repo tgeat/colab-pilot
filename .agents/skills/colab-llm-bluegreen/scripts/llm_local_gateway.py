@@ -365,6 +365,86 @@ def _start_auxiliary_slot_server(port: int, slot: str) -> None:
         pass
 
 
+def _keepalive_worker() -> None:
+    """
+    后台保活与代理令牌自动续期线程（每 90 秒执行一次）：
+    1. 调用 Colab `/tun/m/assignments` 自动刷新 `sessions.json` 中的 `runtimeProxyInfo.token`（防止 3600s 令牌过期）
+    2. 调用 `/tun/m/keep-alive/{endpoint}` (带 `X-Colab-Tunnel: Google` 头) 维持 Google Colab 隧道租约
+    3. 通过 `ColabRuntime` 向云端 Jupyter Kernel 发送轻量心跳 (`pass`)，刷新 Kernel `last_activity`，
+       防止因 `llama-server` 独立后台运行而导致 Jupyter Kernel 被 Google Colab 判定为空闲 (Idle Timeout) 回收实例。
+    """
+    while True:
+        time.sleep(90.0)
+        try:
+            sessions = read_sessions()
+            if not sessions:
+                continue
+
+            # 1. 刷新 assignments 与 runtimeProxyInfo.token，并发送 /tun/m/keep-alive/{endpoint}
+            try:
+                from colab_cli.common import state as colab_state
+
+                assignments = colab_state.client.list_assignments()
+                ep_map = {a.endpoint: a for a in assignments}
+                updated = False
+                for s_name, s_data in list(sessions.items()):
+                    if not isinstance(s_data, dict):
+                        continue
+                    ep = s_data.get("endpoint")
+                    if ep and ep in ep_map:
+                        a = ep_map[ep]
+                        new_tok = a.runtime_proxy_info.token
+                        new_url = a.runtime_proxy_info.url
+                        if new_tok and s_data.get("token") != new_tok:
+                            s_data["token"] = new_tok
+                            s_data["url"] = new_url
+                            updated = True
+                        try:
+                            ka_url = f"{colab_state.client.colab_domain}/tun/m/keep-alive/{ep}"
+                            colab_state.client.session.request(
+                                "GET",
+                                ka_url,
+                                params={"authuser": "0"},
+                                headers={
+                                    "Accept": "application/json",
+                                    "X-Colab-Client-Agent": "colab-cli",
+                                    "X-Colab-Tunnel": "Google",
+                                },
+                                timeout=10,
+                            )
+                        except Exception:
+                            pass
+                if updated:
+                    p = sessions_path()
+                    tmp = p + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(sessions, f, ensure_ascii=False, indent=2)
+                    os.replace(tmp, p)
+            except Exception:
+                pass
+
+            # 2. 对当前活跃的 LLM 会话发送 Jupyter Kernel 轻量心跳，更新 Kernel last_activity
+            _, _, active_sess = resolve_slot_session(None)
+            if active_sess and active_sess.get("url") and active_sess.get("token"):
+                try:
+                    from colab_cli.runtime import ColabRuntime
+
+                    rt = ColabRuntime(
+                        active_sess["url"],
+                        active_sess["token"],
+                        kernel_id=active_sess.get("kernel_id"),
+                        session_id=active_sess.get("session_id"),
+                    )
+                    try:
+                        rt.execute_code("pass", timeout=15)
+                    finally:
+                        rt.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Colab Pilot 本机蓝绿 OpenAI 网关 (纯 Python 无弹窗版)")
     parser.add_argument("--port", type=int, default=18080, help="本机网关监听端口 (默认 18080)")
@@ -386,6 +466,9 @@ def main() -> int:
 
     for slot, port in SLOT_PORTS.items():
         _start_auxiliary_slot_server(port, slot)
+
+    ka_thread = threading.Thread(target=_keepalive_worker, daemon=True)
+    ka_thread.start()
 
     try:
         srv.serve_forever()

@@ -12,6 +12,17 @@ WORKSPACE_META_FILE = "/content/.colab_workspace.json"
 PID_FILE = "/content/.colab_pilot_daemon.pid"
 
 
+def _finite(obj):
+    """递归清洗：非有限浮点数 (NaN / ±Infinity) 转为 None，保证输出严格合法的 JSON。"""
+    if isinstance(obj, float):
+        return obj if obj == obj and obj not in (float("inf"), float("-inf")) else None
+    if isinstance(obj, dict):
+        return {k: _finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite(v) for v in obj]
+    return obj
+
+
 def read_cpu_stat():
     try:
         with open("/proc/stat", "r") as f:
@@ -367,7 +378,7 @@ def collect_once(prev_idle, prev_total, cpu_model):
 
     tmp = TELEMETRY_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
+        json.dump(_finite(payload), f, ensure_ascii=False, allow_nan=False)
     os.replace(tmp, TELEMETRY_FILE)
     return idle, total, payload
 

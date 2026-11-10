@@ -41,6 +41,17 @@ def _default_llm_state_file() -> str:
     return os.path.abspath(".colab_pilot_llm_state.json")
 
 
+def _finite(obj: Any) -> Any:
+    """递归清洗：非有限浮点数 (NaN / ±Infinity) 转为 None，保证输出严格合法的 JSON。"""
+    if isinstance(obj, float):
+        return obj if obj == obj and obj not in (float("inf"), float("-inf")) else None
+    if isinstance(obj, dict):
+        return {k: _finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite(v) for v in obj]
+    return obj
+
+
 class LlmTelemetryTracker:
     """线程安全的 LLM Token 输出频率与蓝绿在线状态统计器"""
 
@@ -58,6 +69,8 @@ class LlmTelemetryTracker:
         state_file: Optional[str] = None,
     ):
         self.lock = threading.Lock()
+        # 状态文件写入锁：后台刷新线程与各请求线程 (on_request_end) 会并发调用 write_state_file
+        self._write_lock = threading.Lock()
         self.slot = slot.lower()
         self.role = role.lower()
         self.engine = engine
@@ -215,10 +228,12 @@ class LlmTelemetryTracker:
         self.check_backend_health()
         snap = self.snapshot(record_history=record_history)
         try:
-            tmp = self.state_file + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(snap, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.state_file)
+            # 每线程独立 tmp 文件名 + 写锁，避免并发写入同一 tmp 导致 JSON 截断/交错
+            tmp = f"{self.state_file}.{threading.get_ident()}.tmp"
+            with self._write_lock:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(_finite(snap), f, ensure_ascii=False, indent=2, allow_nan=False)
+                os.replace(tmp, self.state_file)
         except Exception:
             pass
         return snap
@@ -241,7 +256,7 @@ def make_handler(tracker: LlmTelemetryTracker):
             pass
 
         def _send_json(self, code: int, payload: Dict[str, Any]) -> None:
-            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            raw = json.dumps(_finite(payload), ensure_ascii=False).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))

@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AlertTriangle, ArrowRightLeft, GitCompare, History, MessageSquare } from "lucide-react";
+import { AlertTriangle, ArrowRightLeft, GitCompare, History, MessageSquare, PowerOff } from "lucide-react";
 import { api, errText } from "./api";
 import type { LlmBlueGreenState, Overview, VmView } from "./types";
+import { num, numOrNull, str } from "./format";
+import { DeleteVmDialog } from "./components/DeleteVmDialog";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Header } from "./components/Header";
 import { LlmChatModal } from "./components/LlmChatModal";
 import { VmCard } from "./components/VmCard";
@@ -19,10 +22,12 @@ function LlmBlueGreenBanner({
   bg,
   vms,
   onOpenChat,
+  onShutdown,
 }: {
   bg: LlmBlueGreenState | null | undefined;
   vms: VmView[];
   onOpenChat: (target: string) => void;
+  onShutdown: (vm: VmView) => void;
 }) {
   const prefix = bg?.session_prefix ?? "llm";
   const blueVm = vms.find(
@@ -36,21 +41,21 @@ function LlmBlueGreenBanner({
     return null;
   }
 
-  const activeSlot = (
-    bg?.active_slot ??
-    (greenVm?.telemetry?.llm?.role === "active" ? "green" : "blue")
+  const activeSlot = str(
+    bg?.active_slot,
+    greenVm?.telemetry?.llm?.role === "active" ? "green" : "blue",
   ).toLowerCase();
 
   const renderSlotCard = (slot: "blue" | "green", vm: VmView | undefined) => {
     const llm = vm?.telemetry?.llm;
     const isOnline = !!vm?.on_server && (llm?.online ?? true);
-    const role = (
-      llm?.role ??
-      (isOnline ? (activeSlot === slot ? "active" : "warming") : "standby")
+    const role = str(
+      llm?.role,
+      isOnline ? (activeSlot === slot ? "active" : "warming") : "standby",
     ).toLowerCase();
-    const tps = llm ? (llm.instant_tps || llm.last_request_tps || 0) : 0;
-    const avgTps = llm?.avg_tps_60s ?? 0;
-    const ttft = llm?.ttft_ms ?? llm?.avg_ttft_ms ?? null;
+    const tps = llm ? num(llm.instant_tps) || num(llm.last_request_tps) : 0;
+    const avgTps = num(llm?.avg_tps_60s);
+    const ttft = numOrNull(llm?.ttft_ms) ?? numOrNull(llm?.avg_ttft_ms);
 
     return (
       <div className={`bg-slot-card slot-${slot} ${role === "active" ? "is-active" : ""}`}>
@@ -68,14 +73,25 @@ function LlmBlueGreenBanner({
             </span>
           </div>
           {vm && vm.on_server && (
-            <button
-              className="btn btn-sm"
-              onClick={() => onOpenChat(vm.name)}
-              title={`直接与 ${vm.name} (${slot.toUpperCase()}) 槽位进行对话测试`}
-            >
-              <MessageSquare size={13} color="var(--primary)" />
-              <span>对话此槽位</span>
-            </button>
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <button
+                className="btn btn-sm"
+                onClick={() => onOpenChat(vm.name)}
+                title={`直接与 ${vm.name} (${slot.toUpperCase()}) 槽位进行对话测试`}
+              >
+                <MessageSquare size={13} color="var(--primary)" />
+                <span>对话此槽位</span>
+              </button>
+              <button
+                className="btn btn-danger-ghost btn-sm"
+                onClick={() => onShutdown(vm)}
+                disabled={vm.busy === "deleting"}
+                title={`关机并停止计费 (${vm.name})`}
+              >
+                <PowerOff size={13} />
+                <span>关机</span>
+              </button>
+            </div>
           )}
         </div>
 
@@ -100,14 +116,14 @@ function LlmBlueGreenBanner({
               </div>
               <div>
                 <div className="bg-m-label">累计 Token</div>
-                <div className="bg-m-val">{llm?.total_completion_tokens ?? 0}</div>
+                <div className="bg-m-val">{num(llm?.total_completion_tokens)}</div>
               </div>
             </div>
             <div className="bg-slot-meta">
               <span>
                 <b>{vm.name}</b> · {vm.accelerator}
               </span>
-              <code>{llm?.model_name ?? bg?.model_name ?? "LLM"}</code>
+              <code>{str(llm?.model_name) || str(bg?.model_name) || "LLM"}</code>
             </div>
           </>
         ) : (
@@ -155,6 +171,7 @@ function Dashboard() {
   const [ov, setOv] = useState<Overview | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [chatTarget, setChatTarget] = useState<string | null>(null);
+  const [shutdownVm, setShutdownVm] = useState<VmView | null>(null);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -208,11 +225,14 @@ function Dashboard() {
         )}
 
         {/* LLM 蓝绿槽位（仅在存在 LLM 部署时显示） */}
-        <LlmBlueGreenBanner
-          bg={ov?.llm_bluegreen}
-          vms={vms}
-          onOpenChat={(target) => setChatTarget(target)}
-        />
+        <ErrorBoundary label="llm-bluegreen">
+          <LlmBlueGreenBanner
+            bg={ov?.llm_bluegreen}
+            vms={vms}
+            onOpenChat={(target) => setChatTarget(target)}
+            onShutdown={(vm) => setShutdownVm(vm)}
+          />
+        </ErrorBoundary>
 
         {vms.length === 0 ? (
           <div className="empty">
@@ -225,11 +245,13 @@ function Dashboard() {
         ) : (
           <div className="vm-list">
             {vms.map((vm) => (
-              <VmCard
-                key={vm.name}
-                vm={vm}
-                onOpenLlmChat={(name) => setChatTarget(name)}
-              />
+              <ErrorBoundary key={vm.name} label={`vm:${vm.name}`}>
+                <VmCard
+                  vm={vm}
+                  onOpenLlmChat={(name) => setChatTarget(name)}
+                  onShutdown={(v) => setShutdownVm(v)}
+                />
+              </ErrorBoundary>
             ))}
           </div>
         )}
@@ -271,12 +293,22 @@ function Dashboard() {
         )}
       </main>
 
-      <LlmChatModal
-        open={chatTarget !== null}
-        initialTarget={chatTarget ?? "auto"}
-        ov={ov}
-        onClose={() => setChatTarget(null)}
-      />
+      <ErrorBoundary label="llm-chat">
+        <LlmChatModal
+          open={chatTarget !== null}
+          initialTarget={chatTarget ?? "auto"}
+          ov={ov}
+          onClose={() => setChatTarget(null)}
+        />
+      </ErrorBoundary>
+
+      <ErrorBoundary label="shutdown-vm">
+        <DeleteVmDialog
+          vm={shutdownVm}
+          onClose={() => setShutdownVm(null)}
+          onDelete={(v) => api.deleteVm(v.name, v.endpoint)}
+        />
+      </ErrorBoundary>
     </>
   );
 }

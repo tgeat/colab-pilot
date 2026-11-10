@@ -1,6 +1,6 @@
 import { MessageSquare, RefreshCw } from "lucide-react";
 import type { Overview } from "../types";
-import { fmtBytes } from "../format";
+import { fmtBytes, num, str } from "../format";
 import { isLlmVm } from "./LlmChatModal";
 import { ColabIcon } from "./ui";
 
@@ -12,11 +12,11 @@ export function Header(props: {
 }) {
   const { ov } = props;
   const ccu = ov?.ccu;
-  const rate = ccu?.burn_rate_hourly ?? 0;
+  const rate = num(ccu?.burn_rate_hourly);
   const gd = ov?.gdrive;
   const hasLlm =
     !!ov?.llm_bluegreen || (ov?.vms ?? []).some((v) => isLlmVm(v));
-  const activeSlot = ov?.llm_bluegreen?.active_slot?.toUpperCase();
+  const activeSlot = str(ov?.llm_bluegreen?.active_slot).toUpperCase() || undefined;
 
   // 网盘状态仅在有意义时显示：未授权 / 有断点 / 训练完成
   let gdNote: { text: string; cls: string } | null = null;
@@ -43,7 +43,7 @@ export function Header(props: {
           </div>
           <div className="stat" title="Google Colab 账户剩余计算单元">
             <span className="stat-label">余额</span>
-            <span className="stat-value">{ccu ? `${ccu.balance.toFixed(1)} CU` : "—"}</span>
+            <span className="stat-value">{ccu ? `${num(ccu.balance).toFixed(1)} CU` : "—"}</span>
           </div>
           {gdNote && (
             <div className="stat" title={gd?.error ?? gd?.dir ?? ""}>

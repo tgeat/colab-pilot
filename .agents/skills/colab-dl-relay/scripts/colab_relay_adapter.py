@@ -35,6 +35,38 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
+def _safe_float(v: Any) -> Optional[float]:
+    """安全转换为有限浮点数（支持 Tensor / numpy 标量）；无法转换或 NaN/Inf 时返回 None。"""
+    if v is None:
+        return None
+    try:
+        f = float(v.item() if hasattr(v, "item") else v)
+    except Exception:
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
+
+
+def _finite(obj: Any) -> Any:
+    """递归清洗：非有限浮点数 (NaN / ±Infinity) 转为 None，保证输出严格合法的 JSON。"""
+    if isinstance(obj, bool) or obj is None or isinstance(obj, (int, str)):
+        return obj
+    if isinstance(obj, float):
+        return obj if obj == obj and obj not in (float("inf"), float("-inf")) else None
+    if isinstance(obj, dict):
+        return {k: _finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite(v) for v in obj]
+    if hasattr(obj, "item"):
+        # numpy / torch 标量
+        try:
+            return _finite(obj.item())
+        except Exception:
+            return None
+    return obj
+
+
 def _default_state_file() -> str:
     if os.path.isdir("/content"):
         return "/content/.colab_pilot_training_state.json"
@@ -190,7 +222,9 @@ class ColabRelayContext:
         if metrics:
             for k in ("best_acc", "best_metric", "val_acc", "acc", "f1", "mAP"):
                 if k in metrics and isinstance(metrics[k], (int, float)):
-                    val = float(metrics[k])
+                    val = _safe_float(metrics[k])
+                    if val is None:
+                        continue
                     if self.best_metric is None or val > self.best_metric:
                         self.best_metric = round(val, 5)
 
@@ -199,6 +233,7 @@ class ColabRelayContext:
             avg_ep = sum(self.epoch_durations[-10:]) / len(self.epoch_durations[-10:])
             eta_sec = round(avg_ep * max(0, self.total_epochs - current_epoch), 1)
 
+        loss_f = _safe_float(loss)
         payload = {
             "mode": "dl_relay",
             "framework": self.framework,
@@ -209,7 +244,7 @@ class ColabRelayContext:
             "total_epochs": self.total_epochs,
             "current_step": current_step,
             "total_steps": total_steps,
-            "loss": round(float(loss), 6) if loss is not None else None,
+            "loss": round(loss_f, 6) if loss_f is not None else None,
             "best_metric": self.best_metric,
             "metrics": metrics or {},
             "lr": lr,
@@ -229,7 +264,7 @@ class ColabRelayContext:
         try:
             tmp = self.state_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+                json.dump(_finite(payload), f, ensure_ascii=False, indent=2, allow_nan=False)
             os.replace(tmp, self.state_file)
         except Exception:
             pass
@@ -331,7 +366,7 @@ class ColabRelayContext:
         state: Dict[str, Any] = {
             "epoch": epoch,
             "total_epochs": self.total_epochs,
-            "loss": float(loss),
+            "loss": _safe_float(loss),
             "best_metric": self.best_metric,
             "metrics": metrics or {},
             "extra": extra or {},
@@ -354,20 +389,24 @@ class ColabRelayContext:
         # 同时在 results/ 下写入训练指标摘要
         summary_file = os.path.join(self.results_dir, "training_metrics.json")
         try:
+            loss_f = _safe_float(loss)
             with open(summary_file, "w", encoding="utf-8") as f:
                 json.dump(
-                    {
-                        "model_name": self.model_name,
-                        "last_epoch": epoch,
-                        "total_epochs": self.total_epochs,
-                        "loss": round(float(loss), 6),
-                        "best_metric": self.best_metric,
-                        "metrics": metrics or {},
-                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    },
+                    _finite(
+                        {
+                            "model_name": self.model_name,
+                            "last_epoch": epoch,
+                            "total_epochs": self.total_epochs,
+                            "loss": round(loss_f, 6) if loss_f is not None else None,
+                            "best_metric": self.best_metric,
+                            "metrics": metrics or {},
+                            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    ),
                     f,
                     ensure_ascii=False,
                     indent=2,
+                    allow_nan=False,
                 )
         except Exception:
             pass

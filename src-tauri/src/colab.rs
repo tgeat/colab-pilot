@@ -107,6 +107,8 @@ struct UnassignToken {
 pub struct ColabClient {
     http: reqwest::Client,
     cached: Mutex<Option<(String, Instant)>>,
+    /// 最近一次 refresh_token 续期失败（时间 + 错误信息）：30 秒内直接返回缓存错误，避免高频轮询反复 POST
+    refresh_failure: Mutex<Option<(Instant, String)>>,
 }
 
 pub fn token_path() -> PathBuf {
@@ -139,6 +141,7 @@ impl ColabClient {
         Self {
             http,
             cached: Mutex::new(None),
+            refresh_failure: Mutex::new(None),
         }
     }
 
@@ -172,7 +175,31 @@ impl ColabClient {
             }
         }
 
-        // 2. 使用 refresh_token 静默续期
+        // 2. 使用 refresh_token 静默续期（失败后 30 秒内直接返回缓存错误，不重复请求）
+        const REFRESH_FAIL_BACKOFF: Duration = Duration::from_secs(30);
+        {
+            let fail = self.refresh_failure.lock().await;
+            if let Some((at, msg)) = fail.as_ref() {
+                if at.elapsed() < REFRESH_FAIL_BACKOFF {
+                    return Err(anyhow!("{msg}"));
+                }
+            }
+        }
+        match self.refresh_access_token(&tf).await {
+            Ok((tok, ttl)) => {
+                *self.refresh_failure.lock().await = None;
+                *guard = Some((tok.clone(), Instant::now() + Duration::from_secs(ttl)));
+                Ok(tok)
+            }
+            Err(e) => {
+                *self.refresh_failure.lock().await = Some((Instant::now(), format!("{e:#}")));
+                Err(e)
+            }
+        }
+    }
+
+    /// 向 Google OAuth 端点 POST refresh_token，返回 (access_token, 有效秒数)
+    async fn refresh_access_token(&self, tf: &TokenFile) -> Result<(String, u64)> {
         #[derive(Deserialize)]
         struct RefreshResp {
             access_token: String,
@@ -200,10 +227,9 @@ impl ColabClient {
                 truncate(&text, 200)
             ));
         }
-        let r: RefreshResp = serde_json::from_str(&text)?;
+        let r: RefreshResp = serde_json::from_str(&text).context("解析 Google OAuth 令牌响应失败")?;
         let ttl = r.expires_in.unwrap_or(3600);
-        *guard = Some((r.access_token.clone(), Instant::now() + Duration::from_secs(ttl)));
-        Ok(r.access_token)
+        Ok((r.access_token, ttl))
     }
 
     async fn tun_request(&self, method: Method, path: &str, xsrf: Option<&str>) -> Result<String> {

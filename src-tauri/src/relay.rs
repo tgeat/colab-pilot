@@ -1,9 +1,10 @@
 //! 单台虚拟机的 24h+ 全自动跨实例接力训练监工（对应方案 relay_rclone.sh + train.py）
 
 use crate::cli::{self, s};
-use crate::{hard_terminate, AppState};
+use crate::{hard_terminate, AppState, LockExt};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -51,6 +52,10 @@ pub struct RelayHandle {
     pub status: Mutex<RelayStatus>,
     pub cancel: Mutex<CancellationToken>,
     pub child_pid: Mutex<Option<u32>>,
+    /// 后台监工任务是否仍在执行（stop 后到任务真正退出之间仍为 true，用于拒绝重复启动）
+    pub task_alive: AtomicBool,
+    /// 接力启动代次：仅当前代次的任务退出时才允许改写 running 状态
+    pub gen: AtomicU64,
 }
 
 impl RelayHandle {
@@ -64,12 +69,14 @@ impl RelayHandle {
             }),
             cancel: Mutex::new(CancellationToken::new()),
             child_pid: Mutex::new(None),
+            task_alive: AtomicBool::new(false),
+            gen: AtomicU64::new(0),
         }
     }
 
     pub fn snapshot(&self) -> RelayStatus {
-        let mut st = self.status.lock().unwrap().clone();
-        st.child_pid = *self.child_pid.lock().unwrap();
+        let mut st = self.status.l().clone();
+        st.child_pid = *self.child_pid.l();
         if st.logs.len() > 160 {
             st.logs = st.logs[st.logs.len() - 160..].to_vec();
         }
@@ -77,12 +84,12 @@ impl RelayHandle {
     }
 
     pub fn is_running(&self) -> bool {
-        self.status.lock().unwrap().running
+        self.status.l().running
     }
 
     pub fn log(&self, msg: impl AsRef<str>) {
         let ts = chrono::Local::now().format("%H:%M:%S");
-        let mut st = self.status.lock().unwrap();
+        let mut st = self.status.l();
         st.logs.push(format!("[{ts}] {}", msg.as_ref()));
         if st.logs.len() > 600 {
             let cut = st.logs.len() - 600;
@@ -91,19 +98,19 @@ impl RelayHandle {
     }
 
     pub fn set_phase(&self, phase: &str, label: impl Into<String>) {
-        let mut st = self.status.lock().unwrap();
+        let mut st = self.status.l();
         st.phase = phase.into();
         st.phase_label = label.into();
     }
 
     pub fn token(&self) -> CancellationToken {
-        self.cancel.lock().unwrap().clone()
+        self.cancel.l().clone()
     }
 
     /// 停止接力：取消令牌 + 杀掉本机 colab exec 进程树
     pub async fn stop(&self) {
         self.token().cancel();
-        let pid = *self.child_pid.lock().unwrap();
+        let pid = *self.child_pid.l();
         if let Some(pid) = pid {
             #[cfg(windows)]
             {
@@ -117,7 +124,7 @@ impl RelayHandle {
             #[cfg(not(windows))]
             let _ = pid;
         }
-        let mut st = self.status.lock().unwrap();
+        let mut st = self.status.l();
         st.running = false;
         st.phase = "stopped".into();
         st.phase_label = "已手动停止接力".into();
@@ -197,22 +204,52 @@ async fn sleep_cancellable(secs: u64, cancel: &CancellationToken) -> bool {
     }
 }
 
+/// 任务退出守卫：无论正常结束、出错还是 panic，都会清理运行标记（仅当前代次才改写 running）
+struct RelayTaskGuard {
+    handle: Arc<RelayHandle>,
+    gen: u64,
+}
+
+impl Drop for RelayTaskGuard {
+    fn drop(&mut self) {
+        if self.handle.gen.load(Ordering::SeqCst) == self.gen {
+            self.handle.status.l().running = false;
+            *self.handle.child_pid.l() = None;
+        }
+        self.handle.task_alive.store(false, Ordering::SeqCst);
+    }
+}
+
 pub async fn run_relay(app: Arc<AppState>, handle: Arc<RelayHandle>) {
+    let my_gen = handle.gen.load(Ordering::SeqCst);
+    let _guard = RelayTaskGuard {
+        handle: handle.clone(),
+        gen: my_gen,
+    };
     let cancel = handle.token();
     let result = relay_inner(app.clone(), handle.clone(), cancel.clone()).await;
     if let Err(e) = result {
         if !cancel.is_cancelled() {
             handle.set_phase("error", format!("接力异常：{e}"));
             handle.log(format!("❌ 接力训练发生异常：{e}"));
+            // 计费保护：接力异常中止时若实例仍在服务端计费列表中，立即彻底销毁并核验停费，绝不空转计费
+            let name = handle.status.l().vm_name.clone();
+            if app.find_assignment_by_name(&name).await.is_some() {
+                handle.log("🧹 接力已中止，正在销毁残留实例并核验停止计费…");
+                let r = hard_terminate(&app, &name, None, false).await;
+                handle.log(if r.verified_unassigned {
+                    "✅ 计费已停止"
+                } else {
+                    "⚠️ 销毁未核验，请手动删除"
+                });
+            }
         }
     }
-    handle.status.lock().unwrap().running = false;
-    *handle.child_pid.lock().unwrap() = None;
 }
 
 async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: CancellationToken) -> Result<()> {
-    let name = h.status.lock().unwrap().vm_name.clone();
-    let cfg = h.status.lock().unwrap().config.clone();
+    let name = h.status.l().vm_name.clone();
+    let cfg = h.status.l().config.clone();
     let gdrive = cfg.gdrive_dir.clone();
     let max_secs = cfg.max_session_hours * 3600.0;
     let backup_secs = cfg.backup_interval_minutes * 60.0;
@@ -267,7 +304,7 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
         }
 
         {
-            let mut st = h.status.lock().unwrap();
+            let mut st = h.status.l();
             st.round = round;
             st.round_started_at = Some(chrono::Utc::now().timestamp());
         }

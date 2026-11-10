@@ -1,12 +1,13 @@
 //! 本机 colab / rclone 命令行与状态读取封装（无控制台窗口、UTF-8、工作区与历史日志解析）
 
+use crate::LockExt;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
@@ -129,35 +130,60 @@ pub fn read_sessions() -> HashMap<String, Value> {
         .and_then(|s| serde_json::from_str::<HashMap<String, Value>>(&s).ok())
         .unwrap_or_default();
 
-    // 扫描 Desktop 下各工作区可能通过 `--config` 使用的 .colab-sessions.json
-    if let Some(desktop) = dirs::desktop_dir() {
-        if let Ok(entries) = std::fs::read_dir(&desktop) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    for cand in [".colab-sessions.json", ".colab/sessions.json"] {
-                        let f = p.join(cand);
-                        if f.is_file() {
-                            if let Ok(raw) = std::fs::read_to_string(&f) {
-                                if let Ok(map) = serde_json::from_str::<HashMap<String, Value>>(&raw) {
-                                    for (k, mut v) in map {
-                                        if let Some(obj) = v.as_object_mut() {
-                                            obj.insert(
-                                                "_workspace_path".into(),
-                                                Value::String(p.display().to_string()),
-                                            );
-                                        }
-                                        merged.entry(k).or_insert(v);
-                                    }
-                                }
-                            }
-                        }
+    // 扫描 Desktop 下各工作区可能通过 `--config` 使用的 .colab-sessions.json（文件位置 30 秒缓存，内容每次实时读取）
+    for (p, f) in desktop_session_files() {
+        if let Ok(raw) = std::fs::read_to_string(&f) {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, Value>>(&raw) {
+                for (k, mut v) in map {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("_workspace_path".into(), Value::String(p.display().to_string()));
                     }
+                    merged.entry(k).or_insert(v);
                 }
             }
         }
     }
     merged
+}
+
+/// 桌面扫描与历史摘要缓存有效期（避免每 1.5 秒轮询都全量扫描磁盘）
+const FS_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Desktop 下一级子目录列表（30 秒缓存）
+fn desktop_subdirs() -> Vec<PathBuf> {
+    static CACHE: std::sync::Mutex<Option<(Instant, Vec<PathBuf>)>> = std::sync::Mutex::new(None);
+    if let Some((t, v)) = CACHE.l().as_ref() {
+        if t.elapsed() < FS_CACHE_TTL {
+            return v.clone();
+        }
+    }
+    let list: Vec<PathBuf> = dirs::desktop_dir()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|entries| entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default();
+    *CACHE.l() = Some((Instant::now(), list.clone()));
+    list
+}
+
+/// 桌面各工作区中存在的会话配置文件：(工作区目录, 配置文件路径)（30 秒缓存）
+fn desktop_session_files() -> Vec<(PathBuf, PathBuf)> {
+    static CACHE: std::sync::Mutex<Option<(Instant, Vec<(PathBuf, PathBuf)>)>> = std::sync::Mutex::new(None);
+    if let Some((t, v)) = CACHE.l().as_ref() {
+        if t.elapsed() < FS_CACHE_TTL {
+            return v.clone();
+        }
+    }
+    let mut list = Vec::new();
+    for p in desktop_subdirs() {
+        for cand in [".colab-sessions.json", ".colab/sessions.json"] {
+            let f = p.join(cand);
+            if f.is_file() {
+                list.push((p.clone(), f));
+            }
+        }
+    }
+    *CACHE.l() = Some((Instant::now(), list.clone()));
+    list
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
@@ -613,24 +639,19 @@ pub fn resolve_workspace_for_vm(
                 description: None,
             };
         }
-        if let Ok(entries) = std::fs::read_dir(&desktop) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    if let Some(dn) = p.file_name().and_then(|n| n.to_str()) {
-                        let dn_low = dn.to_lowercase();
-                        let sn_low = session_name.to_lowercase();
-                        if sn_low.starts_with(&dn_low) || dn_low.starts_with(&sn_low) {
-                            return WorkspaceInfo {
-                                name: dn.to_string(),
-                                path: Some(p.display().to_string()),
-                                remote_cwd,
-                                source: "桌面工作区名称匹配".into(),
-                                active_script,
-                                description: None,
-                            };
-                        }
-                    }
+        for p in desktop_subdirs() {
+            if let Some(dn) = p.file_name().and_then(|n| n.to_str()) {
+                let dn_low = dn.to_lowercase();
+                let sn_low = session_name.to_lowercase();
+                if sn_low.starts_with(&dn_low) || dn_low.starts_with(&sn_low) {
+                    return WorkspaceInfo {
+                        name: dn.to_string(),
+                        path: Some(p.display().to_string()),
+                        remote_cwd,
+                        source: "桌面工作区名称匹配".into(),
+                        active_script,
+                        description: None,
+                    };
                 }
             }
         }
@@ -648,7 +669,23 @@ pub fn resolve_workspace_for_vm(
 }
 
 /// 读取最近结束的历史会话摘要（用于仪表盘展示近期工作区执行记录）
+/// 结果按 (活跃会话集合, limit) 缓存 30 秒；活跃实例增减时立即重新计算
 pub fn read_recent_sessions(active_names: &[String], limit: usize) -> Vec<RecentSessionView> {
+    type RecentCache = Option<(Instant, Vec<String>, usize, Vec<RecentSessionView>)>;
+    static CACHE: std::sync::Mutex<RecentCache> = std::sync::Mutex::new(None);
+    let mut key: Vec<String> = active_names.to_vec();
+    key.sort();
+    if let Some((t, k, l, v)) = CACHE.l().as_ref() {
+        if t.elapsed() < FS_CACHE_TTL && *k == key && *l == limit {
+            return v.clone();
+        }
+    }
+    let list = read_recent_sessions_uncached(active_names, limit);
+    *CACHE.l() = Some((Instant::now(), key, limit, list.clone()));
+    list
+}
+
+fn read_recent_sessions_uncached(active_names: &[String], limit: usize) -> Vec<RecentSessionView> {
     let dir = history_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return vec![];
@@ -808,7 +845,7 @@ where
         .spawn()
         .with_context(|| format!("无法启动 {}", bin.display()))?;
     if let Some(slot) = pid_slot {
-        *slot.lock().unwrap() = child.id();
+        *slot.l() = child.id();
     }
 
     if let Some(data) = stdin_data {
@@ -853,7 +890,7 @@ where
     }
     let status = child.wait().await.ok();
     if let Some(slot) = pid_slot {
-        *slot.lock().unwrap() = None;
+        *slot.l() = None;
     }
     Ok(RunOutput {
         code: status.and_then(|s| s.code()).unwrap_or(-1),

@@ -1022,3 +1022,56 @@ tr.row-active td {
   margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border);
   white-space: pre-wrap; color: var(--muted); font-size: 12px; line-height: 1.55;
 }
+
+/* ───────── 紧凑最小窗口自适应 (780 × 520 起) ───────── */
+@media (max-width: 960px) {
+  .topbar-inner {
+    padding: 8px 14px;
+    gap: 10px 14px;
+    flex-wrap: wrap;
+  }
+  .stats {
+    gap: 12px;
+  }
+  .main {
+    padding: 14px 16px 28px;
+  }
+  .workload-grid,
+  .bg-slot-metrics,
+  .chat-telemetry-strip {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .cli-hint-grid {
+    grid-template-columns: 1fr;
+  }
+  .vm-details .kv {
+    grid-template-columns: 1fr 1fr;
+  }
+  .vm-details .kv-item.wide {
+    grid-column: span 2;
+  }
+}
+
+@media (max-height: 640px) {
+  .overlay {
+    padding: 10px;
+  }
+  .modal {
+    max-height: calc(100vh - 20px);
+  }
+  .chat-modal {
+    height: calc(100vh - 20px);
+  }
+  .chat-modal-head {
+    padding: 10px 14px;
+  }
+  .chat-telemetry-strip {
+    padding: 6px 14px;
+  }
+  .chat-body {
+    padding: 12px 14px;
+  }
+  .chat-input-bar {
+    padding: 10px 14px;
+  }
+}

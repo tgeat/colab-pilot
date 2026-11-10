@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, memo, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   Check,
@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { api, errText } from "../api";
 import type { ChatMessage, LlmChatStreamEvent, Overview, VmView } from "../types";
+import { num, numOrNull, str } from "../format";
 import { ColabIcon, useToast } from "./ui";
 
 export interface ConversationTurn {
@@ -180,11 +181,11 @@ function renderTextBlocks(markdown: string, keyPrefix: string): ReactNode[] {
       continue;
     }
 
-    // 2. 标题 # ~ ######
-    const headingMatch = line.match(/^\s*(#{1,6})\s+(.+)$/);
+    // 2. 标题 # ~ ######（兼容流式中间态 "## "：标题文字尚未到达时也必须被消费，否则会死循环）
+    const headingMatch = line.match(/^\s*(#{1,6})(?:\s+(.*))?$/);
     if (headingMatch) {
       const level = headingMatch[1].length;
-      const content = renderInlineMarkdown(headingMatch[2].trim(), `${keyPrefix}-h-${bIdx}`);
+      const content = renderInlineMarkdown((headingMatch[2] ?? "").trim(), `${keyPrefix}-h-${bIdx}`);
       const k = `${keyPrefix}-h-${bIdx++}`;
       if (level === 1) blocks.push(<h1 key={k} className="md-h1">{content}</h1>);
       else if (level === 2) blocks.push(<h2 key={k} className="md-h2">{content}</h2>);
@@ -308,6 +309,11 @@ function renderTextBlocks(markdown: string, keyPrefix: string): ReactNode[] {
       paraLines.push(lines[i]);
       i++;
     }
+    // 兜底：任何未被上述分支消费的行都按普通文本处理，保证循环必然前进（杜绝死循环导致 WebView Out of Memory）
+    if (paraLines.length === 0) {
+      paraLines.push(lines[i]);
+      i++;
+    }
     const k = `${keyPrefix}-p-${bIdx++}`;
     blocks.push(
       <p key={k} className="md-p">
@@ -324,7 +330,14 @@ function renderTextBlocks(markdown: string, keyPrefix: string): ReactNode[] {
   return blocks;
 }
 
-function MarkdownContent({ content, streaming }: { content: string; streaming?: boolean }) {
+// 使用 React.memo：父组件每 1.5s 的概览刷新不会导致已完成的对话被重复解析
+const MarkdownContent = memo(function MarkdownContent({
+  content,
+  streaming,
+}: {
+  content: string;
+  streaming?: boolean;
+}) {
   // 1. 提取 <think>...</think> 深度思考块（兼容流式未闭合的 <think>）
   let thinkText: string | null = null;
   let mainText = content;
@@ -376,9 +389,36 @@ function MarkdownContent({ content, streaming }: { content: string; streaming?: 
       {streaming && <span className="chat-cursor" />}
     </div>
   );
-}
+});
 
 // ───────────────────────────── 大模型交互对话弹窗 ─────────────────────────────
+
+const CHAT_STORAGE_KEY = "colab_pilot_chat_turns_v1";
+/** 发送给模型的历史对话轮数上限（System Prompt 始终保留） */
+const MAX_HISTORY_TURNS = 20;
+
+function loadPersistedTurns(): ConversationTurn[] {
+  try {
+    const raw = window.localStorage.getItem(CHAT_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (t): t is ConversationTurn =>
+          !!t && typeof t === "object" && (t.role === "user" || t.role === "assistant"),
+      )
+      .map((t, idx) => ({
+        ...t,
+        id: str(t.id) || `restored-${idx}-${Math.random().toString(36).slice(2, 7)}`,
+        content: str(t.content),
+        createdAt: str(t.createdAt),
+        streaming: false,
+      }));
+  } catch {
+    return [];
+  }
+}
 
 export function LlmChatModal(props: {
   open: boolean;
@@ -390,12 +430,12 @@ export function LlmChatModal(props: {
   const toast = useToast();
 
   const [targetVm, setTargetVm] = useState<string>(initialTarget || "auto");
-  const [turns, setTurns] = useState<ConversationTurn[]>([]);
+  const [turns, setTurns] = useState<ConversationTurn[]>(() => loadPersistedTurns());
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
-  const [maxTokens, setMaxTokens] = useState(512);
+  const [maxTokens, setMaxTokens] = useState(2048);
   const [temperature, setTemperature] = useState(0.7);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [liveStreamMetrics, setLiveStreamMetrics] = useState<{
@@ -409,6 +449,16 @@ export function LlmChatModal(props: {
   const activeReqIdRef = useRef<string | null>(null);
   const chatBodyRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // 仅在非流式生成期间持久化（避免每个 token 增量都序列化整段历史写入 localStorage）
+  useEffect(() => {
+    if (sending) return;
+    try {
+      window.localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(turns.slice(-60)));
+    } catch {
+      // ignore storage quota errors
+    }
+  }, [turns, sending]);
 
   useEffect(() => {
     if (open && initialTarget) {
@@ -427,12 +477,12 @@ export function LlmChatModal(props: {
   // 解析当前选中的目标实例详情
   const resolvedVm: VmView | undefined = useMemo(() => {
     if (targetVm === "auto") {
-      const prefix = bg?.session_prefix ?? "llm";
-      const activeSlot = (bg?.active_slot ?? "blue").toLowerCase();
+      const prefix = str(bg?.session_prefix, "llm") || "llm";
+      const activeSlot = (str(bg?.active_slot, "blue") || "blue").toLowerCase();
       return (
         llmVms.find(
           (v) =>
-            v.telemetry?.llm?.slot?.toLowerCase() === activeSlot ||
+            str(v.telemetry?.llm?.slot).toLowerCase() === activeSlot ||
             v.name === `${prefix}-${activeSlot}` ||
             v.name.endsWith(`-${activeSlot}`),
         ) ??
@@ -445,24 +495,26 @@ export function LlmChatModal(props: {
 
   const llmTel = resolvedVm?.telemetry?.llm ?? null;
   const displayModel =
-    llmTel?.model_name ?? bg?.model_name ?? resolvedVm?.workspace.description ?? "Colab Cloud LLM";
-  const displayEngine = llmTel?.engine ?? bg?.engine ?? "OpenAI-Compatible";
-  const displaySlot = (
-    liveStreamMetrics?.slot ??
-    llmTel?.slot ??
-    (resolvedVm?.name.endsWith("-green")
-      ? "green"
-      : resolvedVm?.name.endsWith("-blue")
-        ? "blue"
-        : bg?.active_slot ?? null)
-  )?.toLowerCase();
+    str(llmTel?.model_name) || str(bg?.model_name) || str(resolvedVm?.workspace?.description) || "Colab Cloud LLM";
+  const displayEngine = str(llmTel?.engine) || str(bg?.engine) || "OpenAI-Compatible";
+  const displaySlot =
+    str(
+      liveStreamMetrics?.slot ??
+        llmTel?.slot ??
+        (resolvedVm?.name.endsWith("-green")
+          ? "green"
+          : resolvedVm?.name.endsWith("-blue")
+            ? "blue"
+            : bg?.active_slot ?? null),
+    ).toLowerCase() || undefined;
 
   const displayTps =
-    liveStreamMetrics?.tps ??
-    (llmTel ? llmTel.instant_tps || llmTel.last_request_tps || 0 : bg?.warmup_tps ?? 0);
-  const displayAvgTps = llmTel?.avg_tps_60s ?? 0;
-  const displayTtft = liveStreamMetrics?.ttft ?? llmTel?.ttft_ms ?? llmTel?.avg_ttft_ms ?? null;
-  const displayTotalTokens = llmTel?.total_completion_tokens ?? 0;
+    numOrNull(liveStreamMetrics?.tps) ??
+    (llmTel ? num(llmTel.instant_tps) || num(llmTel.last_request_tps) : num(bg?.warmup_tps));
+  const displayAvgTps = num(llmTel?.avg_tps_60s);
+  const displayTtft =
+    numOrNull(liveStreamMetrics?.ttft) ?? numOrNull(llmTel?.ttft_ms) ?? numOrNull(llmTel?.avg_ttft_ms);
+  const displayTotalTokens = num(llmTel?.total_completion_tokens);
 
   // 自动滚动到底部
   useEffect(() => {
@@ -490,6 +542,8 @@ export function LlmChatModal(props: {
             t.id === ev.request_id
               ? {
                   ...t,
+                  // 后端回退到其他传输通道时会从头重新推送，先清空避免文本重复
+                  content: "",
                   vmName: ev.vm_name,
                   slot: ev.slot,
                   model: ev.model,
@@ -598,10 +652,10 @@ export function LlmChatModal(props: {
     if (systemPrompt.trim()) {
       historyMessages.push({ role: "system", content: systemPrompt.trim() });
     }
-    for (const t of turns) {
-      if (!t.error && t.content.trim()) {
-        historyMessages.push({ role: t.role, content: t.content });
-      }
+    // 仅携带最近 MAX_HISTORY_TURNS 轮有效对话，避免上下文无限膨胀
+    const validTurns = turns.filter((t) => !t.error && t.content.trim());
+    for (const t of validTurns.slice(-MAX_HISTORY_TURNS)) {
+      historyMessages.push({ role: t.role, content: t.content });
     }
     historyMessages.push({ role: "user", content: text });
 
@@ -615,7 +669,7 @@ export function LlmChatModal(props: {
       const resp = await api.streamLlmChat({
         request_id: reqId,
         target_vm: targetVm,
-        model: llmTel?.model_name ?? bg?.model_name ?? null,
+        model: str(llmTel?.model_name) || str(bg?.model_name) || null,
         messages: historyMessages,
         max_tokens: maxTokens,
         temperature,
@@ -669,7 +723,12 @@ export function LlmChatModal(props: {
   };
 
   return (
-    <div className="overlay" onClick={onClose}>
+    <div
+      className="overlay"
+      onClick={() => {
+        if (!sending) onClose();
+      }}
+    >
       <div className="modal chat-modal" onClick={(e) => e.stopPropagation()}>
         {/* 顶栏：模型信息、目标节点切换器与实时 tok/s 监控 */}
         <div className="chat-modal-head">
@@ -714,11 +773,11 @@ export function LlmChatModal(props: {
               >
                 <option value="auto">
                   🔄 自动路由活跃节点
-                  {bg?.active_slot ? ` (${bg.active_slot.toUpperCase()})` : ""}
+                  {str(bg?.active_slot) ? ` (${str(bg?.active_slot).toUpperCase()})` : ""}
                 </option>
                 {llmVms.map((v) => {
-                  const sl = v.telemetry?.llm?.slot;
-                  const role = v.telemetry?.llm?.role;
+                  const sl = str(v.telemetry?.llm?.slot);
+                  const role = str(v.telemetry?.llm?.role);
                   return (
                     <option key={v.name} value={v.name}>
                       🖥️ {v.name} ({v.accelerator}
@@ -797,9 +856,9 @@ export function LlmChatModal(props: {
               <label>单次最大生成 (Max Tokens): {maxTokens}</label>
               <input
                 type="range"
-                min={64}
-                max={2048}
-                step={64}
+                min={256}
+                max={8192}
+                step={128}
                 value={maxTokens}
                 onChange={(e) => setMaxTokens(Number(e.target.value))}
               />
@@ -857,15 +916,15 @@ export function LlmChatModal(props: {
                 <div className="chat-bubble-wrap">
                   <div className="chat-meta-top">
                     <span className="chat-sender">
-                      {turn.role === "user" ? "你" : turn.model || displayModel}
+                      {turn.role === "user" ? "你" : str(turn.model) || displayModel}
                     </span>
-                    {turn.role === "assistant" && turn.slot && (
-                      <span className={`slot-badge slot-badge-${turn.slot.toLowerCase()}`}>
-                        {turn.slot.toUpperCase()}
+                    {turn.role === "assistant" && str(turn.slot) && (
+                      <span className={`slot-badge slot-badge-${str(turn.slot).toLowerCase()}`}>
+                        {str(turn.slot).toUpperCase()}
                       </span>
                     )}
-                    {turn.role === "assistant" && turn.vmName && (
-                      <span className="chat-vm-tag">{turn.vmName}</span>
+                    {turn.role === "assistant" && str(turn.vmName) && (
+                      <span className="chat-vm-tag">{str(turn.vmName)}</span>
                     )}
                     <span className="chat-time">{turn.createdAt}</span>
                   </div>
@@ -889,30 +948,30 @@ export function LlmChatModal(props: {
                     )}
                   </div>
 
-                  {turn.role === "assistant" && (turn.content || turn.tps) && (
+                  {turn.role === "assistant" && (!!turn.content || !!num(turn.tps)) && (
                     <div className="chat-meta-foot">
                       <div className="chat-stats-pills">
-                        {turn.tps !== undefined && turn.tps !== null && (
+                        {numOrNull(turn.tps) !== null && (
                           <span className="chat-stat-pill highlight">
                             <Zap size={11} />
-                            {turn.tps.toFixed(1)} tok/s
+                            {num(turn.tps).toFixed(1)} tok/s
                           </span>
                         )}
-                        {turn.ttftMs !== undefined && turn.ttftMs !== null && (
+                        {numOrNull(turn.ttftMs) !== null && (
                           <span className="chat-stat-pill">
-                            TTFT {turn.ttftMs.toFixed(0)} ms
+                            TTFT {num(turn.ttftMs).toFixed(0)} ms
                           </span>
                         )}
-                        {turn.tokens !== undefined && turn.tokens !== null && (
-                          <span className="chat-stat-pill">{turn.tokens} tokens</span>
+                        {numOrNull(turn.tokens) !== null && (
+                          <span className="chat-stat-pill">{num(turn.tokens)} tokens</span>
                         )}
-                        {turn.elapsedMs !== undefined && turn.elapsedMs !== null && (
+                        {numOrNull(turn.elapsedMs) !== null && (
                           <span className="chat-stat-pill">
-                            {(turn.elapsedMs / 1000).toFixed(1)}s
+                            {(num(turn.elapsedMs) / 1000).toFixed(1)}s
                           </span>
                         )}
-                        {turn.transport && (
-                          <span className="chat-stat-pill dim">{turn.transport}</span>
+                        {str(turn.transport) && (
+                          <span className="chat-stat-pill dim">{str(turn.transport)}</span>
                         )}
                       </div>
 

@@ -1,6 +1,6 @@
-import { Clock, Cloud, Cpu, Database, FolderGit2, Gauge, GitCompare, Loader2, MessageSquare, Sparkles, Terminal } from "lucide-react";
+import { Clock, Cloud, Cpu, Database, FolderGit2, Gauge, GitCompare, Loader2, MessageSquare, PowerOff, Sparkles, Terminal } from "lucide-react";
 import type { LlmTelemetry, ProcInfo, TrainingTelemetry, VmView } from "../types";
-import { fmtDuration, pct, shortEndpoint } from "../format";
+import { fmtDuration, num, numOrNull, pct, shortEndpoint, str } from "../format";
 import { isLlmVm } from "./LlmChatModal";
 import { KV } from "./ui";
 
@@ -8,7 +8,7 @@ import { KV } from "./ui";
 function liveActiveProcess(vm: VmView): ProcInfo | null {
   const ap = vm.telemetry?.threads?.active_process ?? null;
   if (!ap) return null;
-  if ((ap.state ?? "").startsWith("Z") || ap.command.includes("<defunct>")) return null;
+  if (str(ap.state).startsWith("Z") || str(ap.command).includes("<defunct>")) return null;
   if (ap.role === "kernel") return null;
   return ap;
 }
@@ -43,7 +43,7 @@ function statusPill(vm: VmView, activeProc: ProcInfo | null) {
     );
   }
   if (llm && llm.online) {
-    const tps = llm.instant_tps || llm.last_request_tps || 0;
+    const tps = num(llm.instant_tps) || num(llm.last_request_tps);
     const cls = llm.role === "warming" ? "pill-amber" : llm.role === "draining" ? "pill-gray" : "pill-green";
     return (
       <span className={`pill ${cls}`}>
@@ -102,9 +102,13 @@ function eventBadgeCls(et: string, hasError: boolean) {
 }
 
 function TrainingProgressBox({ tr, hasCkpt, ckptMb }: { tr: TrainingTelemetry; hasCkpt: boolean; ckptMb: number }) {
-  const cur = tr.current_epoch ?? 0;
-  const tot = tr.total_epochs ?? 100;
+  const cur = num(tr.current_epoch);
+  const tot = num(tr.total_epochs, 100);
   const progress = tot > 0 ? Math.min(100, Math.max(0, (cur / tot) * 100)) : 0;
+  const loss = numOrNull(tr.loss);
+  const modelName = str(tr.model_name);
+  const syncStatus = str(tr.sync_status);
+  const datasetStatus = str(tr.dataset_status);
   const statusMap: Record<string, string> = {
     pulling_dataset: "拉取数据集",
     pulling_checkpoint: "拉取断点",
@@ -115,7 +119,7 @@ function TrainingProgressBox({ tr, hasCkpt, ckptMb }: { tr: TrainingTelemetry; h
     handover_exit: "本棒已退出",
     completed: "已完成",
   };
-  const statusLabel = statusMap[tr.status ?? ""] ?? (tr.status || "运行中");
+  const statusLabel = statusMap[str(tr.status)] ?? (str(tr.status) || "运行中");
 
   return (
     <div className="workload-box dl-box">
@@ -123,10 +127,10 @@ function TrainingProgressBox({ tr, hasCkpt, ckptMb }: { tr: TrainingTelemetry; h
         <span className="workload-title">
           <Sparkles size={14} color="var(--primary)" />
           训练
-          {tr.model_name && <code>{tr.model_name}</code>}
+          {modelName && <code>{modelName}</code>}
           <span className="dim">· {statusLabel}</span>
         </span>
-        <span className="chip chip-blue">Round #{tr.round ?? 1}</span>
+        <span className="chip chip-blue">Round #{num(tr.round, 1)}</span>
       </div>
 
       <div className="dl-progress-head">
@@ -142,30 +146,30 @@ function TrainingProgressBox({ tr, hasCkpt, ckptMb }: { tr: TrainingTelemetry; h
       <div className="workload-grid">
         <div className="wg-item">
           <span className="wg-k">Loss</span>
-          <span className="wg-v mono">{tr.loss !== undefined && tr.loss !== null ? tr.loss.toFixed(5) : "—"}</span>
+          <span className="wg-v mono">{loss !== null ? loss.toFixed(5) : "—"}</span>
         </div>
         <div className="wg-item">
           <span className="wg-k">ETA</span>
-          <span className="wg-v mono">{tr.eta_seconds ? fmtDuration(tr.eta_seconds) : "—"}</span>
+          <span className="wg-v mono">{num(tr.eta_seconds) ? fmtDuration(num(tr.eta_seconds)) : "—"}</span>
         </div>
         <div className="wg-item">
           <span className="wg-k">换棒倒计时</span>
-          <span className="wg-v mono">{fmtDuration(tr.handover_in_seconds)}</span>
+          <span className="wg-v mono">{fmtDuration(num(tr.handover_in_seconds))}</span>
         </div>
-        <div className="wg-item" title={tr.gdrive_dir ?? ""}>
+        <div className="wg-item" title={str(tr.gdrive_dir)}>
           <span className="wg-k">
             <Cloud size={10} /> 网盘
           </span>
-          <span className="wg-v mono">{tr.sync_status ?? (hasCkpt ? `${ckptMb} MB` : "就绪")}</span>
+          <span className="wg-v mono">{syncStatus || (hasCkpt ? `${ckptMb} MB` : "就绪")}</span>
         </div>
       </div>
-      {tr.dataset_status && (
+      {datasetStatus && (
         <div className="workload-foot">
           <span>
-            <Database size={12} /> 数据集: <b>{tr.dataset_status}</b>
+            <Database size={12} /> 数据集: <b>{datasetStatus}</b>
           </span>
           <span>
-            <Clock size={12} /> 下次热备: <b>{fmtDuration(tr.next_backup_in_seconds)}</b>
+            <Clock size={12} /> 下次热备: <b>{fmtDuration(num(tr.next_backup_in_seconds))}</b>
           </span>
         </div>
       )}
@@ -182,15 +186,18 @@ function LlmSupervisionBox({
   vmName: string;
   onOpenChat?: (name: string) => void;
 }) {
-  const slot = (llm.slot ?? "blue").toLowerCase();
-  const role = (llm.role ?? "active").toLowerCase();
-  const instantTps = llm.instant_tps ?? 0;
-  const lastTps = llm.last_request_tps ?? 0;
+  const slot = str(llm.slot, "blue").toLowerCase() || "blue";
+  const role = str(llm.role, "active").toLowerCase() || "active";
+  const modelName = str(llm.model_name) || "LLM";
+  const instantTps = num(llm.instant_tps);
+  const lastTps = num(llm.last_request_tps);
   const displayTps = instantTps > 0 ? instantTps : lastTps;
-  const avgTps = llm.avg_tps_60s ?? 0;
-  const peakTps = llm.peak_tps ?? 0;
-  const ttft = llm.ttft_ms ?? llm.avg_ttft_ms ?? null;
-  const history = llm.tps_history && llm.tps_history.length > 0 ? llm.tps_history : [0, 0, 0, 0, 0, 0, 0, 0];
+  const avgTps = num(llm.avg_tps_60s);
+  const peakTps = num(llm.peak_tps);
+  const ttft = numOrNull(llm.ttft_ms) ?? numOrNull(llm.avg_ttft_ms);
+  const activeStreams = num(llm.active_streams);
+  const rawHistory = Array.isArray(llm.tps_history) ? llm.tps_history.map((v) => num(v)) : [];
+  const history = rawHistory.length > 0 ? rawHistory : [0, 0, 0, 0, 0, 0, 0, 0];
   const maxHist = Math.max(50, ...history, peakTps);
 
   return (
@@ -198,9 +205,9 @@ function LlmSupervisionBox({
       <div className="workload-head">
         <span className="workload-title">
           <GitCompare size={14} color={slot === "green" ? "var(--success)" : "var(--primary)"} />
-          <code>{llm.model_name ?? "LLM"}</code>
+          <code>{modelName}</code>
           <span className={`slot-badge slot-badge-${slot}`}>{slot.toUpperCase()}</span>
-          <span className="dim">· {llm.engine ?? "vLLM"} · {role}</span>
+          <span className="dim">· {str(llm.engine) || "vLLM"} · {role}</span>
         </span>
         <div style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
           <span className={`online-dot ${llm.online ? "is-online" : "is-offline"}`}>
@@ -211,7 +218,7 @@ function LlmSupervisionBox({
             <button
               className="btn btn-primary btn-sm"
               onClick={() => onOpenChat(vmName)}
-              title={`打开与 ${vmName} (${llm.model_name ?? "LLM"}) 的交互对话窗口`}
+              title={`打开与 ${vmName} (${modelName}) 的交互对话窗口`}
             >
               <MessageSquare size={13} />
               <span>打开对话窗口</span>
@@ -229,8 +236,8 @@ function LlmSupervisionBox({
             {displayTps.toFixed(1)} <small>tok/s</small>
           </div>
           <div className="tps-sub">
-            {llm.active_streams && llm.active_streams > 0
-              ? `${llm.active_streams} 个流式请求进行中`
+            {activeStreams > 0
+              ? `${activeStreams} 个流式请求进行中`
               : lastTps > 0
                 ? `峰值 ${peakTps.toFixed(1)} tok/s`
                 : "等待请求"}
@@ -266,12 +273,12 @@ function LlmSupervisionBox({
         <div className="wg-item">
           <span className="wg-k">累计 Token</span>
           <span className="wg-v mono">
-            {llm.total_completion_tokens ?? 0} ({llm.total_requests ?? 0} 次)
+            {num(llm.total_completion_tokens)} ({num(llm.total_requests)} 次)
           </span>
         </div>
         <div className="wg-item">
           <span className="wg-k">换棒倒计时</span>
-          <span className="wg-v mono">{fmtDuration(llm.handover_in_seconds)}</span>
+          <span className="wg-v mono">{fmtDuration(num(llm.handover_in_seconds))}</span>
         </div>
       </div>
     </div>
@@ -281,26 +288,33 @@ function LlmSupervisionBox({
 export function VmCard({
   vm,
   onOpenLlmChat,
+  onShutdown,
 }: {
   vm: VmView;
   onOpenLlmChat?: (name: string) => void;
+  onShutdown?: (vm: VmView) => void;
 }) {
   const t = vm.telemetry;
   const tr = t?.training ?? null;
   const llm = t?.llm ?? null;
   const hasLlm = isLlmVm(vm);
   const stale = vm.telemetry_age !== null && vm.telemetry_age > 25;
+  const isDeleting = vm.busy === "deleting";
 
   const gpu = t?.gpu;
-  const procs = [...(t?.threads?.processes ?? [])].sort((a, b) => b.cpu_percent - a.cpu_percent);
+  const rawProcs = t?.threads?.processes;
+  const procs = (Array.isArray(rawProcs) ? [...rawProcs] : []).sort(
+    (a, b) => num(b?.cpu_percent) - num(a?.cpu_percent),
+  );
   const activeProc = liveActiveProcess(vm);
   const kernel = procs.find((p) => p.role === "kernel") ?? null;
-  const files = t?.files?.entries ?? [];
+  const rawFiles = t?.files?.entries;
+  const files = Array.isArray(rawFiles) ? rawFiles : [];
   const busy = !!(vm.running_task || activeProc || llm?.online);
 
   return (
-    <section className={`vm-card ${busy ? "relay-on" : ""}`}>
-      {/* 头部：会话名 · 硬件 · 状态 · 工作区与运行时长 */}
+    <section className={`vm-card ${busy ? "relay-on" : ""} ${isDeleting ? "deleting" : ""}`}>
+      {/* 头部：会话名 · 硬件 · 状态 · 工作区与运行时长 · 统一关机按钮 */}
       <div className="vm-head">
         <span className="vm-name">{vm.name}</span>
         <span className="chip chip-blue">
@@ -334,6 +348,26 @@ export function VmCard({
             <span>大模型对话</span>
           </button>
         )}
+        {onShutdown && (
+          <button
+            className="btn btn-danger-ghost btn-sm"
+            onClick={() => onShutdown(vm)}
+            disabled={isDeleting}
+            title={`关机并停止计费 (${vm.name})`}
+          >
+            {isDeleting ? (
+              <>
+                <Loader2 size={13} className="spin" />
+                <span>关机中…</span>
+              </>
+            ) : (
+              <>
+                <PowerOff size={13} />
+                <span>关机</span>
+              </>
+            )}
+          </button>
+        )}
       </div>
 
       <div className="vm-main">
@@ -354,23 +388,35 @@ export function VmCard({
 
         {t ? (
           <div className="mini-meters">
-            <MiniMeter name="CPU" value={t.cpu.percent} display={`${t.cpu.percent.toFixed(0)}% · ${t.cpu.cores} 核`} />
-            <MiniMeter name="内存" value={t.memory.percent} display={`${t.memory.used_gb} / ${t.memory.total_gb} GB`} />
+            <MiniMeter
+              name="CPU"
+              value={num(t.cpu?.percent)}
+              display={`${num(t.cpu?.percent).toFixed(0)}% · ${num(t.cpu?.cores)} 核`}
+            />
+            <MiniMeter
+              name="内存"
+              value={num(t.memory?.percent)}
+              display={`${num(t.memory?.used_gb)} / ${num(t.memory?.total_gb)} GB`}
+            />
             {gpu?.available && (
               <MiniMeter
                 name="GPU"
-                value={gpu.gpu_util_percent ?? 0}
-                display={`${(gpu.gpu_util_percent ?? 0).toFixed(0)}%`}
+                value={num(gpu.gpu_util_percent)}
+                display={`${num(gpu.gpu_util_percent).toFixed(0)}%`}
               />
             )}
-            {gpu?.available && gpu.vram_total_mb ? (
+            {gpu?.available && num(gpu.vram_total_mb) > 0 ? (
               <MiniMeter
                 name="显存"
-                value={gpu.vram_percent ?? 0}
-                display={`${((gpu.vram_used_mb ?? 0) / 1024).toFixed(1)} / ${(gpu.vram_total_mb / 1024).toFixed(0)} GB`}
+                value={num(gpu.vram_percent)}
+                display={`${(num(gpu.vram_used_mb) / 1024).toFixed(1)} / ${(num(gpu.vram_total_mb) / 1024).toFixed(0)} GB`}
               />
             ) : null}
-            <MiniMeter name="磁盘" value={t.disk.percent} display={`${t.disk.used_gb} / ${t.disk.total_gb} GB`} />
+            <MiniMeter
+              name="磁盘"
+              value={num(t.disk?.percent)}
+              display={`${num(t.disk?.used_gb)} / ${num(t.disk?.total_gb)} GB`}
+            />
           </div>
         ) : (
           <div className="probe-line">
@@ -427,10 +473,10 @@ export function VmCard({
                 label="CPU 型号"
                 value={
                   <>
-                    <Cpu size={11} /> {t.cpu.model}
+                    <Cpu size={11} /> {str(t.cpu?.model) || "—"}
                   </>
                 }
-                title={t.cpu.model}
+                title={str(t.cpu?.model)}
               />
             )}
           </div>

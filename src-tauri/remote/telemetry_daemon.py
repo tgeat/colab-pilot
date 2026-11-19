@@ -170,10 +170,10 @@ def classify_role(cmd_s):
         return "train"
     if "ipykernel_launcher" in low or "colab_kernel_launcher" in low:
         return "kernel"
-    if ("python" in low or "pytest" in low or "bash " in low or "sh -c" in low) and "/usr/colab" not in low and "jupyter" not in low and "dap_multiplexer" not in low:
-        return "exec"
     if "tmux" in low or ("bash" in low and "-i" in low):
         return "shell"
+    if ("python" in low or "pytest" in low or "bash " in low or "sh -c" in low) and "/usr/colab" not in low and "jupyter" not in low and "dap_multiplexer" not in low:
+        return "exec"
     return "system"
 
 
@@ -339,6 +339,16 @@ def collect_once(prev_idle, prev_total, cpu_model):
     llm_proc = next((p for p in proc_info["processes"] if p["role"] == "llm"), None)
     rclone_proc = next((p for p in proc_info["processes"] if p["role"] == "rclone"), None)
 
+    has_ckpt = False
+    ckpt_size_mb = 0.0
+    try:
+        if os.path.exists("/content/checkpoint.pt"):
+            has_ckpt = True
+            ckpt_size_mb = round(os.path.getsize("/content/checkpoint.pt") / (1024 * 1024), 2)
+    except OSError:
+        has_ckpt = False
+        ckpt_size_mb = 0.0
+
     payload = {
         "timestamp": time.time(),
         "uptime_seconds": round(uptime_sec, 1),
@@ -362,10 +372,8 @@ def collect_once(prev_idle, prev_total, cpu_model):
         },
         "files": {
             "has_rclone_conf": os.path.exists("/content/rclone.conf"),
-            "has_checkpoint": os.path.exists("/content/checkpoint.pt"),
-            "checkpoint_size_mb": round(os.path.getsize("/content/checkpoint.pt") / (1024 * 1024), 2)
-            if os.path.exists("/content/checkpoint.pt")
-            else 0.0,
+            "has_checkpoint": has_ckpt,
+            "checkpoint_size_mb": ckpt_size_mb,
             "has_done_flag": os.path.exists("/content/training_done.flag"),
             "has_results_dir": os.path.isdir("/content/results"),
             "entries": list_content_files(),
@@ -376,16 +384,35 @@ def collect_once(prev_idle, prev_total, cpu_model):
         "llm": llm_state,
     }
 
-    tmp = TELEMETRY_FILE + ".tmp"
+    tmp = f"{TELEMETRY_FILE}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(_finite(payload), f, ensure_ascii=False, allow_nan=False)
     os.replace(tmp, TELEMETRY_FILE)
     return idle, total, payload
 
 
+def _acquire_singleton_pid_lock():
+    pid_f = open(PID_FILE, "a+", encoding="utf-8")
+    try:
+        import fcntl
+
+        fcntl.flock(pid_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ImportError:
+        pass
+    except OSError:
+        pid_f.close()
+        return None
+    pid_f.seek(0)
+    pid_f.truncate()
+    pid_f.write(str(os.getpid()))
+    pid_f.flush()
+    return pid_f
+
+
 def main():
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
+    lock_fh = _acquire_singleton_pid_lock()
+    if lock_fh is None:
+        return
     cpu_model = get_cpu_model()
     idle, total = read_cpu_stat()
     time.sleep(0.25)

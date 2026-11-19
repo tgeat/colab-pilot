@@ -179,6 +179,8 @@ export interface LlmBlueGreenState {
   gpu?: string;
   high_mem?: boolean;
   gateway_url?: string;
+  api_key?: string;
+  last_error?: string | null;
   last_switchover_at?: number;
   warmup_tps?: number;
   updated_at?: number;
@@ -223,6 +225,66 @@ export interface Telemetry {
   llm?: LlmTelemetry | null;
 }
 
+export interface VmSshInfo {
+  ready: boolean;
+  host_alias: string;
+  local_port: number;
+  ssh_command: string;
+  ssh_port_command: string;
+  colab_ssh_command: string;
+  private_key_path: string;
+  public_key_fingerprint: string;
+  remote_ws_url: string;
+  user: string;
+}
+
+export interface LlmApiAccessInfo {
+  vm_name: string;
+  slot: string;
+  model_name: string;
+  engine: string;
+  api_base_url: string;
+  chat_completions_url: string;
+  models_url: string;
+  gateway_base_url: string;
+  api_key: string;
+  local_port: number;
+  remote_port: number;
+  curl_example: string;
+  python_example: string;
+}
+
+export interface CreateVmLlmConfig {
+  engine: string;
+  model_name: string;
+  slot?: string | null;
+  gdrive_model_path?: string | null;
+  custom_api_key?: string | null;
+}
+
+export interface CreateVmEnvConfig {
+  sync_rclone: boolean;
+  mount_gdrive: boolean;
+  pip_packages?: string | null;
+  install_workspace_requirements: boolean;
+  startup_script?: string | null;
+  env_vars?: string | null;
+}
+
+export interface CreateVmRequest {
+  name: string | null;
+  accelerator: string;
+  high_mem: boolean;
+  auth_mode?: "oauth2" | "adc" | null;
+  workspace_path?: string | null;
+  description?: string | null;
+  boot_mode?: "general" | "llm" | "relay" | null;
+  auto_relay: boolean;
+  relay_config: RelayConfig | null;
+  llm_config?: CreateVmLlmConfig | null;
+  env_config?: CreateVmEnvConfig | null;
+}
+
 export interface VmView {
   name: string;
   workspace: WorkspaceInfo;
@@ -241,8 +303,11 @@ export interface VmView {
   telemetry: Telemetry | null;
   telemetry_age: number | null;
   telemetry_error: string | null;
+  deploy_error?: string | null;
   relay: RelayStatus | null;
   busy: string | null;
+  ssh?: VmSshInfo | null;
+  llm_api?: LlmApiAccessInfo | null;
 }
 
 export interface Overview {

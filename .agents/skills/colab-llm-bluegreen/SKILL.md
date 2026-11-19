@@ -36,9 +36,9 @@ This skill standardizes Large Language Model (LLM) deployment on Google Colab ac
    - Only after `llm-green` passes the warmup check (`SLOT_READY`), traffic is atomically switched (`llm-green` → `ACTIVE`, `llm-blue` → `DRAINING`) and `llm-blue` is terminated (`colab stop -s llm-blue`).
 5. **Colab Pro+ 60-Minute Idle Kernel Reaper Protection (Triple Keep-Alive)**:
    - Because `llama-server` and `llm_metrics_sidecar.py` run as detached OS processes (`start_new_session=True`), the Jupyter Kernel returns to `execution_state: "idle"` after `deploy` completes. Even on **Colab Pro+**, Google Colab's idle reaper reclaims VMs if the Jupyter Kernel remains `idle` with `0` connections for ~60 minutes, and `runtimeProxyInfo.token` expires after 3600 seconds.
-   - [`llm_local_gateway.py`](./scripts/llm_local_gateway.py) runs a background `_keepalive_worker` every **90 seconds** that:
+   - [`llm_local_gateway.py`](./scripts/llm_local_gateway.py) runs a background `_keepalive_worker` immediately at startup and every **90 seconds** thereafter (plus on-demand refresh on HTTP `401`/`403`) that:
      1. Calls `/tun/m/keep-alive/{endpoint}` (`X-Colab-Tunnel: Google`) to renew the Colab tunnel lease.
-     2. Refreshes `runtimeProxyInfo.token` from `/tun/m/assignments` into `~/.config/colab-cli/sessions.json`.
+     2. Refreshes `runtimeProxyInfo.token` from `/tun/m/assignments` into the in-memory `_TOKEN_OVERRIDES` table (avoiding concurrent file-write races on `~/.config/colab-cli/sessions.json`).
      3. Sends a lightweight `pass` execution to the remote Jupyter Kernel via `ColabRuntime` to refresh `last_activity` without blocking user chat requests.
 
 ---
@@ -66,7 +66,7 @@ This skill standardizes Large Language Model (LLM) deployment on Google Colab ac
 Verify `colab-cli`, `rclone.conf`, and sidecar syntax (< 2s):
 
 ```powershell
-python -u "C:\Users\86177\.gemini\config\skills\colab-llm-bluegreen\scripts\llm_bluegreen_manager.py" precheck `
+python -u ".agents/skills/colab-llm-bluegreen/scripts/llm_bluegreen_manager.py" precheck `
   --engine llama.cpp `
   --model-name "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF"
 ```
@@ -79,19 +79,19 @@ Use `deploy` to provision `<prefix>-blue` on Colab, pull weights, start the infe
 
 ```powershell
 # Example A: Deploy a multi-shard GGUF model from HuggingFace on Colab G4 (96 GB VRAM)
-python -u "C:\Users\86177\.gemini\config\skills\colab-llm-bluegreen\scripts\llm_bluegreen_manager.py" deploy `
+python -u ".agents/skills/colab-llm-bluegreen/scripts/llm_bluegreen_manager.py" deploy `
   --session-prefix llm `
   --slot blue `
-  --workspace "C:\Users\86177\Desktop\colab-pilot" `
+  --workspace . `
   --gpu G4 `
   --engine llama.cpp `
   --model-name "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF"
 
 # Example B: Deploy a HuggingFace Transformers / vLLM model or pull from Google Drive
-python -u "C:\Users\86177\.gemini\config\skills\colab-llm-bluegreen\scripts\llm_bluegreen_manager.py" deploy `
+python -u ".agents/skills/colab-llm-bluegreen/scripts/llm_bluegreen_manager.py" deploy `
   --session-prefix llm `
   --slot blue `
-  --workspace "C:\Users\86177\Desktop\colab-pilot" `
+  --workspace . `
   --gpu G4 `
   --engine transformers `
   --model-name "Qwen/Qwen3.8-27B"
@@ -105,20 +105,20 @@ python -u "C:\Users\86177\.gemini\config\skills\colab-llm-bluegreen\scripts\llm_
 
 1. **Generate Streaming Load / Verify Live `tok/s` in Colab Pilot**:
    ```powershell
-   python -u "C:\Users\86177\.gemini\config\skills\colab-llm-bluegreen\scripts\llm_bluegreen_manager.py" benchmark `
+   python -u ".agents/skills/colab-llm-bluegreen/scripts/llm_bluegreen_manager.py" benchmark `
      --session-prefix llm `
      --requests 5
    ```
 2. **Execute Make-Before-Break Parallel Hot Switchover (`blue -> green` or `green -> blue`)**:
    ```powershell
-   python -u "C:\Users\86177\.gemini\config\skills\colab-llm-bluegreen\scripts\llm_bluegreen_manager.py" switchover `
+   python -u ".agents/skills/colab-llm-bluegreen/scripts/llm_bluegreen_manager.py" switchover `
      --session-prefix llm `
-     --workspace "C:\Users\86177\Desktop\colab-pilot" `
+     --workspace . `
      --gpu G4
    ```
    - Optional: pass `--hold-overlap-seconds 15` to observe both `llm-blue` and `llm-green` online simultaneously in **Colab Pilot** before the old slot is terminated.
 3. **Stop All Slots & Release Billing**:
    ```powershell
-   python -u "C:\Users\86177\.gemini\config\skills\colab-llm-bluegreen\scripts\llm_bluegreen_manager.py" stop `
+   python -u ".agents/skills/colab-llm-bluegreen/scripts/llm_bluegreen_manager.py" stop `
      --session-prefix llm
    ```

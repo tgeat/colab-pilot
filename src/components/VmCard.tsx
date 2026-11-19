@@ -1,8 +1,81 @@
-import { Clock, Cloud, Cpu, Database, FolderGit2, Gauge, GitCompare, Loader2, MessageSquare, PowerOff, Sparkles, Terminal } from "lucide-react";
-import type { LlmTelemetry, ProcInfo, TrainingTelemetry, VmView } from "../types";
+import { useState } from "react";
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Clock,
+  Cloud,
+  Code2,
+  Copy,
+  Cpu,
+  Database,
+  Eye,
+  EyeOff,
+  FileCode2,
+  FolderGit2,
+  Gauge,
+  GitCompare,
+  KeyRound,
+  Link2,
+  Loader2,
+  MessageSquare,
+  PowerOff,
+  RefreshCw,
+  Repeat2,
+  RotateCw,
+  ShieldCheck,
+  Sparkles,
+  Terminal,
+} from "lucide-react";
+import type {
+  LlmApiAccessInfo,
+  LlmTelemetry,
+  ProcInfo,
+  RelayConfig,
+  TrainingTelemetry,
+  VmSshInfo,
+  VmView,
+} from "../types";
 import { fmtDuration, num, numOrNull, pct, shortEndpoint, str } from "../format";
-import { isLlmVm } from "./LlmChatModal";
+import { isLlmVm, isLlmVmReady } from "../chatUtils";
+import { RelayPanel } from "./RelayPanel";
 import { KV } from "./ui";
+
+function CopyBtn({
+  text,
+  label,
+  title,
+  compact = false,
+}: {
+  text: string;
+  label?: string;
+  title?: string;
+  compact?: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  const doCopy = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      // ignore
+    }
+  };
+  return (
+    <button
+      type="button"
+      className={`copy-chip-btn ${copied ? "copied" : ""} ${compact ? "compact" : ""}`}
+      onClick={doCopy}
+      title={title ?? `点击复制: ${text}`}
+    >
+      {copied ? <Check size={11} /> : <Copy size={11} />}
+      {label && <span>{copied ? "已复制" : label}</span>}
+    </button>
+  );
+}
 
 /** 云端真正在运行的任务进程（排除僵尸进程 Z 与 Kernel 本身） */
 function liveActiveProcess(vm: VmView): ProcInfo | null {
@@ -34,6 +107,30 @@ function statusPill(vm: VmView, activeProc: ProcInfo | null) {
   const llm = t?.llm;
   const tr = t?.training;
 
+  if (vm.busy === "creating") {
+    return (
+      <span className="pill pill-amber">
+        <span className="dot pulse" />
+        开机分配中…
+      </span>
+    );
+  }
+  if (vm.busy === "deploying_llm") {
+    return (
+      <span className="pill pill-amber">
+        <span className="dot pulse" />
+        部署大模型中…
+      </span>
+    );
+  }
+  if (vm.deploy_error) {
+    return (
+      <span className="pill pill-red" title={vm.deploy_error}>
+        <span className="dot" />
+        部署失败
+      </span>
+    );
+  }
   if (vm.busy === "probing") {
     return (
       <span className="pill pill-blue">
@@ -42,7 +139,7 @@ function statusPill(vm: VmView, activeProc: ProcInfo | null) {
       </span>
     );
   }
-  if (llm && llm.online) {
+  if (llm && (llm.online || llm.backend_healthy)) {
     const tps = num(llm.instant_tps) || num(llm.last_request_tps);
     const cls = llm.role === "warming" ? "pill-amber" : llm.role === "draining" ? "pill-gray" : "pill-green";
     return (
@@ -99,6 +196,276 @@ function eventBadgeCls(et: string, hasError: boolean) {
   if (et === "session_created") return "ev-badge ev-new";
   if (et === "automation" || et === "automation_result") return "ev-badge ev-auto";
   return "ev-badge";
+}
+
+/** 每台虚拟机标配的本机免密 SSH 访问栏（全部采用 colab ssh -s <name>，Windows 不使用 /dev/null） */
+function SshAccessBar({
+  vmName,
+  ssh,
+  orphan,
+  onServer,
+  onOpenSshTerminal,
+}: {
+  vmName: string;
+  ssh?: VmSshInfo | null;
+  orphan?: boolean;
+  onServer: boolean;
+  onOpenSshTerminal?: (name: string) => void;
+}) {
+  const hostAliasCmd = ssh?.ssh_command || `ssh colab-${vmName}`;
+  const colabSshCmd = ssh?.colab_ssh_command || `colab ssh -s ${vmName}`;
+  const portCmd =
+    ssh?.ssh_port_command && !ssh.ssh_port_command.includes("/dev/null")
+      ? ssh.ssh_port_command
+      : colabSshCmd;
+  const localPort = ssh?.local_port;
+
+  return (
+    <div className="ssh-access-bar">
+      <div className="ssh-bar-left">
+        <span className="ssh-badge">
+          <Terminal size={12} />
+          <span>SSH</span>
+        </span>
+
+        <div className="ssh-cmd-pill" title="已自动写入 ~/.ssh/config，可在任意终端或 VS Code Remote-SSH 中直接使用">
+          <code className="mono">{hostAliasCmd}</code>
+          <CopyBtn text={hostAliasCmd} compact title={`复制 SSH 命令: ${hostAliasCmd}`} />
+        </div>
+
+        {localPort ? (
+          <div className="ssh-cmd-pill" title={`本机按需 SSH 桥接端口 127.0.0.1:${localPort} -> 云端 /colab/ssh WebSocket`}>
+            <span className="dim" style={{ fontSize: 10.5 }}>端口</span>
+            <code className="mono">127.0.0.1:{localPort}</code>
+            <CopyBtn text={portCmd} label="复制直连" compact title={`复制带密钥与端口的完整命令:\n${portCmd}`} />
+          </div>
+        ) : null}
+
+        <div className="ssh-cmd-pill" title="colab-cli v0.8+ 原生 SSH 会话命令">
+          <code className="mono">{colabSshCmd}</code>
+          <CopyBtn text={colabSshCmd} compact title={`复制: ${colabSshCmd}`} />
+        </div>
+
+        {ssh?.ready && (
+          <span className="ssh-key-tag" title={`免密私钥: ${ssh.private_key_path}\n指纹: ${ssh.public_key_fingerprint}`}>
+            <ShieldCheck size={11} />
+            Ed25519 免密就绪
+          </span>
+        )}
+      </div>
+
+      {onOpenSshTerminal && onServer && (
+        <button
+          type="button"
+          className="btn btn-sm ssh-open-btn"
+          onClick={() => onOpenSshTerminal(vmName)}
+          title={
+            orphan
+              ? `一键弹出交互式远程终端窗口（浏览器创建的外部实例若未开放 SSH 将自动回退 Web TTY）`
+              : `一键弹出本机交互式 SSH 终端窗口并进入 ${vmName}:/content`
+          }
+        >
+          <Terminal size={12} />
+          <span>打开 SSH 终端</span>
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** 部署大模型的虚拟机专属的 OpenAI API Endpoint 与 API Key 面板（精确区分预热中 / 部署失败 / 后端未就绪 / 在线） */
+export function LlmApiAccessBox({
+  apiInfo,
+  busy,
+  llm,
+  deployError,
+  hasLlmProc,
+  onRotateKey,
+  onRetryDeploy,
+}: {
+  apiInfo: LlmApiAccessInfo;
+  busy?: string | null;
+  llm?: LlmTelemetry | null;
+  deployError?: string | null;
+  hasLlmProc?: boolean;
+  onRotateKey?: (vmName: string, customKey?: string | null) => Promise<void>;
+  onRetryDeploy?: () => void;
+}) {
+  const [showKey, setShowKey] = useState(false);
+  const [showSnippet, setShowSnippet] = useState<"none" | "curl" | "python">("none");
+  const [rotating, setRotating] = useState(false);
+
+  const isDeploying =
+    busy === "deploying_llm" ||
+    busy === "creating" ||
+    Boolean(llm && !llm.online && !llm.backend_healthy && !deployError);
+  const isOnline =
+    !isDeploying && !deployError && Boolean(llm?.online || llm?.backend_healthy || hasLlmProc);
+
+  let statusBadge: JSX.Element;
+  if (isDeploying) {
+    statusBadge = (
+      <span className="pill pill-amber">
+        <span className="dot pulse" />
+        部署预热中…
+      </span>
+    );
+  } else if (deployError) {
+    statusBadge = (
+      <span className="pill pill-red" title={deployError}>
+        <span className="dot" />
+        部署失败
+      </span>
+    );
+  } else if (isOnline) {
+    statusBadge = (
+      <span className="pill pill-green">
+        <span className="dot pulse" />
+        在线 · 可直接调用
+      </span>
+    );
+  } else {
+    statusBadge = (
+      <span className="pill pill-gray">
+        <span className="dot" />
+        后端未就绪
+      </span>
+    );
+  }
+
+  const maskedKey =
+    apiInfo.api_key.length > 16
+      ? `${apiInfo.api_key.slice(0, 12)}••••••••${apiInfo.api_key.slice(-6)}`
+      : apiInfo.api_key;
+
+  const handleRotate = async () => {
+    if (!onRotateKey || rotating) return;
+    setRotating(true);
+    try {
+      await onRotateKey(apiInfo.vm_name, null);
+    } finally {
+      setRotating(false);
+    }
+  };
+
+  return (
+    <div className="llm-api-box">
+      <div className="llm-api-head">
+        <span className="llm-api-title">
+          <KeyRound size={13} />
+          <span>模型 OpenAI 兼容 API 与专属 Key</span>
+          <span className="llm-api-port-tag mono">:{apiInfo.local_port}</span>
+          {statusBadge}
+        </span>
+
+        <div className="llm-api-actions">
+          {!isOnline && !isDeploying && onRetryDeploy && (
+            <button
+              type="button"
+              className="copy-chip-btn"
+              onClick={onRetryDeploy}
+              title="重新配置并在该实例上启动大模型推理后端"
+            >
+              <Sparkles size={11} />
+              <span>{deployError ? "重新部署大模型" : "启动模型后端"}</span>
+            </button>
+          )}
+          <CopyBtn text={apiInfo.curl_example} label="复制 cURL" title="复制完整流式 cURL 调用命令" />
+          <CopyBtn text={apiInfo.python_example} label="复制 Python SDK" title="复制完整 Python OpenAI SDK 调用代码" />
+          <button
+            type="button"
+            className={`copy-chip-btn ${showSnippet !== "none" ? "copied" : ""}`}
+            onClick={() => setShowSnippet((s) => (s === "none" ? "python" : "none"))}
+            title="展开/收起代码示例"
+          >
+            <Code2 size={11} />
+            <span>{showSnippet === "none" ? "调用示例" : "收起示例"}</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="llm-api-grid">
+        <div className="llm-api-row">
+          <span className="llm-api-k">
+            <Link2 size={11} /> 专属 Base URL
+          </span>
+          <code className="llm-api-v mono">{apiInfo.api_base_url}</code>
+          <CopyBtn text={apiInfo.api_base_url} label="复制" compact />
+        </div>
+
+        <div className="llm-api-row">
+          <span className="llm-api-k">
+            <GitCompare size={11} /> 蓝绿网关 URL
+          </span>
+          <code className="llm-api-v mono">{apiInfo.gateway_base_url}</code>
+          <CopyBtn text={apiInfo.gateway_base_url} label="复制" compact />
+        </div>
+
+        <div className="llm-api-row">
+          <span className="llm-api-k">
+            <KeyRound size={11} /> API Key
+          </span>
+          <code className="llm-api-v mono key-val">{showKey ? apiInfo.api_key : maskedKey}</code>
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            <button
+              type="button"
+              className="copy-chip-btn compact"
+              onClick={() => setShowKey((v) => !v)}
+              title={showKey ? "隐藏 API Key" : "显示完整 API Key"}
+            >
+              {showKey ? <EyeOff size={11} /> : <Eye size={11} />}
+            </button>
+            <CopyBtn text={apiInfo.api_key} label="复制 Key" compact />
+            {onRotateKey && (
+              <button
+                type="button"
+                className="copy-chip-btn compact"
+                onClick={handleRotate}
+                disabled={rotating}
+                title="重新生成此虚拟机的 API Key"
+              >
+                <RotateCw size={11} className={rotating ? "spin" : ""} />
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="llm-api-row">
+          <span className="llm-api-k">
+            <Sparkles size={11} /> Model ID
+          </span>
+          <code className="llm-api-v mono" title={apiInfo.model_name}>
+            {apiInfo.model_name}
+          </code>
+          <CopyBtn text={apiInfo.model_name} label="复制" compact />
+        </div>
+      </div>
+
+      {showSnippet !== "none" && (
+        <div className="llm-snippet-drawer">
+          <div className="llm-snippet-tabs">
+            <button
+              type="button"
+              className={showSnippet === "python" ? "active" : ""}
+              onClick={() => setShowSnippet("python")}
+            >
+              Python (openai SDK)
+            </button>
+            <button
+              type="button"
+              className={showSnippet === "curl" ? "active" : ""}
+              onClick={() => setShowSnippet("curl")}
+            >
+              cURL 流式请求
+            </button>
+          </div>
+          <pre className="llm-snippet-pre mono">
+            {showSnippet === "python" ? apiInfo.python_example : apiInfo.curl_example}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function TrainingProgressBox({ tr, hasCkpt, ckptMb }: { tr: TrainingTelemetry; hasCkpt: boolean; ckptMb: number }) {
@@ -180,15 +547,25 @@ function TrainingProgressBox({ tr, hasCkpt, ckptMb }: { tr: TrainingTelemetry; h
 function LlmSupervisionBox({
   llm,
   vmName,
+  vmBusy,
+  deployError,
+  llmApi,
   onOpenChat,
+  onRotateKey,
+  onRetryDeploy,
 }: {
   llm: LlmTelemetry;
   vmName: string;
+  vmBusy?: string | null;
+  deployError?: string | null;
+  llmApi?: LlmApiAccessInfo | null;
   onOpenChat?: (name: string) => void;
+  onRotateKey?: (vmName: string, customKey?: string | null) => Promise<void>;
+  onRetryDeploy?: () => void;
 }) {
   const slot = str(llm.slot, "blue").toLowerCase() || "blue";
   const role = str(llm.role, "active").toLowerCase() || "active";
-  const modelName = str(llm.model_name) || "LLM";
+  const modelName = str(llm.model_name) || llmApi?.model_name || "LLM";
   const instantTps = num(llm.instant_tps);
   const lastTps = num(llm.last_request_tps);
   const displayTps = instantTps > 0 ? instantTps : lastTps;
@@ -199,6 +576,10 @@ function LlmSupervisionBox({
   const rawHistory = Array.isArray(llm.tps_history) ? llm.tps_history.map((v) => num(v)) : [];
   const history = rawHistory.length > 0 ? rawHistory : [0, 0, 0, 0, 0, 0, 0, 0];
   const maxHist = Math.max(50, ...history, peakTps);
+  const chatReady =
+    Boolean(llm.online || llm.backend_healthy) &&
+    vmBusy !== "deploying_llm" &&
+    vmBusy !== "creating";
 
   return (
     <div className={`workload-box llm-box slot-${slot}`}>
@@ -207,18 +588,24 @@ function LlmSupervisionBox({
           <GitCompare size={14} color={slot === "green" ? "var(--success)" : "var(--primary)"} />
           <code>{modelName}</code>
           <span className={`slot-badge slot-badge-${slot}`}>{slot.toUpperCase()}</span>
-          <span className="dim">· {str(llm.engine) || "vLLM"} · {role}</span>
+          <span className="dim">· {str(llm.engine) || llmApi?.engine || "llama.cpp"} · {role}</span>
         </span>
         <div style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
-          <span className={`online-dot ${llm.online ? "is-online" : "is-offline"}`}>
+          <span className={`online-dot ${chatReady ? "is-online" : "is-offline"}`}>
             <span className="dot pulse" />
-            {llm.online ? "在线" : "启动中"}
+            {chatReady ? "在线" : "启动中"}
           </span>
           {onOpenChat && (
             <button
+              type="button"
               className="btn btn-primary btn-sm"
               onClick={() => onOpenChat(vmName)}
-              title={`打开与 ${vmName} (${modelName}) 的交互对话窗口`}
+              disabled={!chatReady}
+              title={
+                chatReady
+                  ? `打开与 ${vmName} (${modelName}) 的交互对话窗口`
+                  : `${vmName} 云端推理引擎正在预热启动中，就绪后自动开放对话`
+              }
             >
               <MessageSquare size={13} />
               <span>打开对话窗口</span>
@@ -281,6 +668,18 @@ function LlmSupervisionBox({
           <span className="wg-v mono">{fmtDuration(num(llm.handover_in_seconds))}</span>
         </div>
       </div>
+
+      {llmApi && (
+        <LlmApiAccessBox
+          apiInfo={llmApi}
+          busy={vmBusy}
+          llm={llm}
+          deployError={deployError}
+          hasLlmProc={true}
+          onRotateKey={onRotateKey}
+          onRetryDeploy={onRetryDeploy}
+        />
+      )}
     </div>
   );
 }
@@ -289,32 +688,82 @@ export function VmCard({
   vm,
   onOpenLlmChat,
   onShutdown,
+  onOpenSshTerminal,
+  onRotateLlmKey,
+  onRetryProbe,
+  onDeployLlm,
+  onStartRelay,
+  onRequestStopRelay,
+  onOpenScriptDialog,
 }: {
   vm: VmView;
   onOpenLlmChat?: (name: string) => void;
   onShutdown?: (vm: VmView) => void;
+  onOpenSshTerminal?: (name: string) => void;
+  onRotateLlmKey?: (vmName: string, customKey?: string | null) => Promise<void>;
+  onRetryProbe?: (name: string) => Promise<void>;
+  onDeployLlm?: (vm: VmView) => void;
+  onStartRelay?: (name: string, config: RelayConfig) => Promise<void>;
+  onRequestStopRelay?: (vm: VmView) => void;
+  onOpenScriptDialog?: () => void;
 }) {
+  const [probingLocal, setProbingLocal] = useState(false);
+  const [relayPending, setRelayPending] = useState(false);
+  const [relayExpanded, setRelayExpanded] = useState(false);
+
   const t = vm.telemetry;
   const tr = t?.training ?? null;
   const llm = t?.llm ?? null;
   const hasLlm = isLlmVm(vm);
+  const llmReady = isLlmVmReady(vm);
+  const hasLlmProc = Boolean(t?.threads?.llm_process);
   const stale = vm.telemetry_age !== null && vm.telemetry_age > 25;
   const isDeleting = vm.busy === "deleting";
+  const isCreating = vm.busy === "creating";
+  const isDeployingLlm = vm.busy === "deploying_llm";
+  const isProbing = probingLocal || vm.busy === "probing";
 
   const gpu = t?.gpu;
   const rawProcs = t?.threads?.processes;
-  const procs = (Array.isArray(rawProcs) ? [...rawProcs] : []).sort(
-    (a, b) => num(b?.cpu_percent) - num(a?.cpu_percent),
-  );
+  const procs = (
+    Array.isArray(rawProcs)
+      ? rawProcs.filter((p): p is ProcInfo => !!p && typeof p === "object")
+      : []
+  ).sort((a, b) => num(b?.cpu_percent) - num(a?.cpu_percent));
   const activeProc = liveActiveProcess(vm);
-  const kernel = procs.find((p) => p.role === "kernel") ?? null;
+  const kernel = procs.find((p) => str(p.role) === "kernel") ?? null;
   const rawFiles = t?.files?.entries;
-  const files = Array.isArray(rawFiles) ? rawFiles : [];
-  const busy = !!(vm.running_task || activeProc || llm?.online);
+  const files = Array.isArray(rawFiles)
+    ? rawFiles.filter((f) => !!f && typeof f === "object" && typeof f.name === "string")
+    : [];
+  const busy = !!(vm.running_task || activeProc || llm?.online || vm.relay?.running);
+
+  const showRelayDrawer = Boolean(vm.relay?.running) || relayExpanded;
+  const canUseWorkloadTools = vm.on_server && !isDeleting && !isCreating;
+
+  const handleRetryProbeClick = async () => {
+    if (!onRetryProbe || isProbing) return;
+    setProbingLocal(true);
+    try {
+      await onRetryProbe(vm.name);
+    } finally {
+      setProbingLocal(false);
+    }
+  };
+
+  const handleStartRelayClick = async (cfg: RelayConfig) => {
+    if (!onStartRelay || relayPending) return;
+    setRelayPending(true);
+    try {
+      await onStartRelay(vm.name, cfg);
+    } finally {
+      setRelayPending(false);
+    }
+  };
 
   return (
     <section className={`vm-card ${busy ? "relay-on" : ""} ${isDeleting ? "deleting" : ""}`}>
-      {/* 头部：会话名 · 硬件 · 状态 · 工作区与运行时长 · 统一关机按钮 */}
+      {/* 头部：会话名 · 硬件 · 状态 · 工作区与运行时长 · 部署/对话/关机按钮 */}
       <div className="vm-head">
         <span className="vm-name">{vm.name}</span>
         <span className="chip chip-blue">
@@ -322,7 +771,7 @@ export function VmCard({
           {vm.high_ram ? " · High-RAM" : ""}
         </span>
         {vm.orphan && (
-          <span className="chip chip-red" title="服务端存在但本地 sessions.json 中没有的实例">
+          <span className="chip chip-red" title="浏览器或外部会话创建的云端实例（已自动接管监控与远程终端）">
             外部会话
           </span>
         )}
@@ -338,18 +787,50 @@ export function VmCard({
           </span>
           {stale && <span className="warn">遥测延迟 {vm.telemetry_age?.toFixed(0)}s</span>}
         </span>
-        {hasLlm && !llm && onOpenLlmChat && (
+
+        {canUseWorkloadTools && !llmReady && onDeployLlm && (
           <button
-            className="btn btn-primary btn-sm"
-            onClick={() => onOpenLlmChat(vm.name)}
-            title={`打开与 ${vm.name} 的大模型对话窗口`}
+            type="button"
+            className="btn btn-sm"
+            onClick={() => onDeployLlm(vm)}
+            disabled={isDeployingLlm}
+            title={
+              isDeployingLlm
+                ? `${vm.name} 正在后台拉取并部署大模型…`
+                : vm.deploy_error
+                  ? `上次部署失败，点击重新配置并在 ${vm.name} 上部署大模型`
+                  : `在当前运行实例 (${vm.name}) 上直接部署大模型并开启专属 OpenAI API 与 Key`
+            }
           >
-            <MessageSquare size={13} />
-            <span>大模型对话</span>
+            <Sparkles size={13} color="var(--primary)" />
+            <span>{vm.deploy_error || hasLlm ? "重新部署大模型" : "部署大模型"}</span>
           </button>
         )}
+
+        {hasLlm && !llm && onOpenLlmChat && (
+          <button
+            type="button"
+            className="btn btn-primary btn-sm"
+            onClick={() => onOpenLlmChat(vm.name)}
+            disabled={!llmReady}
+            title={
+              llmReady
+                ? `打开与 ${vm.name} 的大模型对话窗口`
+                : isDeployingLlm
+                  ? `${vm.name} 正在后台拉取权重并预热大模型服务，就绪后自动开放对话`
+                  : vm.deploy_error
+                    ? `大模型部署异常：${vm.deploy_error}`
+                    : `${vm.name} 的大模型推理后端尚未就绪`
+            }
+          >
+            <MessageSquare size={13} />
+            <span>{isDeployingLlm ? "部署预热中…" : llmReady ? "大模型对话" : "等待模型就绪"}</span>
+          </button>
+        )}
+
         {onShutdown && (
           <button
+            type="button"
             className="btn btn-danger-ghost btn-sm"
             onClick={() => onShutdown(vm)}
             disabled={isDeleting}
@@ -370,12 +851,62 @@ export function VmCard({
         )}
       </div>
 
+      {/* 每台虚拟机均提供免密 SSH 连接栏 */}
+      <SshAccessBar
+        vmName={vm.name}
+        ssh={vm.ssh}
+        orphan={vm.orphan}
+        onServer={vm.on_server}
+        onOpenSshTerminal={onOpenSshTerminal}
+      />
+
       <div className="vm-main">
+        {/* 部署异常横幅（可见、可复制、可一键重新部署） */}
+        {vm.deploy_error && (
+          <div className="vm-alert-box vm-alert-danger" role="alert">
+            <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+            <div className="vm-alert-content">
+              <div className="vm-alert-title">云端任务 / 大模型部署异常</div>
+              <div className="vm-alert-desc mono">{vm.deploy_error}</div>
+            </div>
+            <div className="vm-alert-actions">
+              <CopyBtn text={vm.deploy_error} label="复制报错" compact />
+              {onDeployLlm && vm.on_server && (
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => onDeployLlm(vm)}
+                  disabled={isDeployingLlm || isDeleting}
+                >
+                  <Sparkles size={12} color="var(--primary)" />
+                  <span>重新部署大模型</span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {llm && (
           <LlmSupervisionBox
             llm={llm}
             vmName={vm.name}
+            vmBusy={vm.busy}
+            deployError={vm.deploy_error}
+            llmApi={vm.llm_api}
             onOpenChat={onOpenLlmChat}
+            onRotateKey={onRotateLlmKey}
+            onRetryDeploy={onDeployLlm ? () => onDeployLlm(vm) : undefined}
+          />
+        )}
+        {!llm && vm.llm_api && (
+          <LlmApiAccessBox
+            apiInfo={vm.llm_api}
+            busy={vm.busy}
+            llm={llm}
+            deployError={vm.deploy_error}
+            hasLlmProc={hasLlmProc}
+            onRotateKey={onRotateLlmKey}
+            onRetryDeploy={onDeployLlm ? () => onDeployLlm(vm) : undefined}
           />
         )}
         {tr && (
@@ -387,41 +918,105 @@ export function VmCard({
         )}
 
         {t ? (
-          <div className="mini-meters">
-            <MiniMeter
-              name="CPU"
-              value={num(t.cpu?.percent)}
-              display={`${num(t.cpu?.percent).toFixed(0)}% · ${num(t.cpu?.cores)} 核`}
-            />
-            <MiniMeter
-              name="内存"
-              value={num(t.memory?.percent)}
-              display={`${num(t.memory?.used_gb)} / ${num(t.memory?.total_gb)} GB`}
-            />
-            {gpu?.available && (
-              <MiniMeter
-                name="GPU"
-                value={num(gpu.gpu_util_percent)}
-                display={`${num(gpu.gpu_util_percent).toFixed(0)}%`}
-              />
+          <>
+            {stale && vm.telemetry_error && (
+              <div className="vm-alert-box vm-alert-warn" role="status">
+                <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+                <div className="vm-alert-content">
+                  <span className="vm-alert-title">遥测同步延迟（展示上次快照）：</span>
+                  <span className="mono">{vm.telemetry_error}</span>
+                </div>
+                {onRetryProbe && vm.on_server && (
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={handleRetryProbeClick}
+                    disabled={isProbing || isDeleting}
+                  >
+                    {isProbing ? <Loader2 size={12} className="spin" /> : <RefreshCw size={12} />}
+                    <span>{isProbing ? "注入探针中…" : "重试连接探针"}</span>
+                  </button>
+                )}
+              </div>
             )}
-            {gpu?.available && num(gpu.vram_total_mb) > 0 ? (
+            <div className="mini-meters">
               <MiniMeter
-                name="显存"
-                value={num(gpu.vram_percent)}
-                display={`${(num(gpu.vram_used_mb) / 1024).toFixed(1)} / ${(num(gpu.vram_total_mb) / 1024).toFixed(0)} GB`}
+                name="CPU"
+                value={num(t.cpu?.percent)}
+                display={`${num(t.cpu?.percent).toFixed(0)}% · ${num(t.cpu?.cores)} 核`}
               />
-            ) : null}
-            <MiniMeter
-              name="磁盘"
-              value={num(t.disk?.percent)}
-              display={`${num(t.disk?.used_gb)} / ${num(t.disk?.total_gb)} GB`}
-            />
+              <MiniMeter
+                name="内存"
+                value={num(t.memory?.percent)}
+                display={`${num(t.memory?.used_gb)} / ${num(t.memory?.total_gb)} GB`}
+              />
+              {gpu?.available && (
+                <MiniMeter
+                  name="GPU"
+                  value={num(gpu.gpu_util_percent)}
+                  display={`${num(gpu.gpu_util_percent).toFixed(0)}%`}
+                />
+              )}
+              {gpu?.available && num(gpu.vram_total_mb) > 0 ? (
+                <MiniMeter
+                  name="显存"
+                  value={num(gpu.vram_percent)}
+                  display={`${(num(gpu.vram_used_mb) / 1024).toFixed(1)} / ${(num(gpu.vram_total_mb) / 1024).toFixed(0)} GB`}
+                />
+              ) : null}
+              <MiniMeter
+                name="磁盘"
+                value={num(t.disk?.percent)}
+                display={`${num(t.disk?.used_gb)} / ${num(t.disk?.total_gb)} GB`}
+              />
+            </div>
+          </>
+        ) : vm.telemetry_error && !isCreating ? (
+          <div className="vm-alert-box vm-alert-warn" role="alert">
+            <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+            <div className="vm-alert-content">
+              <div className="vm-alert-title">遥测探针连接异常</div>
+              <div className="vm-alert-desc mono">{vm.telemetry_error}</div>
+            </div>
+            <div className="vm-alert-actions">
+              <CopyBtn text={vm.telemetry_error} label="复制" compact />
+              {onRetryProbe && vm.on_server && (
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={handleRetryProbeClick}
+                  disabled={isProbing || isDeleting}
+                  title="重新向云端实例静默注入遥测守护探针并拉取硬件指标"
+                >
+                  {isProbing ? <Loader2 size={12} className="spin" /> : <RefreshCw size={12} />}
+                  <span>{isProbing ? "注入探针中…" : "重试连接探针"}</span>
+                </button>
+              )}
+            </div>
           </div>
         ) : (
           <div className="probe-line">
             <Loader2 size={14} className="spin" />
-            正在连接遥测…
+            <span>
+              {isCreating
+                ? "正在 Google Colab 云端分配算力实例并配置免密 SSH…"
+                : isDeployingLlm
+                  ? "正在云端拉取大模型权重并启动推理服务（首次预热约需 1–5 分钟）…"
+                  : "正在连接遥测…"}
+            </span>
+            {!isCreating && onRetryProbe && vm.on_server && (
+              <button
+                type="button"
+                className="copy-chip-btn"
+                style={{ marginLeft: "auto" }}
+                onClick={handleRetryProbeClick}
+                disabled={isProbing || isDeleting}
+                title="立即重新触发远程遥测守护探针注入"
+              >
+                {isProbing ? <Loader2 size={11} className="spin" /> : <RefreshCw size={11} />}
+                <span>{isProbing ? "注入中…" : "重试连接探针"}</span>
+              </button>
+            )}
           </div>
         )}
 
@@ -433,6 +1028,65 @@ export function VmCard({
               <span className="task-meta">
                 PID {activeProc.pid} · {activeProc.elapsed}
               </span>
+            )}
+          </div>
+        )}
+
+        {/* 新建/通用实例的任务控制面板（集成 ScriptDialog 与 RelayPanel，支持配置脚本与跑训练） */}
+        {onStartRelay && (!llmReady || Boolean(vm.relay)) && !isCreating && (
+          <div className="vm-tools-drawer">
+            <div className="vm-tools-head">
+              <button
+                type="button"
+                className="vm-tools-toggle"
+                onClick={() => setRelayExpanded((v) => !v)}
+              >
+                <Repeat2 size={13} color="var(--primary)" />
+                <span>接力训练 / 脚本配置</span>
+                {vm.relay?.running ? (
+                  <span className="chip chip-blue">运行中 · 第 {vm.relay.round || 1} 棒</span>
+                ) : (
+                  <span className="dim" style={{ fontWeight: 400, fontSize: 11.5 }}>
+                    配置 `train.py` / `requirements.txt` 或开启 24h+ Google Drive 跨实例自动换棒训练
+                  </span>
+                )}
+                {showRelayDrawer ? (
+                  <ChevronUp size={14} style={{ marginLeft: "auto" }} />
+                ) : (
+                  <ChevronDown size={14} style={{ marginLeft: "auto" }} />
+                )}
+              </button>
+
+              {onOpenScriptDialog && (
+                <button
+                  type="button"
+                  className="copy-chip-btn"
+                  onClick={onOpenScriptDialog}
+                  title="打开编辑器配置本地工作区 train.py 与 requirements.txt"
+                >
+                  <FileCode2 size={12} />
+                  <span>编辑训练脚本</span>
+                </button>
+              )}
+            </div>
+
+            {showRelayDrawer && (
+              <div className="vm-tools-body">
+                <RelayPanel
+                  vm={vm}
+                  pending={relayPending}
+                  onStart={handleStartRelayClick}
+                  onStopRequest={() => onRequestStopRelay?.(vm)}
+                />
+                {vm.relay?.logs && vm.relay.logs.length > 0 && (
+                  <details className="relay-logs-details">
+                    <summary>接力监工日志 ({vm.relay.logs.length})</summary>
+                    <pre className="llm-snippet-pre mono" style={{ maxHeight: 160, overflowY: "auto" }}>
+                      {vm.relay.logs.slice(-40).join("\n")}
+                    </pre>
+                  </details>
+                )}
+              </div>
             )}
           </div>
         )}
@@ -452,6 +1106,14 @@ export function VmCard({
             <KV wide label="本地工作区" value={vm.workspace.path ?? "—"} mono title={vm.workspace.path ?? ""} />
             <KV label="节点" value={shortEndpoint(vm.endpoint)} mono title={vm.endpoint ?? ""} />
             <KV label="云端目录" value={vm.workspace.remote_cwd || "/content"} mono />
+            {vm.ssh && (
+              <KV
+                label="SSH 桥接"
+                value={`127.0.0.1:${vm.ssh.local_port} (${vm.ssh.host_alias})`}
+                mono
+                title={vm.ssh.colab_ssh_command}
+              />
+            )}
             <KV
               label="Kernel"
               value={kernel ? `PID ${kernel.pid}` : vm.kernel_id ? vm.kernel_id.slice(0, 10) : "未连接"}

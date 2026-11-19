@@ -769,6 +769,19 @@
     let latestOverview = null;
     const userFormOverrides = {};
 
+    function escHtml(val) {
+      return String(val ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function escJsArg(val) {
+      return escHtml(JSON.stringify(String(val ?? "")));
+    }
+
     function showToast(msg, color = "#3b82f6") {
       const box = document.getElementById("toast-box");
       const el = document.createElement("div");
@@ -903,36 +916,39 @@
 
       const procRows = (th.processes || []).slice(0, 6).map((p) => `
         <tr>
-          <td>${p.pid}</td>
-          <td><span class="badge" style="background:#1e293b;color:#93c5fd;">${p.role}</span></td>
-          <td style="color:#34d399;font-weight:700;">${p.threads} 线程</td>
-          <td>${p.cpu_percent}%</td>
-          <td>${p.rss_mb} MB</td>
-          <td>${p.state}</td>
-          <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${p.command}">${p.command}</td>
+          <td>${escHtml(p.pid)}</td>
+          <td><span class="badge" style="background:#1e293b;color:#93c5fd;">${escHtml(p.role)}</span></td>
+          <td style="color:#34d399;font-weight:700;">${escHtml(p.threads)} 线程</td>
+          <td>${escHtml(p.cpu_percent)}%</td>
+          <td>${escHtml(p.rss_mb)} MB</td>
+          <td>${escHtml(p.state)}</td>
+          <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(p.command)}">${escHtml(p.command)}</td>
         </tr>
       `).join("");
 
       const logsText = (relay.logs && relay.logs.length > 0)
-        ? relay.logs.join("\n")
+        ? escHtml(relay.logs.join("\n"))
         : "暂无接力日志。点击上方「▶ 开启接力训练」即可自动上传 rclone.conf 与 train.py 开始 24h+ 无人值守接力训练。";
 
+      const safeVmName = escHtml(vm.name);
+      const safeEndpoint = escHtml(vm.endpoint || "");
+
       return `
-        <section class="vm-card ${relay.is_running ? "relay-active" : ""}" id="vm-card-${vm.name}">
+        <section class="vm-card ${relay.is_running ? "relay-active" : ""}" id="vm-card-${safeVmName}">
           <!-- 卡片头部：独立虚拟机标识 + 操作按钮 + 彻底销毁停止计费 -->
           <div class="vm-card-header">
             <div class="vm-title-group">
-              <span class="vm-name">[${vm.name}]</span>
-              <span class="badge badge-hw">${vm.accelerator}</span>
-              <span class="badge badge-shape">${vm.machine_shape}</span>
-              <span class="badge ${badgeCls}">${vm.run_state}</span>
+              <span class="vm-name">[${safeVmName}]</span>
+              <span class="badge badge-hw">${escHtml(vm.accelerator)}</span>
+              <span class="badge badge-shape">${escHtml(vm.machine_shape)}</span>
+              <span class="badge ${badgeCls}">${escHtml(vm.run_state)}</span>
               ${vm.adopted_orphan ? `<span class="badge" style="background:rgba(239,68,68,0.2);color:#fca5a5;">云端孤儿实例自动纳管</span>` : ""}
             </div>
             <div class="vm-header-actions">
-              <button class="btn" onclick="probeSingleVm('${vm.name}')" id="btn-probe-${vm.name}" title="立即从云端采集最新资源、运行与线程状态">
+              <button class="btn" onclick="probeSingleVm(${escJsArg(vm.name)})" id="btn-probe-${safeVmName}" title="立即从云端采集最新资源、运行与线程状态">
                 ⚡ 刷新状态
               </button>
-              <button class="btn btn-danger" onclick="confirmHardDeleteVm('${vm.name}', '${vm.endpoint || ""}')" title="调用 Google Colab unassign 接口并二次核验，彻底销毁虚拟机停止计费">
+              <button class="btn btn-danger" onclick="confirmHardDeleteVm(${escJsArg(vm.name)}, ${escJsArg(vm.endpoint || "")})" title="调用 Google Colab unassign 接口并二次核验，彻底销毁虚拟机停止计费">
                 🗑️ 删除虚拟机 (彻底停费)
               </button>
             </div>
@@ -944,7 +960,7 @@
               <div class="section-title">
                 <span>① 运行状态 (Running Status)</span>
                 <span style="font-size:11px;font-weight:500;">
-                  Endpoint: <code>${vm.endpoint || "等待分配"}</code> ·
+                  Endpoint: <code>${escHtml(vm.endpoint || "等待分配")}</code> ·
                   ${vm.is_billing_on_server ? '<span style="color:#34d399;">● 云端在线计费中</span>' : '<span style="color:#94a3b8;">○ 云端未计费</span>'}
                 </span>
               </div>
@@ -955,12 +971,12 @@
                 </div>
                 <div class="kv-item">
                   <div class="kv-label">接力棒次与当前阶段</div>
-                  <div class="kv-val">${relay.is_running ? `第 ${relay.round || 1} 棒 · ${relay.phase_label}` : (relay.phase_label || "未开启接力")}</div>
+                  <div class="kv-val">${relay.is_running ? `第 ${escHtml(relay.round || 1)} 棒 · ${escHtml(relay.phase_label)}` : escHtml(relay.phase_label || "未开启接力")}</div>
                 </div>
                 <div class="kv-item">
                   <div class="kv-label">训练轮次进度 (Epoch / Loss)</div>
                   <div class="kv-val">
-                    ${curEpoch > 0 ? `Epoch ${curEpoch}/${totEpochs} (${epochPct}%) · loss=${tr.loss ?? "-"}` : "待启动训练"}
+                    ${curEpoch > 0 ? `Epoch ${escHtml(curEpoch)}/${escHtml(totEpochs)} (${epochPct}%) · loss=${escHtml(tr.loss ?? "-")}` : "待启动训练"}
                   </div>
                 </div>
                 <div class="kv-item">
@@ -969,7 +985,7 @@
                 </div>
                 <div class="kv-item">
                   <div class="kv-label">云端本地断点 (checkpoint.pt)</div>
-                  <div class="kv-val">${files.has_checkpoint ? `✅ 已存在 (${files.checkpoint_size_mb} MB)` : "暂无本地断点"}</div>
+                  <div class="kv-val">${files.has_checkpoint ? `✅ 已存在 (${escHtml(files.checkpoint_size_mb)} MB)` : "暂无本地断点"}</div>
                 </div>
                 <div class="kv-item">
                   <div class="kv-label">距离下次 30m 网盘热备</div>
@@ -982,18 +998,18 @@
             <div class="section-box">
               <div class="section-title">
                 <span>② 资源状态 (Resource Status)</span>
-                <span style="font-size:11px;font-weight:500;">${cpu.model || ""} (${cpu.cores || "-"} vCPU)</span>
+                <span style="font-size:11px;font-weight:500;">${escHtml(cpu.model || "")} (${escHtml(cpu.cores || "-")} vCPU)</span>
               </div>
               <div class="resource-grid">
                 <div class="res-item">
                   <div class="res-head">
-                    <span class="res-name">GPU 算力与显存 (${gpu.name || vm.accelerator})</span>
-                    <span class="res-num">${gpuPct}%</span>
+                    <span class="res-name">GPU 算力与显存 (${escHtml(gpu.name || vm.accelerator)})</span>
+                    <span class="res-num">${escHtml(gpuPct)}%</span>
                   </div>
                   <div class="progress-track">
-                    <div class="${progressClass(gpuPct)}" style="width:${Math.min(100, gpuPct)}%"></div>
+                    <div class="${progressClass(gpuPct)}" style="width:${Math.min(100, Number(gpuPct) || 0)}%"></div>
                   </div>
-                  <div class="res-sub">${vramText}</div>
+                  <div class="res-sub">${escHtml(vramText)}</div>
                 </div>
 
                 <div class="res-item">
@@ -1077,7 +1093,7 @@
               <div class="relay-config-row">
                 <div class="form-field">
                   <label>换棒目标 GPU</label>
-                  <select data-vm-input data-vm="${vm.name}" data-field="gpu_type">
+                  <select data-vm-input data-vm="${safeVmName}" data-field="gpu_type">
                     ${["T4", "A100", "L4", "H100", "G4", "CPU"].map((g) =>
                       `<option value="${g}" ${(cfg.gpu_type || vm.accelerator) === g ? "selected" : ""}>${g}</option>`
                     ).join("")}
@@ -1085,40 +1101,40 @@
                 </div>
                 <div class="form-field">
                   <label>单棒安全时长 (小时)</label>
-                  <input type="number" step="0.5" data-vm-input data-vm="${vm.name}" data-field="max_session_hours" value="${cfg.max_session_hours ?? 22.5}" />
+                  <input type="number" step="0.5" data-vm-input data-vm="${safeVmName}" data-field="max_session_hours" value="${escHtml(cfg.max_session_hours ?? 22.5)}" />
                 </div>
                 <div class="form-field">
                   <label>网盘热备间隔 (分钟)</label>
-                  <input type="number" step="1" data-vm-input data-vm="${vm.name}" data-field="backup_interval_minutes" value="${cfg.backup_interval_minutes ?? 30}" />
+                  <input type="number" step="1" data-vm-input data-vm="${safeVmName}" data-field="backup_interval_minutes" value="${escHtml(cfg.backup_interval_minutes ?? 30)}" />
                 </div>
                 <div class="form-field">
                   <label>总训练轮数 (Epochs)</label>
-                  <input type="number" step="10" data-vm-input data-vm="${vm.name}" data-field="total_epochs" value="${cfg.total_epochs ?? 500}" />
+                  <input type="number" step="10" data-vm-input data-vm="${safeVmName}" data-field="total_epochs" value="${escHtml(cfg.total_epochs ?? 500)}" />
                 </div>
               </div>
 
               <div class="relay-btn-bar">
                 <div style="display:flex; align-items:center; gap:12px; font-size:12px; color:var(--text-secondary);">
                   <label style="display:flex; align-items:center; gap:5px; cursor:pointer;">
-                    <input type="checkbox" data-vm-input data-vm="${vm.name}" data-field="high_mem" ${cfg.high_mem !== false ? "checked" : ""} />
+                    <input type="checkbox" data-vm-input data-vm="${safeVmName}" data-field="high_mem" ${cfg.high_mem !== false ? "checked" : ""} />
                     High-RAM 高内存
                   </label>
                   <label style="display:flex; align-items:center; gap:5px; cursor:pointer;">
-                    <input type="checkbox" data-vm-input data-vm="${vm.name}" data-field="reset_done_flag" ${cfg.reset_done_flag ? "checked" : ""} />
+                    <input type="checkbox" data-vm-input data-vm="${safeVmName}" data-field="reset_done_flag" ${cfg.reset_done_flag ? "checked" : ""} />
                     启动时重置网盘完成标记 (重新训练)
                   </label>
                 </div>
                 <div style="display:flex; gap:8px;">
                   ${relay.is_running ? `
-                    <button class="btn btn-warning" onclick="stopRelay('${vm.name}', false)">⏹ 关闭接力训练 (保留实例)</button>
-                    <button class="btn btn-danger" onclick="stopRelay('${vm.name}', true)">⏹ 关闭接力并销毁实例停费</button>
+                    <button class="btn btn-warning" onclick="stopRelay(${escJsArg(vm.name)}, false)">⏹ 关闭接力训练 (保留实例)</button>
+                    <button class="btn btn-danger" onclick="stopRelay(${escJsArg(vm.name)}, true)">⏹ 关闭接力并销毁实例停费</button>
                   ` : `
-                    <button class="btn btn-success" onclick="startRelay('${vm.name}')">▶ 开启接力训练 (24h+ 无人值守)</button>
+                    <button class="btn btn-success" onclick="startRelay(${escJsArg(vm.name)})">▶ 开启接力训练 (24h+ 无人值守)</button>
                   `}
                 </div>
               </div>
 
-              <div class="log-terminal" id="log-box-${vm.name}">${logsText}</div>
+              <div class="log-terminal" id="log-box-${safeVmName}">${logsText}</div>
             </div>
           </div>
         </section>
@@ -1243,12 +1259,12 @@
       modal.classList.add("open");
       body.innerHTML = `
         <div style="color:#fbbf24; font-weight:600;">
-          ⏳ 正在对虚拟机 <code>[${name}]</code> (${endpoint || "云端实例"}) 执行四步硬销毁与计费停止核验...
+          ⏳ 正在对虚拟机 <code>[${escHtml(name)}]</code> (${escHtml(endpoint || "云端实例")}) 执行四步硬销毁与计费停止核验...
         </div>
         <ul style="padding-left:18px; color:var(--text-secondary);">
           <li>1. 停止本机接力监工线程与关联子进程...</li>
           <li>2. 关闭远程 Jupyter Kernel 会话...</li>
-          <li>3. 调用 Google Colab <code>/tun/m/unassign/${endpoint}</code> 释放云端算力...</li>
+          <li>3. 调用 Google Colab <code>/tun/m/unassign/${escHtml(endpoint)}</code> 释放云端算力...</li>
           <li>4. 重新查询 <code>/tun/m/assignments</code> 核验云端真实计费列表清零...</li>
         </ul>
       `;
@@ -1259,7 +1275,7 @@
           { method: "DELETE" }
         );
         const data = await res.json();
-        const stepsHtml = (data.steps || []).map((s) => `<li>${s}</li>`).join("");
+        const stepsHtml = (data.steps || []).map((s) => `<li>${escHtml(s)}</li>`).join("");
         const ccu = data.ccu_receipt || {};
         if (data.verified_unassigned) {
           body.innerHTML = `
@@ -1271,10 +1287,10 @@
               <ul style="padding-left:18px; color:var(--text-secondary); font-size:12px;">${stepsHtml}</ul>
             </div>
             <div class="section-box" style="font-family:monospace; font-size:12px;">
-              <div>已释放 Endpoint: ${data.endpoint || "无"}</div>
-              <div>当前云端剩余计费实例数: <strong>${ccu.active_assignments_count ?? 0} 台</strong></div>
-              <div>当前每小时计费速率: <strong style="color:#34d399;">${ccu.burn_rate_hourly ?? 0} CU/h</strong></div>
-              <div>账户剩余计算单元: <strong>${ccu.balance ?? "--"} CU</strong></div>
+              <div>已释放 Endpoint: ${escHtml(data.endpoint || "无")}</div>
+              <div>当前云端剩余计费实例数: <strong>${escHtml(ccu.active_assignments_count ?? 0)} 台</strong></div>
+              <div>当前每小时计费速率: <strong style="color:#34d399;">${escHtml(ccu.burn_rate_hourly ?? 0)} CU/h</strong></div>
+              <div>账户剩余计算单元: <strong>${escHtml(ccu.balance ?? "--")} CU</strong></div>
             </div>
           `;
           showToast(`🗑️ 虚拟机 [${name}] 已彻底销毁并核验停止计费`, "#10b981");
@@ -1283,13 +1299,13 @@
             <div style="color:#f87171; font-weight:700;">
               ⚠️ 服务端核验发现实例可能尚未完全释放，未做假性删除！请点击重试：
             </div>
-            <div style="font-size:12px; color:var(--text-secondary);">${data.error || ""}</div>
+            <div style="font-size:12px; color:var(--text-secondary);">${escHtml(data.error || "")}</div>
             <ul style="padding-left:18px; font-size:12px;">${stepsHtml}</ul>
           `;
         }
         await fetchOverview(false);
       } catch (e) {
-        body.innerHTML = `<div style="color:#f87171;">销毁请求异常: ${e.message}</div>`;
+        body.innerHTML = `<div style="color:#f87171;">销毁请求异常: ${escHtml(e.message)}</div>`;
       }
     }
 

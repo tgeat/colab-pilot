@@ -7,8 +7,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::{Duration, Instant, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
@@ -38,7 +38,20 @@ fn local_bin(name: &str) -> PathBuf {
     dirs::home_dir().unwrap_or_default().join(".local").join("bin").join(file)
 }
 
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) static TEST_COLAB_BIN: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) static TEST_CONFIG_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 pub fn colab_bin() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = TEST_COLAB_BIN.l().clone() {
+        return p;
+    }
     let p = local_bin("colab");
     if p.exists() {
         return p;
@@ -98,6 +111,10 @@ pub fn rclone_conf_path() -> PathBuf {
 }
 
 pub fn colab_config_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = TEST_CONFIG_DIR.l().clone() {
+        return p;
+    }
     dirs::home_dir().unwrap_or_default().join(".config").join("colab-cli")
 }
 
@@ -111,6 +128,852 @@ pub fn history_dir() -> PathBuf {
 
 pub fn workspaces_registry_path() -> PathBuf {
     colab_config_dir().join("workspaces.json")
+}
+
+pub fn llm_api_keys_path() -> PathBuf {
+    colab_config_dir().join("llm_api_keys.json")
+}
+
+pub fn ssh_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = TEST_CONFIG_DIR.l().clone() {
+        return p.join("test_ssh");
+    }
+    dirs::home_dir().unwrap_or_default().join(".ssh")
+}
+
+pub fn ssh_config_path() -> PathBuf {
+    ssh_dir().join("config")
+}
+
+pub fn pilot_ssh_private_key_path() -> PathBuf {
+    ssh_dir().join("colab_pilot_ed25519")
+}
+
+pub fn pilot_ssh_public_key_path() -> PathBuf {
+    ssh_dir().join("colab_pilot_ed25519.pub")
+}
+
+/// 校验会话别名可安全拼入 `~/.ssh/config` 或命令行标识符（杜绝换行与 SSH 指令注入）
+pub fn is_safe_vm_alias(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+pub fn known_hosts_null_device() -> &'static str {
+    // OpenSSH 6+（含 Windows OpenSSH 9.x / Git Bash / Unix）均原生支持 `none`，避免 `NUL` 与 `/dev/null` 跨环境冲突
+    "none"
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct VmSshInfo {
+    pub ready: bool,
+    pub host_alias: String,
+    pub local_port: u16,
+    pub ssh_command: String,
+    pub ssh_port_command: String,
+    pub colab_ssh_command: String,
+    pub private_key_path: String,
+    pub public_key_fingerprint: String,
+    pub remote_ws_url: String,
+    pub user: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct LlmApiAccessInfo {
+    pub vm_name: String,
+    pub slot: String,
+    pub model_name: String,
+    pub engine: String,
+    pub api_base_url: String,
+    pub chat_completions_url: String,
+    pub models_url: String,
+    pub gateway_base_url: String,
+    pub api_key: String,
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub curl_example: String,
+    pub python_example: String,
+}
+
+fn iso_utc_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("state"),
+        uuid::Uuid::new_v4().simple()
+    ));
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(content.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, content)?;
+    }
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::write(path, content);
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(())
+}
+
+/// 收紧 `~/.ssh` 目录及 `~/.ssh/config`（或私钥）权限，防止 Windows 下继承自用户目录的沙箱组
+/// （如 `CodexSandboxUsers`）写权限触发 Win32-OpenSSH 报错 `Bad owner or permissions on ~/.ssh/config`。
+pub fn ensure_ssh_dir_and_config_acl(ssh_dir_path: &Path, config_path: Option<&Path>) {
+    #[cfg(all(windows, not(test)))]
+    {
+        use std::os::windows::process::CommandExt;
+        static DIR_HARDENED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+        let user_principal = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+            (Ok(dom), Ok(usr)) if !dom.trim().is_empty() && !usr.trim().is_empty() => {
+                format!("{}\\{}", dom.trim(), usr.trim())
+            }
+            (_, Ok(usr)) if !usr.trim().is_empty() => usr.trim().to_string(),
+            _ => return,
+        };
+
+        let run_icacls = |args: &[String]| {
+            let mut cmd = std::process::Command::new("icacls");
+            cmd.args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW);
+            let _ = cmd.status();
+        };
+
+        if ssh_dir_path.exists() {
+            DIR_HARDENED.get_or_init(|| {
+                run_icacls(&[
+                    ssh_dir_path.to_string_lossy().to_string(),
+                    "/inheritance:r".into(),
+                    "/grant:r".into(),
+                    "*S-1-5-18:(OI)(CI)(F)".into(),
+                    "*S-1-5-32-544:(OI)(CI)(F)".into(),
+                    format!("{user_principal}:(OI)(CI)(F)"),
+                ]);
+            });
+        }
+
+        if let Some(cfg) = config_path {
+            if cfg.exists() {
+                run_icacls(&[
+                    cfg.to_string_lossy().to_string(),
+                    "/inheritance:r".into(),
+                    "/grant:r".into(),
+                    "*S-1-5-18:(F)".into(),
+                    "*S-1-5-32-544:(F)".into(),
+                    format!("{user_principal}:(F)"),
+                ]);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if ssh_dir_path.exists() {
+            let _ = std::fs::set_permissions(ssh_dir_path, std::fs::Permissions::from_mode(0o700));
+        }
+        if let Some(cfg) = config_path {
+            if cfg.exists() {
+                let _ = std::fs::set_permissions(cfg, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+
+    #[cfg(all(windows, test))]
+    {
+        let _ = (ssh_dir_path, config_path);
+    }
+}
+
+/// 生成供本地 SSH 隧道免密登录 Colab 容器使用的 Ed25519 密钥对（缓存结果，避免高频轮询重复检查）
+pub fn ensure_ssh_keypair() -> Result<(PathBuf, String)> {
+    static KEY_CACHE: std::sync::Mutex<Option<(PathBuf, PathBuf, String)>> =
+        std::sync::Mutex::new(None);
+
+    let priv_key = pilot_ssh_private_key_path();
+    let pub_key = pilot_ssh_public_key_path();
+    {
+        let guard = KEY_CACHE.l();
+        if let Some((cached_priv, cached_pub, cached_pub_raw)) = guard.as_ref() {
+            if cached_priv == &priv_key && cached_priv.exists() && cached_pub.exists() {
+                return Ok((priv_key, cached_pub_raw.clone()));
+            }
+        }
+    }
+
+    let dir = ssh_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let cfg_path = ssh_config_path();
+    ensure_ssh_dir_and_config_acl(&dir, cfg_path.exists().then_some(cfg_path.as_path()));
+    if !priv_key.exists() || !pub_key.exists() {
+        let _ = std::fs::remove_file(&priv_key);
+        let _ = std::fs::remove_file(&pub_key);
+        let keygen = which("ssh-keygen").unwrap_or_else(|| PathBuf::from("ssh-keygen"));
+        let mut cmd = std::process::Command::new(keygen);
+        cmd.args([
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "colab-pilot",
+            "-f",
+            &priv_key.to_string_lossy(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let st = cmd.status().context("调用 ssh-keygen 生成 SSH 密钥失败")?;
+        if !st.success() {
+            return Err(anyhow!("ssh-keygen 生成 SSH 密钥返回非零状态"));
+        }
+        ensure_ssh_dir_and_config_acl(&dir, Some(&priv_key));
+    }
+    let pub_raw = std::fs::read_to_string(&pub_key)
+        .context("读取 colab_pilot_ed25519.pub 失败")?
+        .trim()
+        .to_string();
+    *KEY_CACHE.l() = Some((priv_key.clone(), pub_key, pub_raw.clone()));
+    Ok((priv_key, pub_raw))
+}
+
+const SSH_CONFIG_BEGIN: &str = "# >>> colab-pilot managed hosts >>>";
+const SSH_CONFIG_END: &str = "# <<< colab-pilot managed hosts <<<";
+
+/// 将当前活跃的本地 SSH 桥接端口同步写入 `~/.ssh/config`（使用 `UserKnownHostsFile none`，自动收紧 ACL，内容未变时不写盘）
+pub fn sync_ssh_config_hosts(entries: &[(String, u16)]) {
+    static LAST_SYNCED_BLOCK: std::sync::Mutex<Option<(PathBuf, String)>> =
+        std::sync::Mutex::new(None);
+
+    let Ok((priv_key, _)) = ensure_ssh_keypair() else {
+        return;
+    };
+    let dir = ssh_dir();
+    let cfg_path = ssh_config_path();
+    ensure_ssh_dir_and_config_acl(&dir, None);
+    let priv_str = priv_key.to_string_lossy().replace('\\', "/");
+    let null_hosts = known_hosts_null_device();
+
+    let mut sorted: Vec<(String, u16)> = entries
+        .iter()
+        .filter(|(vm_name, _)| is_safe_vm_alias(vm_name))
+        .cloned()
+        .collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut block = String::new();
+    if !sorted.is_empty() {
+        block.push_str(SSH_CONFIG_BEGIN);
+        block.push('\n');
+        for (vm_name, port) in &sorted {
+            let alias = format!("colab-{vm_name}");
+            block.push_str(&format!(
+                "Host {alias}\n    HostName 127.0.0.1\n    Port {port}\n    User root\n    IdentityFile \"{priv_str}\"\n    IdentitiesOnly yes\n    StrictHostKeyChecking no\n    UserKnownHostsFile {null_hosts}\n    ServerAliveInterval 20\n    ServerAliveCountMax 3\n\n"
+            ));
+        }
+        block.push_str(SSH_CONFIG_END);
+        block.push('\n');
+    }
+
+    {
+        let guard = LAST_SYNCED_BLOCK.l();
+        if let Some((last_path, last_block)) = guard.as_ref() {
+            if last_path == &cfg_path && last_block == &block && (block.is_empty() || cfg_path.exists()) {
+                return;
+            }
+        }
+    }
+
+    let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    let cleaned = if let (Some(s_idx), Some(e_idx)) =
+        (existing.find(SSH_CONFIG_BEGIN), existing.find(SSH_CONFIG_END))
+    {
+        if s_idx <= e_idx {
+            let after = e_idx + SSH_CONFIG_END.len();
+            let tail = existing[after..].trim_start_matches(['\r', '\n']);
+            let head = existing[..s_idx].trim_end();
+            if head.is_empty() {
+                tail.to_string()
+            } else if tail.is_empty() {
+                format!("{head}\n")
+            } else {
+                format!("{head}\n\n{tail}")
+            }
+        } else {
+            existing.clone()
+        }
+    } else {
+        existing.clone()
+    };
+
+    let merged = if block.is_empty() {
+        cleaned
+    } else if cleaned.trim().is_empty() {
+        block.clone()
+    } else {
+        format!("{}\n\n{}", cleaned.trim_end(), block)
+    };
+
+    if merged != existing {
+        let _ = atomic_write_file(&cfg_path, &merged);
+        ensure_ssh_dir_and_config_acl(&dir, Some(&cfg_path));
+    }
+    *LAST_SYNCED_BLOCK.l() = Some((cfg_path, block));
+}
+
+static SESSIONS_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 将服务端在线实例同步/去重至 `sessions.json`，兼容 `google-colab-cli` v0.7/v0.8 会话字段规范：
+/// - 若 `creating_active == true`（`colab new` 正在分配中），跳过写入新的 `orphan-*` 条目，避免与 CLI 写盘竞态或产生重复孤儿；
+/// - 自动清理与已命名会话共享同一 `endpoint` 的陈旧 `orphan-*` 条目，以及已不在 `active_endpoints` 中的过期 `orphan-*` 条目。
+#[allow(clippy::too_many_arguments)]
+pub fn sync_sessions_with_assignments(
+    items: &[(
+        String, // session_name
+        String, // endpoint
+        String, // proxy_url
+        String, // proxy_token
+        i64,    // token_expires_in_seconds
+        String, // accelerator
+        String, // variant
+        bool,   // high_ram
+    )],
+    creating_active: bool,
+) {
+    let _lock = SESSIONS_IO_LOCK.l();
+    let path = sessions_path();
+    let mut map: HashMap<String, Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let mut dirty = false;
+
+    let active_eps: std::collections::HashSet<&str> =
+        items.iter().map(|it| it.1.as_str()).collect();
+    let named_eps: std::collections::HashSet<String> = map
+        .iter()
+        .filter(|(k, _)| !k.starts_with("orphan-"))
+        .filter_map(|(_, v)| v.get("endpoint").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .chain(
+            items
+                .iter()
+                .filter(|it| !it.0.starts_with("orphan-"))
+                .map(|it| it.1.clone()),
+        )
+        .collect();
+
+    // 清理已被正式命名会话接管的重复孤儿条目，以及云端已下线的历史孤儿条目
+    let stale_orphans: Vec<String> = map
+        .iter()
+        .filter_map(|(k, v)| {
+            if !k.starts_with("orphan-") {
+                return None;
+            }
+            let ep = v.get("endpoint").and_then(|x| x.as_str()).unwrap_or("");
+            if ep.is_empty() || named_eps.contains(ep) || !active_eps.contains(ep) {
+                Some(k.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for k in stale_orphans {
+        map.remove(&k);
+        dirty = true;
+    }
+
+    for (session_name, endpoint, proxy_url, proxy_token, exp_secs, accelerator, variant, high_ram) in
+        items
+    {
+        if !is_safe_vm_alias(session_name) {
+            continue;
+        }
+        if session_name.starts_with("orphan-") && (creating_active || named_eps.contains(endpoint))
+        {
+            continue;
+        }
+        let norm_acc = {
+            let u = accelerator.trim().to_uppercase();
+            if u.is_empty() || u == "CPU" || u == "NONE" {
+                "NONE".to_string()
+            } else {
+                u
+            }
+        };
+        let norm_var = {
+            let u = variant.trim().to_uppercase();
+            if u.is_empty() || u == "CPU" || u == "NONE" || u == "DEFAULT" {
+                "DEFAULT".to_string()
+            } else {
+                u
+            }
+        };
+        let shape = if *high_ram { "HIGH_RAM" } else { "STANDARD" };
+        let ttl_secs = if *exp_secs > 0 {
+            (*exp_secs).min(86400)
+        } else {
+            3600
+        };
+        let fresh_exp_iso = (chrono::Utc::now() + chrono::Duration::seconds(ttl_secs))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        if let Some(existing) = map.get_mut(session_name) {
+            if let Some(obj) = existing.as_object_mut() {
+                let cur_name = obj.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                let cur_ep = obj.get("endpoint").and_then(|x| x.as_str()).unwrap_or("");
+                let cur_url = obj.get("url").and_then(|x| x.as_str()).unwrap_or("");
+                let cur_tok = obj.get("token").and_then(|x| x.as_str()).unwrap_or("");
+                let has_exp = obj
+                    .get("token_expires_at")
+                    .and_then(|x| x.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                let has_legacy = obj.contains_key("proxy_url")
+                    || obj.contains_key("proxy_token")
+                    || obj.contains_key("auth_mode")
+                    || obj.contains_key("created_at");
+                if cur_name != session_name
+                    || cur_ep != endpoint
+                    || cur_url != proxy_url
+                    || cur_tok != proxy_token
+                    || !has_exp
+                    || has_legacy
+                {
+                    obj.remove("proxy_url");
+                    obj.remove("proxy_token");
+                    obj.remove("auth_mode");
+                    obj.remove("created_at");
+                    obj.insert("name".into(), Value::String(session_name.clone()));
+                    obj.insert("endpoint".into(), Value::String(endpoint.clone()));
+                    obj.insert("url".into(), Value::String(proxy_url.clone()));
+                    obj.insert("token".into(), Value::String(proxy_token.clone()));
+                    obj.insert("token_expires_at".into(), Value::String(fresh_exp_iso));
+                    obj.insert("accelerator".into(), Value::String(norm_acc));
+                    obj.insert("variant".into(), Value::String(norm_var));
+                    obj.insert("machine_shape".into(), Value::String(shape.into()));
+                    obj.entry("kernel_id").or_insert(Value::Null);
+                    obj.entry("session_id").or_insert(Value::Null);
+                    obj.entry("last_execution").or_insert(Value::Null);
+                    obj.entry("running").or_insert(Value::Null);
+                    dirty = true;
+                }
+            }
+        } else {
+            map.insert(
+                session_name.clone(),
+                serde_json::json!({
+                    "name": session_name,
+                    "token": proxy_token,
+                    "url": proxy_url,
+                    "endpoint": endpoint,
+                    "token_expires_at": fresh_exp_iso,
+                    "variant": norm_var,
+                    "accelerator": norm_acc,
+                    "machine_shape": shape,
+                    "kernel_id": Value::Null,
+                    "session_id": Value::Null,
+                    "last_execution": Value::Null,
+                    "running": Value::Null,
+                }),
+            );
+            dirty = true;
+        }
+    }
+
+    if dirty {
+        if let Ok(raw) = serde_json::to_string_pretty(&map) {
+            let _ = atomic_write_file(&path, &raw);
+        }
+    }
+}
+
+/// 将静默探针或流式桥接首次建立的 `kernel_id` 回写到 `sessions.json`，防止后续调用反复新建泄露 Kernel
+pub fn update_session_kernel_id(endpoint: &str, kernel_id: &str) {
+    let kid = kernel_id.trim();
+    if endpoint.is_empty() || kid.is_empty() {
+        return;
+    }
+    let _lock = SESSIONS_IO_LOCK.l();
+    let path = sessions_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut map) = serde_json::from_str::<HashMap<String, Value>>(&raw) else {
+        return;
+    };
+    let mut dirty = false;
+    for val in map.values_mut() {
+        if let Some(obj) = val.as_object_mut() {
+            if obj.get("endpoint").and_then(|x| x.as_str()) == Some(endpoint) {
+                let existing = obj.get("kernel_id").and_then(|x| x.as_str()).unwrap_or("");
+                if existing.is_empty() {
+                    obj.insert("kernel_id".into(), Value::String(kid.to_string()));
+                    dirty = true;
+                }
+            }
+        }
+    }
+    if dirty {
+        if let Ok(out) = serde_json::to_string_pretty(&map) {
+            let _ = atomic_write_file(&path, &out);
+        }
+    }
+}
+
+static WORKSPACES_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn has_workspace_entry(session_name: &str) -> bool {
+    let _lock = WORKSPACES_IO_LOCK.l();
+    std::fs::read_to_string(workspaces_registry_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, Value>>(&s).ok())
+        .map(|m| m.contains_key(session_name))
+        .unwrap_or(false)
+}
+
+/// 持久化注册实例所属的逻辑工作区与描述（写入 `~/.config/colab-cli/workspaces.json`）
+pub fn register_workspace_entry(
+    session_name: &str,
+    workspace_name: &str,
+    workspace_path: Option<&str>,
+    description: Option<&str>,
+) {
+    let _lock = WORKSPACES_IO_LOCK.l();
+    let path = workspaces_registry_path();
+    let mut map: HashMap<String, Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    map.insert(
+        session_name.to_string(),
+        serde_json::json!({
+            "workspace_name": workspace_name,
+            "workspace_path": workspace_path,
+            "description": description,
+            "updated_at": iso_utc_now(),
+        }),
+    );
+    if let Ok(raw) = serde_json::to_string_pretty(&map) {
+        let _ = atomic_write_file(&path, &raw);
+    }
+}
+
+/// 当实例创建失败且会话表中无对应会话时，回滚移除刚预注册的 `workspaces.json` 条目
+pub fn remove_workspace_entry(session_name: &str) {
+    if session_name.trim().is_empty() {
+        return;
+    }
+    let _lock = WORKSPACES_IO_LOCK.l();
+    let path = workspaces_registry_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut map) = serde_json::from_str::<HashMap<String, Value>>(&raw) else {
+        return;
+    };
+    if map.remove(session_name).is_some() {
+        if let Ok(out) = serde_json::to_string_pretty(&map) {
+            let _ = atomic_write_file(&path, &out);
+        }
+    }
+}
+
+fn generate_random_hex(byte_len: usize) -> String {
+    let mut out = String::with_capacity(byte_len * 2 + 32);
+    while out.len() < byte_len * 2 {
+        out.push_str(&uuid::Uuid::new_v4().simple().to_string());
+    }
+    out.truncate(byte_len * 2);
+    out
+}
+
+static API_KEYS_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn read_llm_api_keys_root() -> Value {
+    std::fs::read_to_string(llm_api_keys_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({ "vms": {} }))
+}
+
+pub fn lookup_vm_api_key_meta(vm_name: &str) -> Option<(String, Option<u16>)> {
+    let root = read_llm_api_keys_root();
+    if let Some(entry) = root.get("vms").and_then(|v| v.get(vm_name)) {
+        if let Some(k) = entry.get("api_key").and_then(|x| x.as_str()).filter(|s| !s.trim().is_empty()) {
+            let lp = entry.get("local_port").and_then(|x| x.as_u64()).map(|n| n as u16);
+            return Some((k.to_string(), lp));
+        }
+    }
+    root.get(vm_name)
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|k| (k.to_string(), None))
+}
+
+pub fn has_registered_llm_api_key(vm_name: &str) -> bool {
+    if vm_name.starts_with("orphan-") {
+        return false;
+    }
+    lookup_vm_api_key_meta(vm_name).is_some()
+}
+
+pub fn remove_llm_api_key_entry(vm_name: &str) {
+    let _lock = API_KEYS_IO_LOCK.l();
+    let path = llm_api_keys_path();
+    let mut root = read_llm_api_keys_root();
+    let mut dirty = false;
+    if let Some(vms_obj) = root.get_mut("vms").and_then(|v| v.as_object_mut()) {
+        if vms_obj.remove(vm_name).is_some() {
+            dirty = true;
+        }
+    }
+    if let Some(root_obj) = root.as_object_mut() {
+        if root_obj.remove(vm_name).is_some() {
+            dirty = true;
+        }
+    }
+    if dirty {
+        if let Ok(raw) = serde_json::to_string_pretty(&root) {
+            let _ = atomic_write_file(&path, &raw);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_llm_api_key_record(
+    vm_name: &str,
+    slot: &str,
+    engine: &str,
+    force_new_key: bool,
+    custom_key: Option<&str>,
+    preferred_local_port: u16,
+    remote_port: u16,
+    model_name: &str,
+) -> LlmApiAccessInfo {
+    let _lock = API_KEYS_IO_LOCK.l();
+    let mut root = read_llm_api_keys_root();
+    if root.get("vms").and_then(|v| v.as_object()).is_none() {
+        if let Some(obj) = root.as_object_mut() {
+            obj.insert("vms".into(), serde_json::json!({}));
+        }
+    }
+    let clean_vm: String = vm_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    let clean_vm = if clean_vm.is_empty() { "vm".to_string() } else { clean_vm };
+
+    let slot_norm = {
+        let s = slot.trim().to_lowercase();
+        if s.is_empty() { "standalone".to_string() } else { s }
+    };
+    let eng_norm = {
+        let e = engine.trim();
+        if e.is_empty() { "builtin".to_string() } else { e.to_string() }
+    };
+    let model_norm = {
+        let m = model_name.trim();
+        if m.is_empty() { "default".to_string() } else { m.to_string() }
+    };
+
+    let mut dirty = false;
+    let (existing_key, existing_port) = root
+        .get("vms")
+        .and_then(|v| v.get(vm_name))
+        .map(|entry| {
+            let k = entry
+                .get("api_key")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let p = entry
+                .get("local_port")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0) as u16;
+            (k, p)
+        })
+        .unwrap_or_default();
+
+    let key_val = if let Some(ck) = custom_key.map(str::trim).filter(|s| s.len() >= 8) {
+        if ck != existing_key {
+            dirty = true;
+        }
+        ck.to_string()
+    } else if !force_new_key && !existing_key.is_empty() {
+        existing_key.clone()
+    } else {
+        dirty = true;
+        format!("sk-colab-{clean_vm}-{}", generate_random_hex(8))
+    };
+
+    let local_port = if preferred_local_port >= 18081 {
+        preferred_local_port
+    } else if slot_norm == "blue" && vm_name.ends_with("-blue") {
+        18081
+    } else if slot_norm == "green" && vm_name.ends_with("-green") {
+        18082
+    } else if existing_port >= 18083 {
+        existing_port
+    } else {
+        let used: std::collections::HashSet<u16> = root
+            .get("vms")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter(|(k, _)| k.as_str() != vm_name)
+                    .filter_map(|(_, val)| val.get("local_port").and_then(|x| x.as_u64()))
+                    .map(|p| p as u16)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut cand = 18083u16;
+        while used.contains(&cand) {
+            cand = cand.saturating_add(1);
+        }
+        dirty = true;
+        cand
+    };
+
+    if existing_port != local_port {
+        dirty = true;
+    }
+
+    let api_base_url = format!("http://127.0.0.1:{local_port}/v1");
+    let chat_completions_url = format!("{api_base_url}/chat/completions");
+    let models_url = format!("{api_base_url}/models");
+    let gateway_base_url = "http://127.0.0.1:18080/v1".to_string();
+
+    if root
+        .get("gateway_api_key")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+    {
+        if let Some(obj) = root.as_object_mut() {
+            obj.insert(
+                "gateway_api_key".into(),
+                Value::String(format!("sk-colab-gateway-{}", generate_random_hex(8))),
+            );
+            dirty = true;
+        }
+    }
+
+    if dirty {
+        if let Some(vms_obj) = root.get_mut("vms").and_then(|v| v.as_object_mut()) {
+            vms_obj.insert(
+                vm_name.to_string(),
+                serde_json::json!({
+                    "vm_name": vm_name,
+                    "slot": slot_norm,
+                    "api_key": key_val,
+                    "local_port": local_port,
+                    "remote_port": remote_port,
+                    "model_name": model_norm,
+                    "engine": eng_norm,
+                    "api_base_url": api_base_url,
+                    "gateway_base_url": gateway_base_url,
+                }),
+            );
+        }
+        if let Ok(raw) = serde_json::to_string_pretty(&root) {
+            let _ = atomic_write_file(&llm_api_keys_path(), &raw);
+        }
+    }
+
+    let curl_example = format!(
+        "curl {chat_completions_url} -H \"Content-Type: application/json\" -H \"Authorization: Bearer {key_val}\" -d '{{\"model\":\"{model_norm}\",\"messages\":[{{\"role\":\"user\",\"content\":\"你好\"}}]}}'"
+    );
+    let python_example = format!(
+        "from openai import OpenAI\nclient = OpenAI(base_url=\"{api_base_url}\", api_key=\"{key_val}\")\nresp = client.chat.completions.create(model=\"{model_norm}\", messages=[{{\"role\": \"user\", \"content\": \"你好\"}}])\nprint(resp.choices[0].message.content)"
+    );
+    LlmApiAccessInfo {
+        vm_name: vm_name.to_string(),
+        slot: slot_norm,
+        model_name: model_norm,
+        engine: eng_norm,
+        api_base_url,
+        chat_completions_url,
+        models_url,
+        gateway_base_url,
+        api_key: key_val,
+        local_port,
+        remote_port,
+        curl_example,
+        python_example,
+    }
+}
+
+/// 获取或自动签发某台 LLM 实例的本机 OpenAI 兼容 API Key 与调用示例
+pub fn resolve_or_create_llm_api_info(
+    vm_name: &str,
+    slot: &str,
+    engine: &str,
+    local_port: u16,
+    remote_port: u16,
+    model_name: &str,
+) -> LlmApiAccessInfo {
+    upsert_llm_api_key_record(
+        vm_name,
+        slot,
+        engine,
+        false,
+        None,
+        local_port,
+        remote_port,
+        model_name,
+    )
+}
+
+/// 轮换或自定义某台 LLM 实例的 API Key
+pub fn rotate_llm_api_key_entry(
+    vm_name: &str,
+    slot: &str,
+    engine: &str,
+    custom_key: Option<&str>,
+    local_port: u16,
+    remote_port: u16,
+    model_name: &str,
+) -> LlmApiAccessInfo {
+    upsert_llm_api_key_record(
+        vm_name,
+        slot,
+        engine,
+        true,
+        custom_key,
+        local_port,
+        remote_port,
+        model_name,
+    )
 }
 
 pub fn llm_bluegreen_state_path() -> PathBuf {
@@ -298,9 +1161,37 @@ fn summarize_outputs(outputs: Option<&Value>) -> (Option<String>, bool) {
     (Some(preview), has_err)
 }
 
-/// 读取指定会话的 colab-cli 结构化历史事件（过滤内部探针启动事件）
+/// 读取指定会话的 colab-cli 结构化历史事件（过滤内部探针启动事件，按 mtime + 文件长度缓存避免高频重复解析）
 pub fn read_session_events(session_name: &str, max_events: usize) -> (Vec<CliEventView>, Vec<String>) {
+    type EventCacheEntry = (Option<SystemTime>, u64, Vec<CliEventView>, Vec<String>);
+    static EVENT_CACHE: std::sync::Mutex<Option<HashMap<PathBuf, EventCacheEntry>>> =
+        std::sync::Mutex::new(None);
+
     let path = history_dir().join(format!("{session_name}.jsonl"));
+    let meta = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(_) => return (vec![], vec![]),
+    };
+    let mtime = meta.modified().ok();
+    let flen = meta.len();
+
+    {
+        let guard = EVENT_CACHE.l();
+        if let Some(map) = guard.as_ref() {
+            if let Some((c_mtime, c_len, cached_events, cached_paths)) = map.get(&path) {
+                if *c_mtime == mtime && *c_len == flen {
+                    let total = cached_events.len();
+                    let tail = if total > max_events {
+                        cached_events[total - max_events..].iter().rev().cloned().collect()
+                    } else {
+                        cached_events.iter().rev().cloned().collect()
+                    };
+                    return (tail, cached_paths.clone());
+                }
+            }
+        }
+    }
+
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return (vec![], vec![]);
     };
@@ -436,7 +1327,14 @@ pub fn read_session_events(session_name: &str, max_events: usize) -> (Vec<CliEve
             }
             "console_started" => (
                 "终端连接".to_string(),
-                format!("colab console -s {session_name}"),
+                format!("终端会话 · {session_name}"),
+                None,
+                None,
+                false,
+            ),
+            "ssh_started" => (
+                "SSH 连接".to_string(),
+                format!("colab ssh -s {session_name}"),
                 None,
                 None,
                 false,
@@ -470,11 +1368,44 @@ pub fn read_session_events(session_name: &str, max_events: usize) -> (Vec<CliEve
 
     let len = events.len();
     let tail = if len > max_events {
-        events.into_iter().skip(len - max_events).rev().collect()
+        events[len - max_events..].iter().rev().cloned().collect()
     } else {
-        events.into_iter().rev().collect()
+        events.iter().rev().cloned().collect()
     };
+
+    {
+        let mut guard = EVENT_CACHE.l();
+        let map = guard.get_or_insert_with(HashMap::new);
+        if map.len() > 128 {
+            map.clear();
+        }
+        map.insert(path, (mtime, flen, events, discovered_paths.clone()));
+    }
+
     (tail, discovered_paths)
+}
+
+/// 判断桌面目录名与 Colab 会话名是否满足安全前缀匹配（至少 3 字符且具备 `-`/`_` 词边界）
+pub(crate) fn is_workspace_prefix_match(dir_name: &str, session_name: &str) -> bool {
+    let dn_low = dir_name.trim().to_lowercase();
+    let sn_low = session_name.trim().to_lowercase();
+    if dn_low.is_empty() || sn_low.is_empty() {
+        return false;
+    }
+    if dn_low == sn_low {
+        return true;
+    }
+    if dn_low.chars().count() < 3 || sn_low.chars().count() < 3 {
+        return false;
+    }
+    let has_boundary = |longer: &str, shorter: &str| -> bool {
+        longer
+            .strip_prefix(shorter)
+            .and_then(|rest| rest.chars().next())
+            .map(|ch| ch == '-' || ch == '_')
+            .unwrap_or(false)
+    };
+    has_boundary(&sn_low, &dn_low) || has_boundary(&dn_low, &sn_low)
 }
 
 /// 综合推断某台 Colab 虚拟机对应的本地工作区（Workspace）信息
@@ -641,9 +1572,7 @@ pub fn resolve_workspace_for_vm(
         }
         for p in desktop_subdirs() {
             if let Some(dn) = p.file_name().and_then(|n| n.to_str()) {
-                let dn_low = dn.to_lowercase();
-                let sn_low = session_name.to_lowercase();
-                if sn_low.starts_with(&dn_low) || dn_low.starts_with(&sn_low) {
+                if is_workspace_prefix_match(dn, session_name) {
                     return WorkspaceInfo {
                         name: dn.to_string(),
                         path: Some(p.display().to_string()),
@@ -796,22 +1725,31 @@ pub fn build_cmd(bin: &PathBuf, args: &[String]) -> Command {
     cmd
 }
 
+/// 按 PID 结束进程树（跨平台封装）
+pub async fn kill_pid_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let mut k = Command::new("taskkill");
+        k.args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        k.creation_flags(CREATE_NO_WINDOW);
+        let _ = k.status().await;
+    }
+    #[cfg(not(windows))]
+    {
+        let mut k = Command::new("kill");
+        k.args(["-KILL", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = k.status().await;
+    }
+}
+
 /// 结束整个进程树（uv trampoline -> python）
 pub async fn kill_tree(child: &mut Child) {
     if let Some(pid) = child.id() {
-        #[cfg(windows)]
-        {
-            let mut k = Command::new("taskkill");
-            k.args(["/PID", &pid.to_string(), "/T", "/F"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            k.creation_flags(CREATE_NO_WINDOW);
-            let _ = k.status().await;
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = pid;
-        }
+        kill_pid_tree(pid).await;
     }
     let _ = child.kill().await;
 }
@@ -819,12 +1757,83 @@ pub async fn kill_tree(child: &mut Child) {
 pub struct RunOutput {
     pub code: i32,
     pub output: String,
+    pub stdout: String,
     pub cancelled: bool,
-    #[allow(dead_code)]
     pub timed_out: bool,
 }
 
-/// 运行命令：可选 stdin、超时、取消，逐行回调（stdout 与 stderr 合并）
+const MAX_COLLECTED_BYTES: usize = 256 * 1024;
+const MAX_LINE_BUFFER_BYTES: usize = 16 * 1024;
+
+pub(crate) fn push_rolling_tail(target: &mut String, line: &str, max_bytes: usize) {
+    target.push_str(line);
+    target.push('\n');
+    if target.len() > max_bytes {
+        let mut cut = target.len() - max_bytes;
+        while cut < target.len() && !target.is_char_boundary(cut) {
+            cut += 1;
+        }
+        target.drain(..cut);
+    }
+}
+
+struct LineByteBuffer {
+    buf: Vec<u8>,
+    last_was_cr: bool,
+}
+
+impl LineByteBuffer {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(512),
+            last_was_cr: false,
+        }
+    }
+
+    fn push_bytes<F: FnMut(&str)>(&mut self, bytes: &[u8], mut emit: F) {
+        for &b in bytes {
+            if b == b'\n' {
+                if self.last_was_cr {
+                    self.last_was_cr = false;
+                    continue;
+                }
+                let s = String::from_utf8_lossy(&self.buf);
+                emit(&s);
+                self.buf.clear();
+            } else if b == b'\r' {
+                self.last_was_cr = true;
+                let s = String::from_utf8_lossy(&self.buf);
+                emit(&s);
+                self.buf.clear();
+            } else {
+                self.last_was_cr = false;
+                self.buf.push(b);
+                if self.buf.len() >= MAX_LINE_BUFFER_BYTES {
+                    // 若存在未完结的 UTF-8 尾字节（最多 3 字节），保留到下一段，避免人为切断合法多字节字符
+                    let split_at = match std::str::from_utf8(&self.buf) {
+                        Ok(_) => self.buf.len(),
+                        Err(e) if e.error_len().is_none() && e.valid_up_to() > 0 => e.valid_up_to(),
+                        Err(_) => self.buf.len(),
+                    };
+                    let s = String::from_utf8_lossy(&self.buf[..split_at]);
+                    emit(&s);
+                    self.buf.drain(..split_at);
+                }
+            }
+        }
+    }
+
+    fn flush_remaining<F: FnMut(&str)>(&mut self, mut emit: F) {
+        if !self.buf.is_empty() {
+            let s = String::from_utf8_lossy(&self.buf);
+            emit(&s);
+            self.buf.clear();
+        }
+        self.last_was_cr = false;
+    }
+}
+
+/// 运行命令：可选 stdin、超时、取消，原始字节排空管道（容忍非 UTF-8 输出与 `\r` 进度条，绝不死锁管道）
 pub async fn run_streaming<F>(
     bin: &PathBuf,
     args: &[String],
@@ -856,11 +1865,14 @@ where
         }
     }
 
-    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-    let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
-    let mut out_lines = BufReader::new(stdout).lines();
-    let mut err_lines = BufReader::new(stderr).lines();
+    let mut stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+    let mut stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
+    let mut out_buf = LineByteBuffer::new();
+    let mut err_buf = LineByteBuffer::new();
+    let mut out_chunk = [0u8; 4096];
+    let mut err_chunk = [0u8; 4096];
     let mut collected = String::new();
+    let mut stdout_collected = String::new();
     let mut out_done = false;
     let mut err_done = false;
     let cancel = cancel.unwrap_or_default();
@@ -872,19 +1884,45 @@ where
 
     while !(out_done && err_done) {
         tokio::select! {
-            line = out_lines.next_line(), if !out_done => match line {
-                Ok(Some(l)) => { on_line(&l); collected.push_str(&l); collected.push('\n'); }
-                _ => out_done = true,
+            res = stdout.read(&mut out_chunk), if !out_done => match res {
+                Ok(0) | Err(_) => {
+                    out_buf.flush_remaining(|l| {
+                        on_line(l);
+                        push_rolling_tail(&mut collected, l, MAX_COLLECTED_BYTES);
+                        push_rolling_tail(&mut stdout_collected, l, MAX_COLLECTED_BYTES);
+                    });
+                    out_done = true;
+                }
+                Ok(n) => {
+                    out_buf.push_bytes(&out_chunk[..n], |l| {
+                        on_line(l);
+                        push_rolling_tail(&mut collected, l, MAX_COLLECTED_BYTES);
+                        push_rolling_tail(&mut stdout_collected, l, MAX_COLLECTED_BYTES);
+                    });
+                }
             },
-            line = err_lines.next_line(), if !err_done => match line {
-                Ok(Some(l)) => { on_line(&l); collected.push_str(&l); collected.push('\n'); }
-                _ => err_done = true,
+            res = stderr.read(&mut err_chunk), if !err_done => match res {
+                Ok(0) | Err(_) => {
+                    err_buf.flush_remaining(|l| {
+                        on_line(l);
+                        push_rolling_tail(&mut collected, l, MAX_COLLECTED_BYTES);
+                    });
+                    err_done = true;
+                }
+                Ok(n) => {
+                    err_buf.push_bytes(&err_chunk[..n], |l| {
+                        on_line(l);
+                        push_rolling_tail(&mut collected, l, MAX_COLLECTED_BYTES);
+                    });
+                }
             },
             _ = cancel.cancelled() => { cancelled = true; break; }
             _ = &mut deadline => { timed_out = true; break; }
         }
     }
 
+    drop(stdout);
+    drop(stderr);
     if cancelled || timed_out {
         kill_tree(&mut child).await;
     }
@@ -895,6 +1933,7 @@ where
     Ok(RunOutput {
         code: status.and_then(|s| s.code()).unwrap_or(-1),
         output: collected,
+        stdout: stdout_collected,
         cancelled,
         timed_out,
     })
@@ -906,4 +1945,420 @@ pub async fn run_simple(bin: &PathBuf, args: &[String], timeout: Duration) -> Re
 
 pub fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
+}
+
+/// 过滤 ANSI 转义与 `google-colab-cli` 版本更新提示横幅，避免升级提示遮蔽真实错误尾行
+pub fn strip_colab_cli_banners(raw: &str) -> String {
+    let no_ansi = crate::relay::strip_ansi_codes(raw);
+    let mut kept = Vec::new();
+    for line in no_ansi.lines() {
+        let t = line.trim();
+        if t.starts_with("[colab] A new version of Colab CLI is available")
+            || (t.starts_with("[colab] Run ")
+                && (t.contains("google-colab-cli") || t.contains("uv tool upgrade")))
+        {
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
+}
+
+fn is_cli_box_border_line(t: &str) -> bool {
+    if t.is_empty() {
+        return false;
+    }
+    if (t.starts_with('┌') || t.starts_with('╭')) && (t.ends_with('┐') || t.ends_with('╮')) {
+        return true;
+    }
+    t.chars().all(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '┌' | '┐'
+                    | '└'
+                    | '┘'
+                    | '─'
+                    | '━'
+                    | '╭'
+                    | '╮'
+                    | '╰'
+                    | '╯'
+                    | '═'
+                    | '├'
+                    | '┤'
+                    | '┬'
+                    | '┴'
+                    | '┼'
+                    | '+'
+                    | '-'
+                    | '='
+            )
+    })
+}
+
+fn strip_cli_box_row(t: &str) -> Option<&str> {
+    let mut chars = t.chars();
+    let first = chars.next()?;
+    let last = chars.next_back()?;
+    if matches!(first, '│' | '║') && matches!(last, '│' | '║') {
+        let inner = &t[first.len_utf8()..t.len() - last.len_utf8()];
+        Some(inner.trim())
+    } else {
+        None
+    }
+}
+
+/// 从 CLI 输出中提取最具可读性的最后一条核心报错（剥离 ANSI、升级横幅及 Rich/Typer 方框边框，合并方框内折行正文）
+pub fn last_meaningful_cli_line(cleaned: &str, fallback: &str) -> String {
+    let stripped = strip_colab_cli_banners(cleaned);
+    let lines: Vec<&str> = stripped.lines().map(str::trim).collect();
+    let mut idx = lines.len();
+    while idx > 0 {
+        idx -= 1;
+        let t = lines[idx];
+        if t.is_empty() || is_cli_box_border_line(t) {
+            continue;
+        }
+        if let Some(inner) = strip_cli_box_row(t) {
+            let mut box_parts = Vec::new();
+            if !inner.is_empty() {
+                box_parts.push(inner);
+            }
+            while idx > 0 {
+                let prev = lines[idx - 1];
+                if prev.is_empty() {
+                    idx -= 1;
+                    continue;
+                }
+                if is_cli_box_border_line(prev) {
+                    break;
+                }
+                if let Some(prev_inner) = strip_cli_box_row(prev) {
+                    if !prev_inner.is_empty() {
+                        box_parts.push(prev_inner);
+                    }
+                    idx -= 1;
+                } else {
+                    break;
+                }
+            }
+            box_parts.reverse();
+            let joined = box_parts.join(" ");
+            if !joined.is_empty() {
+                return joined;
+            }
+            continue;
+        }
+        return t.to_string();
+    }
+    fallback.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn test_line_byte_buffer_non_utf8_cr_and_unbroken_utf8_boundary() {
+        let mut buf = LineByteBuffer::new();
+        let mut lines = Vec::new();
+
+        // GBK bytes ("正在") + \r progress + \r\n + UTF-8 across >16KB unbroken line
+        buf.push_bytes(b"\xd5\xfd\xd4\xda step1\rstep2\r", |l| lines.push(l.to_string()));
+        buf.push_bytes(b"\ndone\n", |l| lines.push(l.to_string()));
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("step1"));
+        assert_eq!(lines[1], "step2");
+        assert_eq!(lines[2], "done");
+
+        // Unbroken >16KB line with 3-byte UTF-8 ("中" = E4 B8 AD) crossing MAX_LINE_BYTES
+        lines.clear();
+        let prefix = vec![b'a'; MAX_LINE_BUFFER_BYTES - 1];
+        let mut big = prefix;
+        big.extend_from_slice("中尾\n".as_bytes());
+        buf.push_bytes(&big, |l| lines.push(l.to_string()));
+        let joined = lines.join("");
+        assert!(joined.ends_with("中尾"));
+        assert!(!joined.contains('\u{FFFD}'));
+    }
+
+    #[tokio::test]
+    async fn test_run_streaming_non_utf8_over_160kb_no_deadlock_and_separate_stdout() {
+        let py = colab_python_bin();
+        let code = concat!(
+            "import sys\n",
+            "chunk = b'\\xd5\\xfd\\xd4\\xda_' * 40 + b'ok\\n'\n",
+            "for _ in range(900):\n",
+            "    sys.stdout.buffer.write(chunk)\n",
+            "sys.stdout.buffer.flush()\n",
+            "sys.stderr.write('WARN_ONLY_STDERR\\n')\n",
+            "sys.stderr.flush()\n",
+        );
+        let mut callback_count = 0usize;
+        let out = run_streaming(
+            &py,
+            &s(&["-c", code]),
+            None,
+            Duration::from_secs(15),
+            None,
+            None,
+            |_| callback_count += 1,
+        )
+        .await
+        .expect("run_streaming should succeed on non-UTF-8 >160KB output");
+
+        assert_eq!(out.code, 0);
+        assert!(!out.timed_out);
+        assert!(!out.cancelled);
+        assert!(callback_count >= 901);
+        assert!(out.output.len() <= MAX_COLLECTED_BYTES + 256);
+        assert!(out.output.contains("WARN_ONLY_STDERR"));
+        assert!(!out.stdout.contains("WARN_ONLY_STDERR"));
+        assert!(out.stdout.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn test_run_streaming_cancel_and_timeout_terminate_child() {
+        let py = colab_python_bin();
+        let cancel = CancellationToken::new();
+        let cancel_trigger = cancel.clone();
+        let pid_slot: Mutex<Option<u32>> = Mutex::new(None);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            cancel_trigger.cancel();
+        });
+
+        let started = Instant::now();
+        let out = run_streaming(
+            &py,
+            &s(&["-c", "import time; print('READY', flush=True); time.sleep(30)"]),
+            None,
+            Duration::from_secs(20),
+            Some(cancel),
+            Some(&pid_slot),
+            |_| {},
+        )
+        .await
+        .expect("cancelled run_streaming should return Ok(RunOutput)");
+
+        assert!(out.cancelled);
+        assert!(!out.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(pid_slot.l().is_none());
+
+        let out_to = run_streaming(
+            &py,
+            &s(&["-c", "import time; time.sleep(30)"]),
+            None,
+            Duration::from_millis(300),
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("timed-out run_streaming should return Ok(RunOutput)");
+        assert!(out_to.timed_out);
+    }
+
+    #[test]
+    fn test_workspace_prefix_match_boundaries() {
+        assert!(!is_workspace_prefix_match("", "llm-blue"));
+        assert!(!is_workspace_prefix_match("ab", "ab-1"));
+        assert!(is_workspace_prefix_match("ab", "ab"));
+        assert!(!is_workspace_prefix_match("llm", "llmchat"));
+        assert!(!is_workspace_prefix_match("dl2", "dl2train"));
+        assert!(is_workspace_prefix_match("llm", "llm-blue"));
+        assert!(is_workspace_prefix_match("resnet_exp", "resnet_exp_r2"));
+        assert!(is_workspace_prefix_match("Qwen-Service-Green", "qwen-service"));
+    }
+
+    #[test]
+    fn test_strip_colab_cli_banners_preserves_real_error_tail() {
+        let noisy = "\x1b[31mError: HTTP 400: Backend rejected accelerator 'G4'\x1b[0m\n[colab] A new version of Colab CLI is available: 0.7.1 -> 0.8.0\n[colab] Run `uv tool upgrade google-colab-cli` to update.\n";
+        let cleaned = strip_colab_cli_banners(noisy);
+        assert_eq!(
+            last_meaningful_cli_line(&cleaned, "unknown"),
+            "Error: HTTP 400: Backend rejected accelerator 'G4'"
+        );
+
+        // Single-line Typer / Rich error box must extract inner message, NEVER bottom border └────┘
+        let rich_single = "Usage: colab new [OPTIONS]\nTry 'colab new -h' for help.\n┌─ Error ─────────────────────────────────────────────────────────────────────┐\n│ No such option: --auth                                                      │\n└─────────────────────────────────────────────────────────────────────────────┘\n";
+        assert_eq!(
+            last_meaningful_cli_line(rich_single, "unknown"),
+            "No such option: --auth"
+        );
+
+        // Multi-line wrapped Rich error box with ANSI codes must join wrapped rows cleanly
+        let rich_multiline = "\x1b[31m╭─ Error ──────────────────────────────────────────╮\x1b[0m\n│ Invalid value for '--gpu': unsupported value     │\n│ 'FOO'. Supported: T4, L4, G4, H100, A100.        │\n╰──────────────────────────────────────────────────╯\n";
+        assert_eq!(
+            last_meaningful_cli_line(rich_multiline, "unknown"),
+            "Invalid value for '--gpu': unsupported value 'FOO'. Supported: T4, L4, G4, H100, A100."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_sessions_dedups_orphans_and_respects_creating_active() {
+        let _env_guard = TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_cli_sync_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = TEST_CONFIG_DIR.l().clone();
+        *TEST_CONFIG_DIR.l() = Some(tmp.clone());
+
+        // Pre-populate stale orphan sharing endpoint with a named session + dead orphan
+        std::fs::write(
+            sessions_path(),
+            serde_json::json!({
+                "orphan-abc123-0001": { "endpoint": "m-s-shared01", "proxy_url": "http://127.0.0.1", "proxy_token": "old" },
+                "orphan-dead00-9999": { "endpoint": "m-s-gone", "proxy_url": "http://127.0.0.1", "proxy_token": "old" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // 1. While creating_active == true, new orphan-newep-1111 must NOT be written, while named session IS registered
+        sync_sessions_with_assignments(
+            &[
+                (
+                    "g4-smoke".into(),
+                    "m-s-shared01".into(),
+                    "https://proxy.example".into(),
+                    "tok-1".into(),
+                    3600,
+                    "CPU".into(),
+                    "CPU".into(),
+                    false,
+                ),
+                (
+                    "orphan-newep-1111".into(),
+                    "m-s-provisioning".into(),
+                    "https://proxy2.example".into(),
+                    "tok-2".into(),
+                    3600,
+                    "G4".into(),
+                    "GPU".into(),
+                    false,
+                ),
+            ],
+            true,
+        );
+
+        let map1 = read_sessions();
+        assert!(map1.contains_key("g4-smoke"));
+        assert!(!map1.contains_key("orphan-abc123-0001"), "duplicate orphan sharing named endpoint must be removed");
+        assert!(!map1.contains_key("orphan-dead00-9999"), "offline orphan must be pruned");
+        assert!(!map1.contains_key("orphan-newep-1111"), "orphan must not be registered during colab new");
+        assert_eq!(map1["g4-smoke"]["name"].as_str(), Some("g4-smoke"));
+        assert_eq!(map1["g4-smoke"]["url"].as_str(), Some("https://proxy.example"));
+        assert_eq!(map1["g4-smoke"]["token"].as_str(), Some("tok-1"));
+        assert_eq!(map1["g4-smoke"]["endpoint"].as_str(), Some("m-s-shared01"));
+        assert_eq!(map1["g4-smoke"]["accelerator"].as_str(), Some("NONE"));
+        assert_eq!(map1["g4-smoke"]["variant"].as_str(), Some("DEFAULT"));
+        assert!(map1["g4-smoke"].get("proxy_url").is_none());
+        assert!(map1["g4-smoke"].get("proxy_token").is_none());
+        assert!(map1["g4-smoke"]["token_expires_at"].as_str().unwrap_or("").contains('T'));
+
+        // Verify TTL < 300s is NOT clamped upward to 300s, and existing entry updates canonical url/token while keeping kernel_id
+        update_session_kernel_id("m-s-shared01", "kid-keep-01");
+        let before_short = chrono::Utc::now();
+        sync_sessions_with_assignments(
+            &[
+                (
+                    "g4-smoke".into(),
+                    "m-s-shared01".into(),
+                    "https://proxy-rot.example".into(),
+                    "tok-rot".into(),
+                    120,
+                    "CPU".into(),
+                    "CPU".into(),
+                    false,
+                ),
+                (
+                    "orphan-newep-1111".into(),
+                    "m-s-browser".into(),
+                    "https://proxy2.example".into(),
+                    "tok-2".into(),
+                    3600,
+                    "G4".into(),
+                    "GPU".into(),
+                    false,
+                ),
+            ],
+            false,
+        );
+        let map2 = read_sessions();
+        assert!(map2.contains_key("orphan-newep-1111"));
+        assert_eq!(map2["g4-smoke"]["url"].as_str(), Some("https://proxy-rot.example"));
+        assert_eq!(map2["g4-smoke"]["token"].as_str(), Some("tok-rot"));
+        assert_eq!(map2["g4-smoke"]["kernel_id"].as_str(), Some("kid-keep-01"));
+        let exp_dt = chrono::DateTime::parse_from_rfc3339(
+            map2["g4-smoke"]["token_expires_at"].as_str().unwrap(),
+        )
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+        let delta_s = (exp_dt - before_short).num_seconds();
+        assert!(
+            (100..=150).contains(&delta_s),
+            "short TTL (120s) must not be clamped to >=300s, got {delta_s}s"
+        );
+        assert_eq!(map2["orphan-newep-1111"]["name"].as_str(), Some("orphan-newep-1111"));
+        assert_eq!(map2["orphan-newep-1111"]["url"].as_str(), Some("https://proxy2.example"));
+        assert_eq!(map2["orphan-newep-1111"]["token"].as_str(), Some("tok-2"));
+        assert!(map2["orphan-newep-1111"].get("proxy_url").is_none());
+
+        // Steady-state poll must not rewrite sessions.json when nothing changed
+        let raw_before = std::fs::read_to_string(sessions_path()).unwrap();
+        sync_sessions_with_assignments(
+            &[
+                (
+                    "g4-smoke".into(),
+                    "m-s-shared01".into(),
+                    "https://proxy-rot.example".into(),
+                    "tok-rot".into(),
+                    115,
+                    "CPU".into(),
+                    "CPU".into(),
+                    false,
+                ),
+                (
+                    "orphan-newep-1111".into(),
+                    "m-s-browser".into(),
+                    "https://proxy2.example".into(),
+                    "tok-2".into(),
+                    3595,
+                    "G4".into(),
+                    "GPU".into(),
+                    false,
+                ),
+            ],
+            false,
+        );
+        let raw_after = std::fs::read_to_string(sessions_path()).unwrap();
+        assert_eq!(raw_before, raw_after, "steady-state poll must leave sessions.json untouched");
+
+        // Real-host google-colab-cli v0.8.0 StateStore roundtrip check when colab python env is installed
+        let py = colab_python_bin();
+        if py.exists() {
+            let out = std::process::Command::new(&py)
+                .args([
+                    "-c",
+                    "import sys; from pathlib import Path; from colab_cli.state import StateStore; s = StateStore(Path(sys.argv[1])).list(); assert 'g4-smoke' in s and 'orphan-newep-1111' in s, f'missing keys: {list(s)}'; assert s['g4-smoke'].url == 'https://proxy-rot.example' and s['g4-smoke'].token == 'tok-rot'",
+                    &sessions_path().to_string_lossy(),
+                ])
+                .env("PYTHONDONTWRITEBYTECODE", "1")
+                .output()
+                .expect("spawn colab_python_bin for StateStore validation");
+            assert!(
+                out.status.success(),
+                "colab_cli StateStore failed to parse synced sessions.json: stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        *TEST_CONFIG_DIR.l() = prev;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

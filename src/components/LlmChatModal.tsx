@@ -1,4 +1,4 @@
-import { type ReactNode, memo, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   Check,
@@ -10,15 +10,25 @@ import {
   Send,
   SlidersHorizontal,
   Sparkles,
+  Square,
   Trash2,
   User,
   X,
   Zap,
 } from "lucide-react";
 import { api, errText } from "../api";
-import type { ChatMessage, LlmChatStreamEvent, Overview, VmView } from "../types";
+import type { LlmChatStreamEvent, Overview, VmView } from "../types";
 import { num, numOrNull, str } from "../format";
+import {
+  buildHistoryMessages,
+  extractThinkParts,
+  isLlmVm,
+  isSafeMarkdownUrl,
+  parseMarkdownSegments,
+} from "../chatUtils";
 import { ColabIcon, useToast } from "./ui";
+
+export { isLlmVm };
 
 export interface ConversationTurn {
   id: string;
@@ -34,6 +44,7 @@ export interface ConversationTurn {
   elapsedMs?: number | null;
   transport?: string | null;
   streaming?: boolean;
+  cancelled?: boolean;
   error?: string | null;
 }
 
@@ -46,14 +57,6 @@ const QUICK_PROMPTS = [
   "🚀 请详细解析大语言模型蓝绿热切换 (Make-Before-Break) 的核心原理。",
   "⚡ 写一段 PyTorch 混合精度训练 (AMP) 与断点续训的标准模板代码。",
 ];
-
-export function isLlmVm(vm: VmView): boolean {
-  if (!vm.on_server) return false;
-  if (vm.telemetry?.llm) return true;
-  if (vm.telemetry?.threads?.llm_process) return true;
-  if (vm.name.startsWith("llm-")) return true;
-  return false;
-}
 
 // ───────────────────────────── 轻量级流式 Markdown 渲染器 ─────────────────────────────
 
@@ -84,11 +87,19 @@ function renderInlineMarkdown(text: string, keyPrefix = "in"): ReactNode[] {
       const splitPos = raw.indexOf("](");
       const label = raw.slice(1, splitPos);
       const url = raw.slice(splitPos + 2, -1);
-      nodes.push(
-        <a key={k} href={url} target="_blank" rel="noreferrer" className="md-link">
-          {renderInlineMarkdown(label, k)}
-        </a>,
-      );
+      if (isSafeMarkdownUrl(url)) {
+        nodes.push(
+          <a key={k} href={url.trim()} target="_blank" rel="noopener noreferrer" className="md-link">
+            {renderInlineMarkdown(label, k)}
+          </a>,
+        );
+      } else {
+        nodes.push(
+          <span key={k} className="dim" title="已拦截非 http/https/mailto 链接">
+            {renderInlineMarkdown(label, k)}
+          </span>,
+        );
+      }
     } else if (raw.startsWith("***") && raw.endsWith("***")) {
       nodes.push(
         <strong key={k}>
@@ -120,10 +131,13 @@ function CodeBlockCard({ lang, code }: { lang: string; code: string }) {
   const [copied, setCopied] = useState(false);
 
   const onCopy = () => {
-    navigator.clipboard.writeText(code).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1400);
-    });
+    navigator.clipboard
+      ?.writeText(code)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1400);
+      })
+      .catch(() => {});
   };
 
   return (
@@ -338,38 +352,8 @@ const MarkdownContent = memo(function MarkdownContent({
   content: string;
   streaming?: boolean;
 }) {
-  // 1. 提取 <think>...</think> 深度思考块（兼容流式未闭合的 <think>）
-  let thinkText: string | null = null;
-  let mainText = content;
-  const thinkClosed = content.match(/^\s*<think>([\s\S]*?)<\/think>\s*/i);
-  if (thinkClosed) {
-    thinkText = thinkClosed[1].trim();
-    mainText = content.slice(thinkClosed[0].length);
-  } else if (/^\s*<think>/i.test(content)) {
-    thinkText = content.replace(/^\s*<think>/i, "").trim();
-    mainText = "";
-  }
-
-  // 2. 拆分围栏代码块 ```lang ... ```（支持流式输出中尚未闭合的代码块）
-  const segments: { type: "text" | "code"; lang?: string; text: string }[] = [];
-  const fenceRegex = /```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)(?:```|$)/g;
-  let lastIdx = 0;
-  let m: RegExpExecArray | null;
-
-  while ((m = fenceRegex.exec(mainText)) !== null) {
-    if (m.index > lastIdx) {
-      segments.push({ type: "text", text: mainText.slice(lastIdx, m.index) });
-    }
-    segments.push({
-      type: "code",
-      lang: m[1]?.trim() || "text",
-      text: m[2].replace(/\n$/, ""),
-    });
-    lastIdx = fenceRegex.lastIndex;
-  }
-  if (lastIdx < mainText.length) {
-    segments.push({ type: "text", text: mainText.slice(lastIdx) });
-  }
+  const { thinkText, mainText } = extractThinkParts(content, !!streaming);
+  const segments = parseMarkdownSegments(mainText);
 
   return (
     <div className="md-body">
@@ -394,8 +378,8 @@ const MarkdownContent = memo(function MarkdownContent({
 // ───────────────────────────── 大模型交互对话弹窗 ─────────────────────────────
 
 const CHAT_STORAGE_KEY = "colab_pilot_chat_turns_v1";
-/** 发送给模型的历史对话轮数上限（System Prompt 始终保留） */
-const MAX_HISTORY_TURNS = 20;
+/** 发送给模型的历史问答对上限（System Prompt 始终保留） */
+const MAX_HISTORY_PAIRS = 10;
 
 function loadPersistedTurns(): ConversationTurn[] {
   try {
@@ -447,8 +431,25 @@ export function LlmChatModal(props: {
   } | null>(null);
 
   const activeReqIdRef = useRef<string | null>(null);
+  const cancelledReqIdRef = useRef<string | null>(null);
+  const stickToBottomRef = useRef<boolean>(true);
   const chatBodyRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const handleStop = useCallback(() => {
+    const reqId = activeReqIdRef.current;
+    if (!reqId) return;
+    cancelledReqIdRef.current = reqId;
+    api.cancelLlmChat(reqId).catch(() => {});
+  }, []);
+
+  const handleCloseModal = useCallback(() => {
+    if (activeReqIdRef.current) {
+      cancelledReqIdRef.current = activeReqIdRef.current;
+      api.cancelLlmChat(activeReqIdRef.current).catch(() => {});
+    }
+    onClose();
+  }, [onClose]);
 
   // 仅在非流式生成期间持久化（避免每个 token 增量都序列化整段历史写入 localStorage）
   useEffect(() => {
@@ -463,9 +464,24 @@ export function LlmChatModal(props: {
   useEffect(() => {
     if (open && initialTarget) {
       setTargetVm(initialTarget);
+      stickToBottomRef.current = true;
       setTimeout(() => inputRef.current?.focus(), 60);
     }
   }, [open, initialTarget]);
+
+  // 支持 Esc 快捷键：正在生成时停止生成，空闲时关闭窗口
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        if (sending) handleStop();
+        else handleCloseModal();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, sending, handleStop, handleCloseModal]);
 
   const vms = ov?.vms ?? [];
   const bg = ov?.llm_bluegreen ?? null;
@@ -474,19 +490,19 @@ export function LlmChatModal(props: {
     return matched.length > 0 ? matched : vms.filter((v) => v.on_server);
   }, [vms]);
 
-  // 解析当前选中的目标实例详情
+  // 解析当前选中的目标实例详情（严格优先匹配 `${prefix}-${activeSlot}`，杜绝跨集群误匹配）
   const resolvedVm: VmView | undefined = useMemo(() => {
     if (targetVm === "auto") {
-      const prefix = str(bg?.session_prefix, "llm") || "llm";
+      const prefix = (str(bg?.session_prefix, "llm") || "llm").trim();
       const activeSlot = (str(bg?.active_slot, "blue") || "blue").toLowerCase();
       return (
+        llmVms.find((v) => v.name === `${prefix}-${activeSlot}`) ??
+        llmVms.find((v) => str(v.telemetry?.llm?.slot).toLowerCase() === activeSlot) ??
         llmVms.find(
           (v) =>
-            str(v.telemetry?.llm?.slot).toLowerCase() === activeSlot ||
-            v.name === `${prefix}-${activeSlot}` ||
-            v.name.endsWith(`-${activeSlot}`),
+            v.telemetry?.llm?.online &&
+            str(v.telemetry?.llm?.role, "active").toLowerCase() === "active",
         ) ??
-        llmVms.find((v) => v.telemetry?.llm?.online && v.telemetry?.llm?.role === "active") ??
         llmVms[0]
       );
     }
@@ -495,37 +511,45 @@ export function LlmChatModal(props: {
 
   const llmTel = resolvedVm?.telemetry?.llm ?? null;
   const displayModel =
-    str(llmTel?.model_name) || str(bg?.model_name) || str(resolvedVm?.workspace?.description) || "Colab Cloud LLM";
+    str(llmTel?.model_name) ||
+    str(bg?.model_name) ||
+    str(resolvedVm?.workspace?.description) ||
+    "Colab Cloud LLM";
   const displayEngine = str(llmTel?.engine) || str(bg?.engine) || "OpenAI-Compatible";
+  const prefix = (str(bg?.session_prefix, "llm") || "llm").trim();
+  const inferredVmSlot =
+    resolvedVm?.name === `${prefix}-green`
+      ? "green"
+      : resolvedVm?.name === `${prefix}-blue`
+        ? "blue"
+        : null;
   const displaySlot =
-    str(
-      liveStreamMetrics?.slot ??
-        llmTel?.slot ??
-        (resolvedVm?.name.endsWith("-green")
-          ? "green"
-          : resolvedVm?.name.endsWith("-blue")
-            ? "blue"
-            : bg?.active_slot ?? null),
-    ).toLowerCase() || undefined;
+    str(liveStreamMetrics?.slot ?? llmTel?.slot ?? inferredVmSlot ?? null).toLowerCase() ||
+    undefined;
 
   const displayTps =
     numOrNull(liveStreamMetrics?.tps) ??
     (llmTel ? num(llmTel.instant_tps) || num(llmTel.last_request_tps) : num(bg?.warmup_tps));
   const displayAvgTps = num(llmTel?.avg_tps_60s);
   const displayTtft =
-    numOrNull(liveStreamMetrics?.ttft) ?? numOrNull(llmTel?.ttft_ms) ?? numOrNull(llmTel?.avg_ttft_ms);
+    numOrNull(liveStreamMetrics?.ttft) ??
+    numOrNull(llmTel?.ttft_ms) ??
+    numOrNull(llmTel?.avg_ttft_ms);
   const displayTotalTokens = num(llmTel?.total_completion_tokens);
 
-  // 自动滚动到底部
+  // 智能贴底滚动：仅当用户位于底部附近（80px 内）或窗口刚打开时自动跟随滚动，不打断向上翻阅长回复
   useEffect(() => {
-    if (chatBodyRef.current) {
-      chatBodyRef.current.scrollTop = chatBodyRef.current.scrollHeight;
+    const el = chatBodyRef.current;
+    if (el && stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
     }
   }, [turns, open]);
 
-  // 监听后端 Tauri 推送的流式 Token 事件
+  // 监听后端 Tauri 推送的流式 Token 事件（带卸载竞态保护与异常捕获）
   useEffect(() => {
+    let disposed = false;
     const unlistenPromise = listen<LlmChatStreamEvent>("llm-chat-event", (event) => {
+      if (disposed) return;
       const ev = event.payload;
       if (!ev || ev.request_id !== activeReqIdRef.current) return;
 
@@ -542,7 +566,6 @@ export function LlmChatModal(props: {
             t.id === ev.request_id
               ? {
                   ...t,
-                  // 后端回退到其他传输通道时会从头重新推送，先清空避免文本重复
                   content: "",
                   vmName: ev.vm_name,
                   slot: ev.slot,
@@ -601,22 +624,35 @@ export function LlmChatModal(props: {
         );
       } else if (ev.kind === "error") {
         setLiveStreamMetrics(null);
+        const wasCancelled =
+          cancelledReqIdRef.current === ev.request_id ||
+          (ev.error ?? "").includes("对话已手动停止");
         setTurns((prev) =>
           prev.map((t) =>
             t.id === ev.request_id
               ? {
                   ...t,
                   streaming: false,
-                  error: ev.error ?? "推理请求失败",
+                  cancelled: wasCancelled || t.cancelled,
+                  error: wasCancelled ? null : (ev.error ?? "推理请求失败"),
                 }
               : t,
           ),
         );
       }
-    });
+    })
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+          return null;
+        }
+        return unlisten;
+      })
+      .catch(() => null);
 
     return () => {
-      unlistenPromise.then((unlisten) => unlisten());
+      disposed = true;
+      unlistenPromise.then((fn) => fn?.());
     };
   }, []);
 
@@ -629,6 +665,8 @@ export function LlmChatModal(props: {
     const nowStr = new Date().toLocaleTimeString("zh-CN", { hour12: false });
     const reqId = `chat-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     activeReqIdRef.current = reqId;
+    cancelledReqIdRef.current = null;
+    stickToBottomRef.current = true;
 
     const userTurn: ConversationTurn = {
       id: `user-${reqId}`,
@@ -648,16 +686,12 @@ export function LlmChatModal(props: {
       streaming: true,
     };
 
-    const historyMessages: ChatMessage[] = [];
-    if (systemPrompt.trim()) {
-      historyMessages.push({ role: "system", content: systemPrompt.trim() });
-    }
-    // 仅携带最近 MAX_HISTORY_TURNS 轮有效对话，避免上下文无限膨胀
-    const validTurns = turns.filter((t) => !t.error && t.content.trim());
-    for (const t of validTurns.slice(-MAX_HISTORY_TURNS)) {
-      historyMessages.push({ role: t.role, content: t.content });
-    }
-    historyMessages.push({ role: "user", content: text });
+    const historyMessages = buildHistoryMessages(
+      turns,
+      systemPrompt,
+      text,
+      MAX_HISTORY_PAIRS,
+    );
 
     if (!customPrompt) {
       setInput("");
@@ -675,12 +709,13 @@ export function LlmChatModal(props: {
         temperature,
       });
 
+      const wasCancelled = cancelledReqIdRef.current === reqId;
       setTurns((prev) =>
         prev.map((t) =>
           t.id === reqId
             ? {
                 ...t,
-                content: t.content || resp.reply,
+                content: resp.reply || t.content,
                 vmName: resp.vm_name,
                 slot: resp.slot,
                 model: resp.model,
@@ -689,6 +724,7 @@ export function LlmChatModal(props: {
                 tokens: resp.completion_tokens,
                 elapsedMs: resp.elapsed_ms,
                 transport: resp.transport,
+                cancelled: wasCancelled || t.cancelled,
                 streaming: false,
               }
             : t,
@@ -696,19 +732,27 @@ export function LlmChatModal(props: {
       );
     } catch (e) {
       const msg = errText(e);
+      const wasCancelled =
+        cancelledReqIdRef.current === reqId || msg.includes("对话已手动停止");
       setTurns((prev) =>
         prev.map((t) =>
           t.id === reqId
             ? {
                 ...t,
                 streaming: false,
-                error: msg,
+                cancelled: wasCancelled || t.cancelled,
+                error: wasCancelled ? null : msg,
               }
             : t,
         ),
       );
-      toast(`大模型对话请求失败: ${msg}`, "error");
+      if (!wasCancelled) {
+        toast(`大模型对话请求失败: ${msg}`, "error");
+      }
     } finally {
+      if (activeReqIdRef.current === reqId) {
+        activeReqIdRef.current = null;
+      }
       setSending(false);
       setLiveStreamMetrics(null);
       setTimeout(() => inputRef.current?.focus(), 40);
@@ -716,17 +760,20 @@ export function LlmChatModal(props: {
   };
 
   const handleCopy = (id: string, text: string) => {
-    navigator.clipboard.writeText(text).then(() => {
-      setCopiedId(id);
-      setTimeout(() => setCopiedId((cur) => (cur === id ? null : cur)), 1500);
-    });
+    navigator.clipboard
+      ?.writeText(text)
+      .then(() => {
+        setCopiedId(id);
+        setTimeout(() => setCopiedId((cur) => (cur === id ? null : cur)), 1500);
+      })
+      .catch(() => {});
   };
 
   return (
     <div
       className="overlay"
       onClick={() => {
-        if (!sending) onClose();
+        if (!sending) handleCloseModal();
       }}
     >
       <div className="modal chat-modal" onClick={(e) => e.stopPropagation()}>
@@ -804,7 +851,7 @@ export function LlmChatModal(props: {
             >
               <Trash2 size={15} />
             </button>
-            <button className="icon-btn" onClick={onClose} title="关闭窗口 (Esc)">
+            <button className="icon-btn" onClick={handleCloseModal} title="关闭窗口 (Esc)">
               <X size={16} />
             </button>
           </div>
@@ -878,7 +925,14 @@ export function LlmChatModal(props: {
         )}
 
         {/* 对话消息流 */}
-        <div className="chat-body" ref={chatBodyRef}>
+        <div
+          className="chat-body"
+          ref={chatBodyRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+          }}
+        >
           {turns.length === 0 ? (
             <div className="chat-empty">
               <div className="chat-empty-icon">
@@ -926,6 +980,7 @@ export function LlmChatModal(props: {
                     {turn.role === "assistant" && str(turn.vmName) && (
                       <span className="chat-vm-tag">{str(turn.vmName)}</span>
                     )}
+                    {turn.cancelled && <span className="chat-vm-tag">已停止</span>}
                     <span className="chat-time">{turn.createdAt}</span>
                   </div>
 
@@ -944,7 +999,9 @@ export function LlmChatModal(props: {
                         <span>正在等待云端 GPU 生成首字响应…</span>
                       </div>
                     ) : (
-                      <span className="dim">（无输出内容）</span>
+                      <span className="dim">
+                        {turn.cancelled ? "（已手动停止生成）" : "（无输出内容）"}
+                      </span>
                     )}
                   </div>
 
@@ -1014,26 +1071,28 @@ export function LlmChatModal(props: {
                 handleSend();
               }
             }}
-            placeholder={`向 ${displayModel} 提问（Enter 发送，Shift + Enter 换行）…`}
+            placeholder={`向 ${displayModel} 提问（Enter 发送，Shift + Enter 换行，Esc 停止/关闭）…`}
             disabled={sending}
           />
-          <button
-            className="btn btn-primary chat-send-btn"
-            onClick={() => handleSend()}
-            disabled={sending || !input.trim()}
-          >
-            {sending ? (
-              <>
-                <Loader2 size={15} className="spin" />
-                生成中…
-              </>
-            ) : (
-              <>
-                <Send size={15} />
-                发送
-              </>
-            )}
-          </button>
+          {sending ? (
+            <button
+              className="btn btn-danger chat-send-btn"
+              onClick={handleStop}
+              title="立即中断本次流式生成 (Esc)"
+            >
+              <Square size={14} />
+              停止生成
+            </button>
+          ) : (
+            <button
+              className="btn btn-primary chat-send-btn"
+              onClick={() => handleSend()}
+              disabled={!input.trim()}
+            >
+              <Send size={15} />
+              发送
+            </button>
+          )}
         </div>
       </div>
     </div>

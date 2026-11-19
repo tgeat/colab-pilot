@@ -45,15 +45,26 @@ from colab_cli.contents import ContentsClient
 from colab_cli.runtime import ColabRuntime
 from colab_cli.state import SessionState
 
-WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(WORKSPACE_DIR, "static")
+LEGACY_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKSPACE_DIR = os.path.dirname(LEGACY_DIR)
+STATIC_DIR = os.path.join(LEGACY_DIR, "static")
 TRAIN_SCRIPT_PATH = os.path.join(WORKSPACE_DIR, "train.py")
 REQUIREMENTS_PATH = os.path.join(WORKSPACE_DIR, "requirements.txt")
 SCHEME_DOC_PATH = os.path.join(WORKSPACE_DIR, "RELAY_TRAINING_SCHEME.md")
 
-# 默认可执行文件路径
-RCLONE_BIN = shutil.which("rclone") or r"C:\Users\86177\.local\bin\rclone.exe"
-COLAB_BIN = shutil.which("colab") or r"C:\Users\86177\.local\bin\colab.exe"
+
+def _find_local_bin(name: str) -> str:
+    cand = shutil.which(name)
+    if cand:
+        return cand
+    ext = ".exe" if os.name == "nt" else ""
+    fallback = os.path.expanduser(f"~/.local/bin/{name}{ext}")
+    return fallback if os.path.exists(fallback) else f"{name}{ext}"
+
+
+# 默认可执行文件路径（跨用户可移植解析）
+RCLONE_BIN = _find_local_bin("rclone")
+COLAB_BIN = _find_local_bin("colab")
 
 EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="ColabPilotWorker")
 STATE_LOCK = threading.RLock()
@@ -545,9 +556,14 @@ def hard_terminate_vm(name: str, endpoint: Optional[str] = None, stop_relay: boo
             # 二次核验云端实际计费列表
             assignments = state.client.list_assignments()
             remaining_endpoints = [a.endpoint for a in assignments]
-            if not target_endpoint or target_endpoint not in remaining_endpoints:
+            if target_endpoint:
+                if target_endpoint not in remaining_endpoints:
+                    verified_gone = True
+                    steps_log.append("服务端二次核验通过：该实例已从 Google Colab 计费列表中彻底移除")
+                    break
+            elif len(remaining_endpoints) == 0:
                 verified_gone = True
-                steps_log.append("服务端二次核验通过：该实例已从 Google Colab 计费列表中彻底移除")
+                steps_log.append("服务端二次核验通过：云端计费实例列表为空")
                 break
         except Exception as e:
             last_error = str(e)
@@ -1189,6 +1205,27 @@ class BaseAPIHandler(tornado.web.RequestHandler):
         self.set_header("Content-Type", "application/json; charset=utf-8")
         self.set_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 
+    def prepare(self):
+        if self.request.method in ("POST", "PUT", "DELETE", "PATCH"):
+            origin = (self.request.headers.get("Origin") or "").strip()
+            if origin:
+                from urllib.parse import urlparse
+
+                parsed = urlparse(origin)
+                if parsed.scheme not in ("http", "https") or (parsed.hostname or "").lower() not in (
+                    "127.0.0.1",
+                    "localhost",
+                ):
+                    self.write_json({"ok": False, "error": "Forbidden cross-origin request"}, status=403)
+                    self.finish()
+                    return
+            if self.request.method == "POST":
+                ctype = (self.request.headers.get("Content-Type") or "").lower()
+                if not ctype.startswith("application/json"):
+                    self.write_json({"ok": False, "error": "Content-Type must be application/json"}, status=415)
+                    self.finish()
+                    return
+
     def write_json(self, data: Any, status: int = 200):
         self.set_status(status)
         self.write(json.dumps(data, ensure_ascii=False, default=str))
@@ -1261,7 +1298,8 @@ class VMsHandler(BaseAPIHandler):
                 status=400,
             )
         except Exception as e:
-            self.write_json({"ok": False, "error": str(e), "trace": traceback.format_exc()}, status=500)
+            logging.exception("VMsHandler.post error")
+            self.write_json({"ok": False, "error": str(e)}, status=500)
 
 
 class VMDetailHandler(BaseAPIHandler):

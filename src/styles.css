@@ -1063,15 +1063,617 @@ tr.row-active td {
     height: calc(100vh - 20px);
   }
   .chat-modal-head {
-    padding: 10px 14px;
+    padding: 8px 14px;
   }
   .chat-telemetry-strip {
+    padding: 4px 14px;
+    grid-template-columns: repeat(4, 1fr);
+  }
+  .chat-settings-bar {
     padding: 6px 14px;
+    max-height: 92px;
+    overflow-y: auto;
   }
   .chat-body {
-    padding: 12px 14px;
+    padding: 10px 14px;
   }
   .chat-input-bar {
-    padding: 10px 14px;
+    padding: 8px 14px;
+  }
+}
+
+/* ───────── 每台虚拟机免密 SSH 连接栏 ───────── */
+.ssh-access-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding: 7px 14px;
+  background: linear-gradient(90deg, #f6f8fc 0%, #f1f5fb 100%);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.ssh-bar-left {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.ssh-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #1e293b;
+  background: #e2e8f0;
+  padding: 2px 7px;
+  border-radius: 5px;
+  letter-spacing: 0.2px;
+}
+.ssh-cmd-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 2px 3px 2px 8px;
+  font-size: 11.5px;
+  color: var(--text);
+}
+.ssh-cmd-pill code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text);
+  background: transparent;
+  padding: 0;
+}
+.ssh-key-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--success);
+  background: var(--success-50);
+  border: 1px solid #bfe8d4;
+  padding: 2px 7px;
+  border-radius: 99px;
+}
+.ssh-open-btn {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  background: #1e293b;
+  color: #ffffff;
+  border-color: #1e293b;
+}
+.ssh-open-btn:hover:not(:disabled) {
+  background: #0f172a;
+  border-color: #0f172a;
+  color: #ffffff;
+}
+
+.copy-chip-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.copy-chip-btn.compact {
+  height: 20px;
+  padding: 0 5px;
+  font-size: 10.5px;
+}
+.copy-chip-btn:hover:not(:disabled) {
+  background: var(--primary-50);
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.copy-chip-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.copy-chip-btn.copied {
+  background: var(--success-50);
+  border-color: #9de0bd;
+  color: var(--success);
+}
+
+/* ───────── 大模型虚拟机 OpenAI API & Key 面板 ───────── */
+.llm-api-box {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid #d5e3ff;
+  border-radius: 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 1px 2px rgba(26, 115, 232, 0.04);
+}
+.llm-api-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.llm-api-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--primary-600);
+  flex-wrap: wrap;
+}
+.llm-api-port-tag {
+  font-size: 10.5px;
+  background: var(--primary-50);
+  color: var(--primary);
+  border: 1px solid #c9ddff;
+  padding: 0 6px;
+  border-radius: 4px;
+}
+.llm-api-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.llm-api-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+}
+.llm-api-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  min-width: 0;
+}
+.llm-api-k {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.llm-api-v {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text);
+  background: transparent;
+  padding: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.llm-api-v.key-val {
+  color: #b45309;
+  font-weight: 600;
+}
+.llm-snippet-drawer {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #f8fafc;
+}
+.llm-snippet-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 4px 8px;
+  background: #eef2f7;
+  border-bottom: 1px solid var(--border);
+}
+.llm-snippet-tabs button {
+  border: none;
+  background: transparent;
+  padding: 3px 9px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.llm-snippet-tabs button.active {
+  background: var(--surface);
+  color: var(--primary);
+  box-shadow: var(--shadow-sm);
+}
+.llm-snippet-pre {
+  margin: 0;
+  padding: 9px 12px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #1e293b;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+/* ───────── 开机 / 新建实例全量配置弹窗样式 ───────── */
+.boot-mode-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+.boot-mode-tab {
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+.boot-mode-tab:hover {
+  border-color: var(--primary);
+  background: var(--surface-2);
+}
+.boot-mode-tab.sel {
+  border-color: var(--primary);
+  background: var(--primary-50);
+  box-shadow: 0 0 0 2px rgba(26, 115, 232, 0.14);
+}
+.boot-mode-tab-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+.boot-mode-tab.sel .boot-mode-tab-head {
+  color: var(--primary-600);
+}
+.boot-mode-tab-desc {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 3px;
+  line-height: 1.38;
+}
+
+.hw-grid-4 {
+  grid-template-columns: repeat(4, 1fr);
+}
+.hw-tag {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--primary-600);
+  background: var(--surface-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.form-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.form-grid-3 {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr 1fr;
+  gap: 10px;
+}
+.form-grid-4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+.field textarea {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  padding: 7px 9px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  resize: vertical;
+  outline: none;
+}
+.field textarea:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-50);
+}
+
+.single-shape-note {
+  height: 36px;
+  border-radius: 10px;
+  border: 1px dashed var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 10px;
+}
+
+.modal-inline-error {
+  margin-bottom: 4px;
+  align-items: flex-start;
+}
+.modal-inline-error-body {
+  flex: 1;
+  min-width: 0;
+}
+.modal-inline-error-title {
+  font-weight: 700;
+  font-size: 12.5px;
+  margin-bottom: 4px;
+}
+.modal-inline-error-text {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 140px;
+  overflow-y: auto;
+  user-select: text;
+}
+
+.cfg-panel {
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.cfg-panel-llm {
+  background: #f5f9ff;
+  border-color: #c8ddff;
+}
+.cfg-panel-relay {
+  background: #f6fbf8;
+  border-color: #c3e6d3;
+}
+.cfg-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.cfg-panel-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+.cfg-panel-badge {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--primary-600);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 1px 7px;
+  border-radius: 99px;
+}
+
+.preset-pills {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.preset-pill {
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text-2);
+  border-radius: 99px;
+  padding: 1px 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.preset-pill:hover,
+.preset-pill.active {
+  border-color: var(--primary);
+  background: var(--primary-50);
+  color: var(--primary-600);
+}
+
+.adv-config-box {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.adv-config-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 13px;
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+}
+.adv-config-toggle:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+.adv-config-body {
+  padding: 12px 13px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.adv-checks-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+.adv-check-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+.adv-check-item input {
+  margin-top: 3px;
+}
+.adv-check-item .t {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.adv-check-item .d {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+/* ───────── 实例卡片探针/部署告警框与任务控制折叠抽屉 ───────── */
+.vm-alert-box {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: 9px;
+  border: 1px solid;
+  font-size: 12px;
+}
+.vm-alert-warn {
+  background: var(--warning-50);
+  border-color: #fbdca8;
+  color: #8a5400;
+}
+.vm-alert-danger {
+  background: var(--danger-50);
+  border-color: #f6c4c6;
+  color: #a52a2e;
+}
+.vm-alert-content {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+  user-select: text;
+}
+.vm-alert-title {
+  font-weight: 700;
+  margin-bottom: 2px;
+}
+.vm-alert-desc {
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+.vm-alert-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.vm-tools-drawer {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.vm-tools-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+}
+.vm-tools-toggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  padding: 2px 0;
+}
+.vm-tools-toggle:hover {
+  color: var(--primary);
+}
+.vm-tools-body {
+  padding: 12px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.relay-logs-details {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #f8fafc;
+}
+.relay-logs-details > summary {
+  padding: 6px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-2);
+  cursor: pointer;
+  background: var(--surface-2);
+}
+
+@media (max-width: 960px) {
+  .llm-api-grid,
+  .boot-mode-tabs,
+  .form-grid-2,
+  .form-grid-3,
+  .adv-checks-grid {
+    grid-template-columns: 1fr;
+  }
+  .hw-grid-4,
+  .form-grid-4 {
+    grid-template-columns: repeat(2, 1fr);
   }
 }

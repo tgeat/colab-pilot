@@ -4,16 +4,16 @@
 Colab Pilot — 深度学习上云前本机 4 阶段冒烟验证工具 (smoke_test_dl.py)
 ==========================================================================
 在将训练脚本放入 Google Colab 之前，强制在本机执行 4 道验证关卡：
-1. [语法与依赖编译] 检查训练脚本与 colab_relay_adapter.py 无语法错误
+1. [语法与依赖编译] 内存级 AST 与字节码编译检查（不污染工作区 __pycache__）
 2. [Pass #1 冒烟保存] 跑 1 个 Epoch/Step 后触发模拟换棒，验证前向/反向传播、checkpoint.pt 落盘及遥测状态写入
 3. [Pass #2 断点续训] 基于 Pass #1 生成的 checkpoint.pt 续训第 2 个 Epoch，验证 epoch 从 2 递增且 Loss 连续
-4. [Google Drive 连通性] 验证本机 rclone 与 rclone.conf 就绪，确保上云后能正常拉取数据集与上传结果
+4. [Google Drive 连通性] 验证本机 rclone 与 rclone.conf 读写连通性，失败严格返回非零退出码
 """
 
 import argparse
+import ast
 import json
 import os
-import py_compile
 import shutil
 import subprocess
 import sys
@@ -24,6 +24,13 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def check_python_syntax(filepath: str) -> None:
+    with open(filepath, "rb") as f:
+        source = f.read()
+    tree = ast.parse(source, filename=filepath)
+    compile(tree, filename=filepath, mode="exec")
 
 
 def find_rclone() -> str:
@@ -67,20 +74,19 @@ def main() -> int:
         print(f"❌ [失败] 找不到训练脚本: {script_abs}")
         return 1
 
-    # ── 第 1 关：语法与模块编译校验 ──
+    # ── 第 1 关：语法与模块编译校验（纯内存编译，不产生 __pycache__） ──
     print("\n[1/4] 正在校验 Python 语法与接力适配器...")
     try:
-        py_compile.compile(script_abs, doraise=True)
+        check_python_syntax(script_abs)
         if os.path.exists(adapter_abs):
-            py_compile.compile(adapter_abs, doraise=True)
+            check_python_syntax(adapter_abs)
         print("  ✅ 第 1 关通过：训练脚本与接力适配器语法无误。")
     except Exception as e:
         print(f"  ❌ 第 1 关失败：语法错误 -> {e}")
         return 1
 
-    # 在隔离临时目录中执行 Pass #1 与 Pass #2，不污染工作区正式文件
+    # 在隔离临时目录中执行 Pass #1 与 Pass #2，通过环境变量驱动（绝不向用户脚本注入未知 CLI 参数）
     with tempfile.TemporaryDirectory(prefix="colab_smoke_") as tmpdir:
-        # 拷贝适配器到沙箱目录方便导入
         if os.path.exists(adapter_abs):
             shutil.copy2(adapter_abs, os.path.join(tmpdir, "colab_relay_adapter.py"))
 
@@ -91,6 +97,7 @@ def main() -> int:
 
         base_env = os.environ.copy()
         base_env.update({
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUTF8": "1",
             "PYTHONIOENCODING": "utf-8",
             "PYTHONPATH": workspace_dir + os.pathsep + tmpdir + os.pathsep + base_env.get("PYTHONPATH", ""),
@@ -108,9 +115,10 @@ def main() -> int:
         print("\n[2/4] 正在执行 Smoke Pass #1（验证前向/反向传播 + Epoch 1 断点保存）...")
         env1 = base_env.copy()
         env1["SMOKE_PASS"] = "1"
+        env1["RELAY_ROUND"] = "1"
         t0 = time.time()
         res1 = subprocess.run(
-            [args.python, script_abs, "--smoke-test", "--smoke-pass", "1"],
+            [args.python, "-B", script_abs],
             cwd=tmpdir,
             env=env1,
             capture_output=True,
@@ -147,9 +155,10 @@ def main() -> int:
         print("\n[3/4] 正在执行 Smoke Pass #2（验证从 checkpoint.pt 断点续训 Epoch 2）...")
         env2 = base_env.copy()
         env2["SMOKE_PASS"] = "2"
+        env2["RELAY_ROUND"] = "2"
         t1 = time.time()
         res2 = subprocess.run(
-            [args.python, script_abs, "--smoke-test", "--smoke-pass", "2"],
+            [args.python, "-B", script_abs],
             cwd=tmpdir,
             env=env2,
             capture_output=True,
@@ -191,15 +200,17 @@ def main() -> int:
     if not args.skip_rclone_net:
         remote_root = args.gdrive_dir.split(":")[0] + ":"
         rc_test = subprocess.run(
-            [rclone_bin, "--config", rclone_conf, "--retries=5", "--low-level-retries=20", "about", remote_root],
+            [rclone_bin, "--config", rclone_conf, "--retries=5", "--low-level-retries=20", "about", "--", remote_root],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=90,
         )
         if rc_test.returncode != 0:
-            print(f"  ⚠️ 警告：rclone 在线探测返回非零 ({rc_test.stderr.strip()[:200]})")
-        else:
-            print(f"  ✅ 第 4 关通过：rclone 与 Google Drive ({args.gdrive_dir}) 读写就绪。")
+            print(f"  ❌ 第 4 关失败：rclone 在线连通性探测返回非零 ({(rc_test.stderr or '').strip()[:240]})")
+            return 1
+        print(f"  ✅ 第 4 关通过：rclone 与 Google Drive ({args.gdrive_dir}) 读写就绪。")
     else:
         print(f"  ✅ 第 4 关通过：rclone 配置文件 ({rclone_conf}) 已就绪。")
 

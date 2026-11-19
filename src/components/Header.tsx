@@ -1,7 +1,7 @@
-import { MessageSquare, RefreshCw } from "lucide-react";
+import { MessageSquare, Power, RefreshCw } from "lucide-react";
 import type { Overview } from "../types";
 import { fmtBytes, num, str } from "../format";
-import { isLlmVm } from "./LlmChatModal";
+import { hasAnyReadyLlmVm, isLlmVm } from "../chatUtils";
 import { ColabIcon } from "./ui";
 
 export function Header(props: {
@@ -9,13 +9,15 @@ export function Header(props: {
   refreshing: boolean;
   onRefresh: () => void;
   onOpenLlmChat: (target: string) => void;
+  onOpenCreateVm: () => void;
 }) {
   const { ov } = props;
   const ccu = ov?.ccu;
   const rate = num(ccu?.burn_rate_hourly);
   const gd = ov?.gdrive;
-  const hasLlm =
-    !!ov?.llm_bluegreen || (ov?.vms ?? []).some((v) => isLlmVm(v));
+  const vms = ov?.vms ?? [];
+  const anyReadyLlm = hasAnyReadyLlmVm(vms);
+  const hasLlm = !!ov?.llm_bluegreen || vms.some((v) => isLlmVm(v));
   const activeSlot = str(ov?.llm_bluegreen?.active_slot).toUpperCase() || undefined;
 
   // 网盘状态仅在有意义时显示：未授权 / 有断点 / 训练完成
@@ -54,15 +56,29 @@ export function Header(props: {
         </div>
 
         <div className="top-actions">
+          <button
+            className="add-btn"
+            onClick={props.onOpenCreateVm}
+            title="选择 GPU/TPU/CPU 加速器与全量 Colab 配置并开机启动新虚拟机（自动配置免密 SSH 与大模型 API）"
+          >
+            <Power size={13} />
+            <span>开机 / 新建实例</span>
+          </button>
+
           {hasLlm && (
             <button
               className="btn btn-primary btn-sm chat-trigger-btn"
               onClick={() => props.onOpenLlmChat("auto")}
-              title="打开云端大模型交互对话窗口"
+              disabled={!anyReadyLlm}
+              title={
+                anyReadyLlm
+                  ? "打开云端大模型交互对话窗口"
+                  : "当前没有在线且健康就绪的大模型实例（若正在部署请等待预热完成）"
+              }
             >
               <MessageSquare size={14} />
               <span>大模型对话</span>
-              {activeSlot && <span className="chat-trigger-slot">{activeSlot}</span>}
+              {anyReadyLlm && activeSlot && <span className="chat-trigger-slot">{activeSlot}</span>}
             </button>
           )}
 

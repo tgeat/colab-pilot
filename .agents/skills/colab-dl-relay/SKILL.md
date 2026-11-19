@@ -100,7 +100,7 @@ Use `colab_relay_adapter.py --wrap "<train_cmd>"` to wrap any unmodified reposit
 If you want to verify local tensor shapes and checkpoint save/load keys before uploading, run:
 
 ```powershell
-python -u "C:\Users\86177\.gemini\config\skills\colab-dl-relay\scripts\smoke_test_dl.py" `
+python -u ".agents/skills/colab-dl-relay/scripts/smoke_test_dl.py" `
   --script train.py `
   --gdrive-dir gdrive:colab_relay
 ```
@@ -112,7 +112,7 @@ python -u "C:\Users\86177\.gemini\config\skills\colab-dl-relay\scripts\smoke_tes
 Launch [`dl_relay_runner.py`](./scripts/dl_relay_runner.py) to execute the training on Google Colab via `colab-cli`:
 
 ```powershell
-python -u "C:\Users\86177\.gemini\config\skills\colab-dl-relay\scripts\dl_relay_runner.py" `
+python -u ".agents/skills/colab-dl-relay/scripts/dl_relay_runner.py" `
   --session <workspace-session-name> `
   --workspace . `
   --script train.py `

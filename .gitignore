@@ -3,6 +3,14 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 *.pt
+*.exe
+rclone.conf
+.colab_*
+.pilot_instance_token
+training_done.flag
+results/
+*.log
+*.pid
 legacy/__pycache__/
 __pycache__/
 *.pyc

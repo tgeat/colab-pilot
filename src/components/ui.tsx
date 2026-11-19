@@ -1,4 +1,4 @@
-import { createContext, ReactNode, useCallback, useContext, useState } from "react";
+import { createContext, ReactNode, useCallback, useContext, useEffect, useState } from "react";
 import { X } from "lucide-react";
 import { pct } from "../format";
 
@@ -72,8 +72,20 @@ export function Modal(props: {
   children: ReactNode;
   closable?: boolean;
 }) {
-  if (!props.open) return null;
   const closable = props.closable !== false;
+  useEffect(() => {
+    if (!props.open || !closable) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        props.onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [props.open, closable, props.onClose]);
+
+  if (!props.open) return null;
   return (
     <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && closable && props.onClose()}>
       <div className={`modal ${props.wide ? "wide" : ""}`}>

@@ -110,13 +110,25 @@ class LlmTelemetryTracker:
         parsed = urlparse(self.backend_url)
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        conn: Optional[http.client.HTTPConnection] = None
         try:
-            with socket.create_connection((host, port), timeout=1.5):
-                self.backend_healthy = True
-                return True
+            conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+            conn = conn_cls(host, port, timeout=2.0)
+            conn.request("GET", "/health")
+            resp = conn.getresponse()
+            _ = resp.read()
+            healthy = resp.status < 500
+            self.backend_healthy = healthy
+            return healthy
         except Exception:
             self.backend_healthy = False
             return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def on_request_start(self, prompt_tokens_est: int = 0) -> int:
         with self.lock:
@@ -436,9 +448,12 @@ def make_handler(tracker: LlmTelemetryTracker):
         def _proxy_request(self, method: str) -> None:
             parsed = urlparse(tracker.backend_url)
             host = parsed.hostname or "127.0.0.1"
-            port = parsed.port or 8001
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
 
-            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                length = max(0, int(self.headers.get("Content-Length", "0") or "0"))
+            except ValueError:
+                length = 0
             body = self.rfile.read(length) if length > 0 else None
 
             is_completion = "/completions" in self.path or "/api/generate" in self.path or "/api/chat" in self.path
@@ -446,8 +461,11 @@ def make_handler(tracker: LlmTelemetryTracker):
             if is_completion:
                 tracker.on_request_start(prompt_tokens_est=max(4, length // 6))
 
+            conn: Optional[http.client.HTTPConnection] = None
+            headers_sent = False
             try:
-                conn = http.client.HTTPConnection(host, port, timeout=600)
+                conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+                conn = conn_cls(host, port, timeout=600)
                 fwd_headers = {
                     k: v
                     for k, v in self.headers.items()
@@ -464,6 +482,7 @@ def make_handler(tracker: LlmTelemetryTracker):
                     if k.lower() not in ("transfer-encoding", "connection", "content-length"):
                         self.send_header(k, v)
                 self.send_header("Connection", "close")
+                headers_sent = True
                 self.end_headers()
                 self.close_connection = True
 
@@ -482,55 +501,77 @@ def make_handler(tracker: LlmTelemetryTracker):
                         if line_str.startswith("data:") and is_completion:
                             data_part = line_str[5:].strip()
                             if data_part and data_part != "[DONE]":
-                                now = time.time()
-                                if first_token_ts is None:
-                                    first_token_ts = now
-                                    tracker.on_first_token((now - req_start) * 1000.0)
-                                tok_inc = 1
+                                tok_inc = 0
                                 try:
                                     j = json.loads(data_part)
-                                    choices = j.get("choices") or []
-                                    if choices:
-                                        delta = choices[0].get("delta") or {}
-                                        txt = (
-                                            delta.get("content")
-                                            or delta.get("reasoning_content")
-                                            or choices[0].get("text")
-                                            or ""
-                                        )
-                                        if txt:
-                                            tok_inc = _estimate_tokens_from_text(txt)
+                                    if isinstance(j, dict):
+                                        if j.get("error"):
+                                            tok_inc = 0
+                                        else:
+                                            choices = j.get("choices") or []
+                                            if choices:
+                                                delta = choices[0].get("delta") or {}
+                                                txt = (
+                                                    delta.get("content")
+                                                    or delta.get("reasoning_content")
+                                                    or choices[0].get("text")
+                                                    or ""
+                                                )
+                                                if txt:
+                                                    tok_inc = _estimate_tokens_from_text(txt)
                                 except Exception:
-                                    pass
-                                stream_tokens += tok_inc
-                                tracker.on_tokens_emitted(tok_inc, max(0.02, now - first_token_ts), stream_tokens)
+                                    tok_inc = 1
+                                if tok_inc > 0:
+                                    now = time.time()
+                                    if first_token_ts is None:
+                                        first_token_ts = now
+                                        tracker.on_first_token((now - req_start) * 1000.0)
+                                    stream_tokens += tok_inc
+                                    tracker.on_tokens_emitted(tok_inc, max(0.02, now - first_token_ts), stream_tokens)
                 else:
                     raw_resp = resp.read()
-                    if is_completion and raw_resp:
-                        now = time.time()
-                        tracker.on_first_token((now - req_start) * 1000.0)
-                        tok_cnt = 16
+                    if is_completion and raw_resp and 200 <= resp.status < 400:
+                        tok_cnt = 0
                         try:
                             j = json.loads(raw_resp.decode("utf-8", errors="ignore"))
-                            usage = j.get("usage") or {}
-                            if "completion_tokens" in usage:
-                                tok_cnt = int(usage["completion_tokens"])
+                            if isinstance(j, dict) and not j.get("error"):
+                                usage = j.get("usage") or {}
+                                if "completion_tokens" in usage:
+                                    tok_cnt = max(0, int(usage["completion_tokens"]))
+                                else:
+                                    choices = j.get("choices") or []
+                                    if choices:
+                                        msg = choices[0].get("message") or {}
+                                        txt = msg.get("content") or choices[0].get("text") or ""
+                                        if txt:
+                                            tok_cnt = _estimate_tokens_from_text(txt)
                         except Exception:
-                            pass
-                        tracker.on_tokens_emitted(tok_cnt, max(0.05, now - req_start), tok_cnt)
+                            tok_cnt = 16
+                        if tok_cnt > 0:
+                            now = time.time()
+                            tracker.on_first_token((now - req_start) * 1000.0)
+                            tracker.on_tokens_emitted(tok_cnt, max(0.05, now - req_start), tok_cnt)
                     self.wfile.write(raw_resp)
                     self.wfile.flush()
 
-                conn.close()
                 if is_completion:
                     tracker.on_request_end(ok=(200 <= resp.status < 400))
             except Exception as e:
                 if is_completion:
                     tracker.on_request_end(ok=False)
-                try:
-                    self._send_json(502, {"error": f"Backend engine unreachable: {e}"})
-                except Exception:
-                    pass
+                if not headers_sent:
+                    try:
+                        self._send_json(502, {"error": f"Backend engine unreachable: {e}"})
+                    except Exception:
+                        pass
+                else:
+                    self.close_connection = True
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
     return SidecarHandler
 

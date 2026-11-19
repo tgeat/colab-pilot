@@ -9,7 +9,7 @@ mod colab;
 mod relay;
 
 use anyhow::Context;
-use cli::{s, CliEventView, RecentSessionView, WorkspaceInfo};
+use cli::{s, CliEventView, LlmApiAccessInfo, RecentSessionView, VmSshInfo, WorkspaceInfo};
 use colab::{Assignment, Ccu, ColabClient};
 use futures::future::join_all;
 use relay::{RelayConfig, RelayHandle, RelayStatus};
@@ -34,6 +34,16 @@ impl<T> LockExt<T> for Mutex<T> {
 
 const TELEMETRY_DAEMON_PY: &str = include_str!("../remote/telemetry_daemon.py");
 const DEFAULT_TRAIN_PY: &str = include_str!("../../train.py");
+const LLM_LOCAL_GATEWAY_PY: &str =
+    include_str!("../../.agents/skills/colab-llm-bluegreen/scripts/llm_local_gateway.py");
+const LLM_BLUEGREEN_MANAGER_PY: &str =
+    include_str!("../../.agents/skills/colab-llm-bluegreen/scripts/llm_bluegreen_manager.py");
+const LLM_METRICS_SIDECAR_PY: &str =
+    include_str!("../../.agents/skills/colab-llm-bluegreen/scripts/llm_metrics_sidecar.py");
+const DL_RELAY_RUNNER_PY: &str =
+    include_str!("../../.agents/skills/colab-dl-relay/scripts/dl_relay_runner.py");
+const COLAB_RELAY_ADAPTER_PY: &str =
+    include_str!("../../.agents/skills/colab-dl-relay/scripts/colab_relay_adapter.py");
 const DEFAULT_GDRIVE_DIR: &str = "gdrive:colab_relay";
 
 // ───────────────────────────── 数据结构 ─────────────────────────────
@@ -93,6 +103,10 @@ pub struct VmView {
     pub telemetry_error: Option<String>,
     pub relay: Option<RelayStatus>,
     pub busy: Option<String>,
+    pub ssh: Option<VmSshInfo>,
+    pub llm_api: Option<LlmApiAccessInfo>,
+    #[serde(default)]
+    pub deploy_error: Option<String>,
 }
 
 #[derive(Serialize, Clone, Default, Debug)]
@@ -173,6 +187,40 @@ struct TelemetryEntry {
     error: Option<String>,
 }
 
+#[derive(Default)]
+struct GdriveCache {
+    status: Option<GdriveStatus>,
+    updated_at: Option<Instant>,
+    in_flight: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CreatingVmMeta {
+    accelerator: String,
+    high_mem: bool,
+    workspace_name: String,
+    workspace_path: Option<String>,
+    description: Option<String>,
+}
+
+struct SshBridgeTarget {
+    endpoint: String,
+    proxy_url: String,
+    proxy_token: String,
+}
+
+struct LocalSshBridge {
+    local_port: u16,
+    target: Mutex<SshBridgeTarget>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl LocalSshBridge {
+    fn shutdown(&self) {
+        self.cancel.cancel();
+    }
+}
+
 pub struct AppState {
     pub client: ColabClient,
     pub workspace: PathBuf,
@@ -181,22 +229,46 @@ pub struct AppState {
     last_assignments: Mutex<Option<(Vec<Assignment>, Instant)>>,
     last_ccu: Mutex<Option<Ccu>>,
     relays: Mutex<HashMap<String, Arc<RelayHandle>>>,
+    creating_vms: Mutex<HashMap<String, CreatingVmMeta>>,
+    ssh_bridges: Mutex<HashMap<String, Arc<LocalSshBridge>>>,
+    deploy_errors: Mutex<HashMap<String, String>>,
+    active_chats: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
     busy: Mutex<HashMap<String, String>>,
     probe_cooldown: Mutex<HashMap<String, Instant>>,
-    gdrive: tokio::sync::Mutex<(Option<GdriveStatus>, Option<Instant>)>,
+    gdrive: tokio::sync::Mutex<GdriveCache>,
     refresh_lock: tokio::sync::Mutex<()>,
 }
 
-fn orphan_name(endpoint: &str) -> String {
+pub(crate) fn legacy_orphan_name(endpoint: &str) -> String {
     let tail: String = endpoint
         .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
         .rev()
         .take(6)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .collect();
-    format!("orphan-{}", tail.to_lowercase())
+    let tail = if tail.is_empty() {
+        "vm".to_string()
+    } else {
+        tail.to_lowercase()
+    };
+    format!("orphan-{tail}")
+}
+
+pub(crate) fn orphan_name(endpoint: &str) -> String {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in endpoint.as_bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let base = legacy_orphan_name(endpoint);
+    format!("{base}-{:04x}", hash & 0xffff)
+}
+
+pub(crate) fn matches_orphan_name(endpoint: &str, candidate: &str) -> bool {
+    orphan_name(endpoint) == candidate || legacy_orphan_name(endpoint) == candidate
 }
 
 fn session_endpoint(v: &Value) -> Option<String> {
@@ -204,8 +276,46 @@ fn session_endpoint(v: &Value) -> Option<String> {
 }
 
 impl AppState {
+    pub fn new_with(client: ColabClient, workspace: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            client,
+            workspace,
+            overview: tokio::sync::RwLock::new(Overview::default()),
+            telemetry: Mutex::new(HashMap::new()),
+            last_assignments: Mutex::new(None),
+            last_ccu: Mutex::new(None),
+            relays: Mutex::new(HashMap::new()),
+            creating_vms: Mutex::new(HashMap::new()),
+            ssh_bridges: Mutex::new(HashMap::new()),
+            deploy_errors: Mutex::new(HashMap::new()),
+            active_chats: Mutex::new(HashMap::new()),
+            busy: Mutex::new(HashMap::new()),
+            probe_cooldown: Mutex::new(HashMap::new()),
+            gdrive: tokio::sync::Mutex::new(GdriveCache::default()),
+            refresh_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
     fn relay(&self, name: &str) -> Option<Arc<RelayHandle>> {
         self.relays.l().get(name).cloned()
+    }
+
+    pub(crate) fn is_deleting(&self, name: &str) -> bool {
+        self.busy
+            .l()
+            .get(name)
+            .map(|v| v == "deleting")
+            .unwrap_or(false)
+    }
+
+    fn active_relay_gdrive_dir(&self) -> String {
+        self.relays
+            .l()
+            .values()
+            .find(|h| h.is_running())
+            .map(|h| h.status.l().config.gdrive_dir.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_GDRIVE_DIR.to_string())
     }
 
     fn set_busy(&self, name: &str, what: Option<&str>) {
@@ -216,6 +326,18 @@ impl AppState {
             }
             None => {
                 b.remove(name);
+            }
+        }
+    }
+
+    fn set_deploy_error(&self, name: &str, err: Option<String>) {
+        let mut map = self.deploy_errors.l();
+        match err.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            Some(msg) => {
+                map.insert(name.to_string(), msg);
+            }
+            None => {
+                map.remove(name);
             }
         }
     }
@@ -238,15 +360,18 @@ impl AppState {
         }
     }
 
-    /// 根据会话名（或 orphan-xxxxxx）在服务端计费列表中查找实例
+    /// 根据会话名（或新旧格式 orphan-*）在服务端计费列表中查找实例
     pub async fn find_assignment_by_name(&self, name: &str) -> Option<Assignment> {
         let sessions = cli::read_sessions();
         let ep = sessions.get(name).and_then(session_endpoint);
         let list = self.client.list_assignments().await.ok()?;
-        match ep {
-            Some(ep) => list.into_iter().find(|a| a.endpoint == ep),
-            None => list.into_iter().find(|a| orphan_name(&a.endpoint) == name),
+        if let Some(ref target_ep) = ep {
+            if let Some(found) = list.iter().find(|a| &a.endpoint == target_ep) {
+                return Some(found.clone());
+            }
         }
+        list.into_iter()
+            .find(|a| matches_orphan_name(&a.endpoint, name))
     }
 
     fn env_status(&self) -> EnvStatus {
@@ -278,7 +403,7 @@ async fn fetch_gdrive_status(dir: &str) -> GdriveStatus {
     let out = cli::run_simple(
         &cli::rclone_bin(),
         &[
-            s(&["lsjson", "--retries=5", "--low-level-retries=20"]),
+            s(&["lsjson", "--retries=5", "--low-level-retries=20", "--"]),
             vec![dir.to_string()],
         ]
         .concat(),
@@ -287,25 +412,35 @@ async fn fetch_gdrive_status(dir: &str) -> GdriveStatus {
     .await;
     match out {
         Ok(o) if o.code == 0 => {
-            let json_start = o.output.find('[').unwrap_or(0);
-            let arr: Vec<Value> = serde_json::from_str(&o.output[json_start..]).unwrap_or_default();
-            st.ok = true;
-            for it in arr {
-                let f = GdriveFile {
-                    name: it["Name"].as_str().unwrap_or("").into(),
-                    size: it["Size"].as_i64().unwrap_or(0),
-                    mod_time: it["ModTime"].as_str().unwrap_or("").into(),
-                    is_dir: it["IsDir"].as_bool().unwrap_or(false),
-                };
-                if f.name == "checkpoint.pt" {
-                    st.has_checkpoint = true;
-                    st.checkpoint_size = f.size;
-                    st.checkpoint_mtime = Some(f.mod_time.clone());
+            let trimmed = o.stdout.trim();
+            let json_slice = trimmed
+                .find('[')
+                .map(|idx| &trimmed[idx..])
+                .unwrap_or("[]");
+            match serde_json::from_str::<Vec<Value>>(json_slice) {
+                Ok(arr) => {
+                    st.ok = true;
+                    for it in arr {
+                        let f = GdriveFile {
+                            name: it["Name"].as_str().unwrap_or("").into(),
+                            size: it["Size"].as_i64().unwrap_or(0),
+                            mod_time: it["ModTime"].as_str().unwrap_or("").into(),
+                            is_dir: it["IsDir"].as_bool().unwrap_or(false),
+                        };
+                        if f.name == "checkpoint.pt" {
+                            st.has_checkpoint = true;
+                            st.checkpoint_size = f.size;
+                            st.checkpoint_mtime = Some(f.mod_time.clone());
+                        }
+                        if f.name == "training_done.flag" {
+                            st.has_done_flag = true;
+                        }
+                        st.files.push(f);
+                    }
                 }
-                if f.name == "training_done.flag" {
-                    st.has_done_flag = true;
+                Err(e) => {
+                    st.error = Some(format!("解析 rclone lsjson 输出失败: {e}"));
                 }
-                st.files.push(f);
             }
         }
         Ok(o) if o.output.contains("directory not found") => {
@@ -351,42 +486,65 @@ print("PROBE_OK", "reused" if alive else "started")
 /// 使用 colab-cli 虚拟环境直接通过 /colab/tty（或 ColabRuntime）静默启动遥测守护进程，
 /// 不改写 ~/.config/colab-cli/sessions.json 与 history/*.jsonl，也不中断正在运行的训练任务。
 const SILENT_PROBE_LAUNCHER_PY: &str = r#"
-import json, sys, time
-from urllib.parse import urlparse
+import json, sys, time, urllib.request
+from urllib.parse import quote, urlparse
 
 url = sys.argv[1]
 token = sys.argv[2]
+existing_kid = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3].strip() else None
+safe_tok = quote(token, safe="")
+
+def check_probe_alive():
+    for rel in ("content/.colab_pilot_telemetry.json", "content/.colab_pilot_daemon.pid"):
+        chk_url = f"{url.rstrip('/')}/api/contents/{rel}?authuser=0&colab-runtime-proxy-token={safe_tok}&content=0"
+        req = urllib.request.Request(
+            chk_url,
+            headers={
+                "X-Colab-Runtime-Proxy-Token": token,
+                "X-Colab-Client-Agent": "colab-cli",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                if 200 <= r.status < 300:
+                    return True
+        except Exception:
+            pass
+    return False
 
 started = False
 try:
     import websocket
     parsed = urlparse(url)
     ws_scheme = "wss" if parsed.scheme == "https" else "ws"
-    ws_url = f"{ws_scheme}://{parsed.netloc}/colab/tty?colab-runtime-proxy-token={token}"
-    ws = websocket.create_connection(ws_url, timeout=8)
-    cmd = (
-        "python3 -c 'import os,subprocess,sys;"
-        "pf=\"/content/.colab_pilot_daemon.pid\";"
-        "alive=False\n"
-        "try:\n"
-        " alive=os.path.exists(pf) and (os.kill(int(open(pf).read().strip()),0) or True)\n"
-        "except Exception:\n"
-        " alive=False\n"
-        "if not alive:\n"
-        " subprocess.Popen([sys.executable,\"/content/.colab_pilot_daemon.py\"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)'\n"
+    ws_url = f"{ws_scheme}://{parsed.netloc}/colab/tty?colab-runtime-proxy-token={safe_tok}"
+    ws = websocket.create_connection(
+        ws_url,
+        header=[
+            f"X-Colab-Runtime-Proxy-Token: {token}",
+            "X-Colab-Client-Agent: colab-cli",
+        ],
+        timeout=10,
     )
-    ws.send(json.dumps({"data": cmd + "\n"}))
-    time.sleep(1.2)
+    ws.send(json.dumps({"cols": 120, "rows": 30}))
+    time.sleep(0.25)
+    ws.send(json.dumps({"data": "nohup python3 /content/.colab_pilot_daemon.py >/dev/null 2>&1 </dev/null &\n"}))
+    for _ in range(8):
+        time.sleep(0.5)
+        if check_probe_alive():
+            started = True
+            print("PROBE_OK via_tty", flush=True)
+            break
     ws.close()
-    started = True
-    print("PROBE_OK via_tty")
-except Exception as e:
+except Exception:
     pass
 
 if not started:
     from colab_cli.runtime import ColabRuntime
-    rt = ColabRuntime(url, token)
+    rt = ColabRuntime(url, token, kernel_id=existing_kid, session_id=None)
     try:
+        if not existing_kid and getattr(rt, "kernel_id", None):
+            print(f"KERNEL_ID:{rt.kernel_id}", flush=True)
         rt.execute_code('''
 import os, subprocess, sys, time
 pid_file = "/content/.colab_pilot_daemon.pid"
@@ -401,31 +559,56 @@ if not alive:
     subprocess.Popen([sys.executable, "/content/.colab_pilot_daemon.py"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     time.sleep(0.8)
-''', timeout=25)
-        print("PROBE_OK via_kernel")
+''', timeout=35)
+        print("PROBE_OK via_kernel", flush=True)
     finally:
         rt.stop()
 "#;
 
 pub async fn deploy_probe_for_assignment(app: &Arc<AppState>, a: &Assignment) -> anyhow::Result<()> {
-    app.client
+    if let Err(e) = app
+        .client
         .contents_upload(a, "content/.colab_pilot_daemon.py", TELEMETRY_DAEMON_PY.as_bytes())
-        .await?;
+        .await
+    {
+        if colab::is_proxy_auth_error(&e) {
+            *app.last_assignments.l() = None;
+        }
+        return Err(e);
+    }
+
+    let existing_kid = cli::read_sessions()
+        .values()
+        .find(|v| session_endpoint(v).as_deref() == Some(a.endpoint.as_str()))
+        .and_then(|v| v.get("kernel_id").and_then(|x| x.as_str()))
+        .unwrap_or("")
+        .to_string();
 
     let py = cli::colab_python_bin();
     let args = vec![
+        "-u".to_string(),
         "-c".to_string(),
         SILENT_PROBE_LAUNCHER_PY.to_string(),
         a.runtime_proxy_info.url.clone(),
         a.runtime_proxy_info.token.clone(),
+        existing_kid,
     ];
-    let out = cli::run_simple(&py, &args, Duration::from_secs(40)).await?;
+    let out = cli::run_simple(&py, &args, Duration::from_secs(65)).await?;
+    for line in out.stdout.lines() {
+        if let Some(kid) = line.trim().strip_prefix("KERNEL_ID:") {
+            cli::update_session_kernel_id(&a.endpoint, kid);
+        }
+    }
     if out.output.contains("PROBE_OK") {
         Ok(())
     } else {
+        let cleaned = cli::strip_colab_cli_banners(&out.output);
+        if cleaned.contains("401") || cleaned.contains("403") {
+            *app.last_assignments.l() = None;
+        }
         anyhow::bail!(
             "探针自动注入失败：{}",
-            out.output.trim().lines().last().unwrap_or("无输出")
+            cli::last_meaningful_cli_line(&cleaned, "无输出")
         )
     }
 }
@@ -435,11 +618,12 @@ pub async fn deploy_probe_inner(app: &Arc<AppState>, name: &str) -> anyhow::Resu
         .find_assignment_by_name(name)
         .await
         .ok_or_else(|| anyhow::anyhow!("服务端未找到实例 [{name}]"))?;
-    if let Ok(()) = deploy_probe_for_assignment(app, &a).await {
-        return Ok(());
-    }
-    if !cli::read_sessions().contains_key(name) {
-        anyhow::bail!("该实例不在 colab-cli 会话表中，且静默注入未响应");
+    let silent_err = match deploy_probe_for_assignment(app, &a).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if !cli::read_sessions().contains_key(name) || name.starts_with("orphan-") {
+        return Err(silent_err);
     }
     let out = cli::run_streaming(
         &cli::colab_bin(),
@@ -454,10 +638,468 @@ pub async fn deploy_probe_inner(app: &Arc<AppState>, name: &str) -> anyhow::Resu
     if out.output.contains("PROBE_OK") {
         Ok(())
     } else {
+        let cleaned = cli::strip_colab_cli_banners(&out.output);
         anyhow::bail!(
             "探针启动失败：{}",
-            out.output.trim().lines().last().unwrap_or("无输出")
+            cli::last_meaningful_cli_line(&cleaned, "无输出")
         )
+    }
+}
+
+// ───────────────────── 本机按需 SSH WebSocket 桥接与交互式 /colab/tty 回退终端 ─────────────────────
+
+/// 使用 google-colab-cli 内置的 `websocket-client`（`import websocket`）桥接 `/colab/ssh` 二进制流，
+/// 彻底修复缺失 `websockets` 模块导致的 SSH 握手失败，并兼容 `google-colab-cli v0.8+` 请求头规范。
+pub(crate) const WS_SSH_STDIO_BRIDGE_PY: &str = r#"
+import os, sys, threading
+from urllib.parse import quote, urlparse
+import websocket
+
+url = sys.argv[1]
+token = sys.argv[2]
+pubkey = sys.argv[3].strip()
+
+if os.name == "nt":
+    import msvcrt
+    msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+    msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+
+parsed = urlparse(url)
+ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+safe_tok = quote(token, safe="")
+ws_url = (
+    f"{ws_scheme}://{parsed.netloc}/colab/ssh"
+    f"?colab-runtime-proxy-token={safe_tok}"
+    f"&colab-client-agent=colab-cli&colab-client-agent=ssh-mode-proxy"
+)
+headers = ["X-Colab-Client-Agent: colab-cli"]
+if pubkey:
+    headers.append(f"X-Colab-Ssh-Pubkey: {pubkey}")
+
+ws = websocket.create_connection(ws_url, header=headers, timeout=15)
+if getattr(ws, "sock", None) is not None:
+    ws.sock.settimeout(None)
+
+def stdin_to_ws():
+    try:
+        while True:
+            chunk = os.read(0, 16384)
+            if not chunk:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                break
+            ws.send_binary(chunk)
+    except Exception:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+t = threading.Thread(target=stdin_to_ws, daemon=True)
+t.start()
+
+try:
+    while True:
+        opcode, data = ws.recv_data(control_frame=True)
+        if opcode == websocket.ABNF.OPCODE_CLOSE:
+            break
+        if opcode in (websocket.ABNF.OPCODE_BINARY, websocket.ABNF.OPCODE_TEXT) and data:
+            payload = data.encode("utf-8") if isinstance(data, str) else data
+            view = memoryview(payload)
+            written = 0
+            while written < len(view):
+                n = os.write(1, view[written:])
+                if n <= 0:
+                    break
+                written += n
+except Exception:
+    pass
+finally:
+    try:
+        ws.close()
+    except Exception:
+        pass
+"#;
+
+/// 针对 `google-colab-cli v0.8.0` 移除 `colab console` 及浏览器/新版实例不支持 `/colab/ssh` 的内置双协议交互式终端客户端：
+/// 1. 优先连接新版 Colab Tornado Jupyter Server 的 `/api/terminals` + `/terminals/websocket/<name>`（携带 `_xsrf` Cookie，退出自动 DELETE 清理）；
+/// 2. 若 `/api/terminals` 不可用，自动无缝回退至传统 `/colab/tty` WebSocket。
+pub(crate) const INTERACTIVE_TTY_CONSOLE_PY: &str = r#"
+import http.cookiejar, json, os, shutil, sys, threading, urllib.request
+from urllib.parse import quote, urlparse
+import websocket
+
+if os.name == "nt":
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        for std_id, flag in ((-11, 0x0004), (-12, 0x0004)):
+            h = k32.GetStdHandle(std_id)
+            mode = ctypes.c_uint32()
+            if k32.GetConsoleMode(h, ctypes.byref(mode)):
+                k32.SetConsoleMode(h, mode.value | flag)
+    except Exception:
+        pass
+
+url = (os.environ.get("COLAB_PILOT_PROXY_URL") or (sys.argv[1] if len(sys.argv) > 1 else "")).rstrip("/")
+token = os.environ.get("COLAB_PILOT_PROXY_TOKEN") or (sys.argv[2] if len(sys.argv) > 2 else "")
+vm_label = os.environ.get("COLAB_PILOT_VM_NAME") or (sys.argv[3] if len(sys.argv) > 3 else "colab-vm")
+
+parsed = urlparse(url)
+ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+safe_tok = quote(token, safe="")
+
+ws = None
+proto = "jupyter"
+term_name = None
+opener = None
+post_hdrs = {}
+
+# 1. 优先尝试 Jupyter Server /api/terminals + /terminals/websocket/<name>
+cj = http.cookiejar.CookieJar()
+opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+base_hdrs = {
+    "X-Colab-Runtime-Proxy-Token": token,
+    "X-Colab-Client-Agent": "colab-cli",
+}
+post_hdrs = dict(base_hdrs)
+try:
+    sys.stdout.write(f"\x1b[36m[Colab Pilot]\x1b[0m 正在连接云端 Jupyter 交互终端 ({vm_label} · /api/terminals) ...\r\n")
+    sys.stdout.flush()
+    req_get = urllib.request.Request(
+        f"{url}/api/terminals?authuser=0&colab-runtime-proxy-token={safe_tok}",
+        headers=base_hdrs,
+    )
+    with opener.open(req_get, timeout=12) as _:
+        pass
+    xsrf = next((c.value for c in cj if c.name == "_xsrf"), "")
+    if xsrf:
+        post_hdrs["X-XSRFToken"] = xsrf
+    post_hdrs["Content-Type"] = "application/json"
+    req_post = urllib.request.Request(
+        f"{url}/api/terminals?authuser=0&colab-runtime-proxy-token={safe_tok}",
+        data=b"{}",
+        headers=post_hdrs,
+        method="POST",
+    )
+    with opener.open(req_post, timeout=12) as resp:
+        term_info = json.loads(resp.read().decode("utf-8", "replace"))
+        term_name = term_info.get("name")
+    if term_name:
+        ws_headers = [
+            f"X-Colab-Runtime-Proxy-Token: {token}",
+            "X-Colab-Client-Agent: colab-cli",
+        ]
+        cookie_header = "; ".join(f"{c.name}={c.value}" for c in cj)
+        if cookie_header:
+            ws_headers.append(f"Cookie: {cookie_header}")
+        ws_url = f"{ws_scheme}://{parsed.netloc}/terminals/websocket/{quote(str(term_name), safe='')}?authuser=0&colab-runtime-proxy-token={safe_tok}"
+        ws = websocket.create_connection(ws_url, header=ws_headers, timeout=15)
+        if getattr(ws, "sock", None) is not None:
+            ws.sock.settimeout(None)
+except Exception as e:
+    sys.stdout.write(f"\x1b[33m[Colab Pilot] /api/terminals 暂不可用 ({e})，回退至 /colab/tty ...\x1b[0m\r\n")
+    sys.stdout.flush()
+    ws = None
+    term_name = None
+
+# 2. 若 /api/terminals 不可用，无缝回退至 /colab/tty
+if ws is None:
+    proto = "colab_tty"
+    ws_url = f"{ws_scheme}://{parsed.netloc}/colab/tty?colab-runtime-proxy-token={safe_tok}"
+    try:
+        ws = websocket.create_connection(
+            ws_url,
+            header=[
+                f"X-Colab-Runtime-Proxy-Token: {token}",
+                "X-Colab-Client-Agent: colab-cli",
+            ],
+            timeout=15,
+        )
+        if getattr(ws, "sock", None) is not None:
+            ws.sock.settimeout(None)
+    except Exception as e:
+        sys.stdout.write(f"\x1b[31m[Colab Pilot] 无法连接远程交互终端 (/api/terminals 与 /colab/tty 均失败): {e}\x1b[0m\r\n")
+        sys.stdout.flush()
+        sys.exit(1)
+
+cols, rows = shutil.get_terminal_size((120, 32))
+try:
+    if proto == "jupyter":
+        ws.send(json.dumps(["set_size", rows, cols, 0, 0]))
+        ws.send(json.dumps(["stdin", "cd /content 2>/dev/null && clear\r"]))
+    else:
+        ws.send(json.dumps({"cols": cols, "rows": rows}))
+        ws.send(json.dumps({"data": "cd /content 2>/dev/null; clear\r"}))
+except Exception:
+    pass
+
+closed = threading.Event()
+
+def send_input(seq):
+    if proto == "jupyter":
+        ws.send(json.dumps(["stdin", seq]))
+    else:
+        ws.send(json.dumps({"data": seq}))
+
+def recv_loop():
+    try:
+        while not closed.is_set():
+            msg = ws.recv()
+            if msg is None:
+                break
+            txt = msg.decode("utf-8", "replace") if isinstance(msg, bytes) else msg
+            if proto == "jupyter":
+                try:
+                    arr = json.loads(txt)
+                    if isinstance(arr, list) and len(arr) >= 2:
+                        kind = arr[0]
+                        if kind == "stdout":
+                            sys.stdout.write(str(arr[1]))
+                            sys.stdout.flush()
+                        elif kind == "disconnect":
+                            break
+                        continue
+                except Exception:
+                    pass
+            elif txt.startswith("{"):
+                try:
+                    obj = json.loads(txt)
+                    if isinstance(obj, dict) and "data" in obj:
+                        txt = str(obj["data"])
+                except Exception:
+                    pass
+            if txt:
+                sys.stdout.write(txt)
+                sys.stdout.flush()
+    except Exception:
+        pass
+    finally:
+        closed.set()
+
+threading.Thread(target=recv_loop, daemon=True).start()
+
+WIN_SPECIAL_KEYS = {
+    "H": "\x1b[A",
+    "P": "\x1b[B",
+    "M": "\x1b[C",
+    "K": "\x1b[D",
+    "G": "\x1b[H",
+    "O": "\x1b[F",
+    "S": "\x1b[3~",
+    "I": "\x1b[5~",
+    "Q": "\x1b[6~",
+}
+
+try:
+    if os.name == "nt":
+        import msvcrt, time
+        while not closed.is_set():
+            if not msvcrt.kbhit():
+                time.sleep(0.015)
+                continue
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                k = msvcrt.getwch()
+                seq = WIN_SPECIAL_KEYS.get(k, "")
+            else:
+                seq = ch
+            if seq:
+                send_input(seq)
+    else:
+        import select, termios, tty
+        fd = sys.stdin.fileno()
+        old_attr = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while not closed.is_set():
+                r, _, _ = select.select([fd], [], [], 0.1)
+                if r:
+                    data = os.read(fd, 1024)
+                    if not data:
+                        break
+                    send_input(data.decode("utf-8", "replace"))
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+except KeyboardInterrupt:
+    try:
+        send_input("\x03")
+    except Exception:
+        pass
+finally:
+    closed.set()
+    try:
+        ws.close()
+    except Exception:
+        pass
+    if proto == "jupyter" and term_name and opener is not None:
+        try:
+            req_del = urllib.request.Request(
+                f"{url}/api/terminals/{quote(str(term_name), safe='')}?authuser=0&colab-runtime-proxy-token={safe_tok}",
+                headers=post_hdrs,
+                method="DELETE",
+            )
+            opener.open(req_del, timeout=5).close()
+        except Exception:
+            pass
+    sys.stdout.write("\r\n\x1b[33m[Colab Pilot] 远程终端会话已断开。\x1b[0m\r\n")
+    sys.stdout.flush()
+"#;
+
+async fn ensure_vm_ssh_bridge(app: &AppState, vm_name: &str, a: &Assignment) -> Option<u16> {
+    if !cli::is_safe_vm_alias(vm_name) {
+        return None;
+    }
+    if let Some(existing) = app.ssh_bridges.l().get(vm_name).cloned() {
+        let mut t = existing.target.l();
+        t.endpoint = a.endpoint.clone();
+        t.proxy_url = a.runtime_proxy_info.url.clone();
+        t.proxy_token = a.runtime_proxy_info.token.clone();
+        return Some(existing.local_port);
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+    let local_port = listener.local_addr().ok()?.port();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let bridge = Arc::new(LocalSshBridge {
+        local_port,
+        target: Mutex::new(SshBridgeTarget {
+            endpoint: a.endpoint.clone(),
+            proxy_url: a.runtime_proxy_info.url.clone(),
+            proxy_token: a.runtime_proxy_info.token.clone(),
+        }),
+        cancel: cancel.clone(),
+    });
+    app.ssh_bridges
+        .l()
+        .insert(vm_name.to_string(), bridge.clone());
+
+    let bridge_loop = bridge.clone();
+    tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                _ = cancel.cancelled() => break,
+                r = listener.accept() => r,
+            };
+            let Ok((mut tcp_stream, _)) = accepted else {
+                break;
+            };
+            let (proxy_url, proxy_token) = {
+                let t = bridge_loop.target.l();
+                (t.proxy_url.clone(), t.proxy_token.clone())
+            };
+            let conn_cancel = cancel.clone();
+            tokio::spawn(async move {
+                let pubkey = tokio::task::spawn_blocking(|| {
+                    cli::ensure_ssh_keypair().ok().map(|(_, pub_s)| pub_s)
+                })
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+
+                let py = cli::colab_python_bin();
+                let mut cmd = tokio::process::Command::new(py);
+                cmd.args([
+                    "-u",
+                    "-c",
+                    WS_SSH_STDIO_BRIDGE_PY,
+                    &proxy_url,
+                    &proxy_token,
+                    &pubkey,
+                ])
+                .env("PYTHONUTF8", "1")
+                .env("PYTHONIOENCODING", "utf-8")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+                #[cfg(windows)]
+                cmd.creation_flags(0x0800_0000);
+
+                let Ok(mut child) = cmd.spawn() else {
+                    return;
+                };
+                let (Some(mut py_stdin), Some(mut py_stdout)) =
+                    (child.stdin.take(), child.stdout.take())
+                else {
+                    cli::kill_tree(&mut child).await;
+                    return;
+                };
+                let (mut tcp_r, mut tcp_w) = tcp_stream.split();
+                tokio::select! {
+                    _ = conn_cancel.cancelled() => {},
+                    _ = tokio::io::copy(&mut tcp_r, &mut py_stdin) => {},
+                    _ = tokio::io::copy(&mut py_stdout, &mut tcp_w) => {},
+                }
+                cli::kill_tree(&mut child).await;
+            });
+        }
+    });
+
+    Some(local_port)
+}
+
+fn build_vm_ssh_info(vm_name: &str, a: &Assignment, local_port: Option<u16>) -> VmSshInfo {
+    let alias = format!("colab-{vm_name}");
+    let (priv_path_str, fingerprint) = match cli::ensure_ssh_keypair() {
+        Ok((priv_p, pub_raw)) => {
+            let fp = pub_raw
+                .split_whitespace()
+                .nth(1)
+                .map(|b64| {
+                    let tail: String = b64.chars().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
+                    format!("ed25519:…{tail}")
+                })
+                .unwrap_or_else(|| "ed25519".into());
+            (priv_p.to_string_lossy().replace('\\', "/"), fp)
+        }
+        Err(_) => (
+            cli::pilot_ssh_private_key_path()
+                .to_string_lossy()
+                .replace('\\', "/"),
+            "ed25519".into(),
+        ),
+    };
+    let port = local_port.unwrap_or(0);
+    let null_hosts = cli::known_hosts_null_device();
+    let ssh_d = cli::ssh_dir();
+    let has_default_ssh_key =
+        ssh_d.join("id_ed25519.pub").exists() || ssh_d.join("id_ecdsa.pub").exists();
+    let colab_ssh_command = if has_default_ssh_key {
+        format!("colab ssh -s {vm_name}")
+    } else {
+        format!("colab ssh -i \"{priv_path_str}\" -s {vm_name}")
+    };
+    let ssh_port_command = if port > 0 {
+        format!(
+            "ssh -p {port} -i \"{priv_path_str}\" -o StrictHostKeyChecking=no -o UserKnownHostsFile={null_hosts} root@127.0.0.1"
+        )
+    } else {
+        colab_ssh_command.clone()
+    };
+    // 绝不在前端可见结构体中暴露 colab-runtime-proxy-token 查询参数
+    let remote_ws_url = a
+        .runtime_proxy_info
+        .url
+        .trim_end_matches('/')
+        .replacen("https://", "wss://", 1)
+        .replacen("http://", "ws://", 1)
+        + "/colab/ssh";
+
+    VmSshInfo {
+        ready: port > 0 && cli::is_safe_vm_alias(vm_name),
+        host_alias: alias.clone(),
+        local_port: port,
+        ssh_command: format!("ssh {alias}"),
+        ssh_port_command,
+        colab_ssh_command,
+        private_key_path: priv_path_str,
+        public_key_fingerprint: fingerprint,
+        remote_ws_url,
+        user: "root".into(),
     }
 }
 
@@ -478,7 +1120,108 @@ fn local_metrics_client() -> Option<&'static reqwest::Client> {
         .as_ref()
 }
 
-async fn fetch_telemetry(app: &AppState, a: &Assignment) -> TelemetryEntry {
+/// 严格判定指定 VM 是否属于当前蓝绿集群固定槽位（`{session_prefix}-blue` -> 18081，`{session_prefix}-green` -> 18082），
+/// 杜绝其他同名后缀实例（如 `other-blue`）与本地蓝绿网关串流或混入指标（H-4）。
+pub(crate) fn bluegreen_tunnel_port_for_vm(vm_name: &str, bg: Option<&Value>) -> Option<u16> {
+    let bg = bg?;
+    let prefix = bg
+        .get("session_prefix")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("llm");
+    if vm_name == format!("{prefix}-blue") {
+        Some(18081)
+    } else if vm_name == format!("{prefix}-green") {
+        Some(18082)
+    } else {
+        None
+    }
+}
+
+/// 过滤陈旧的 `llm_bluegreen_state.json`：
+/// - 若处于 `switching` / `initializing` / `warming_up` / `deploying` 且更新时间在 30 分钟内，保留展示；
+/// - 若处于 `failed` 且关联的 `failed_session` 在线/创建中，或错误发生在最近 10 分钟内，保留展示以便界面显示错误诊断；
+/// - 其余状态（如 `serving`）仅当蓝绿槽位（`{prefix}-blue` / `{prefix}-green`）或 `active_session` 确实在线/创建中/部署中时才保留，
+///   杜绝数天前残留的 `serving` 文件虚报在线或误导对话路由。
+pub(crate) fn filter_live_bluegreen_state(
+    bg: Option<Value>,
+    online_names: &[String],
+    busy: &HashMap<String, String>,
+    creating_names: &[String],
+    now_ts: f64,
+) -> Option<Value> {
+    let bg = bg?;
+    let phase = bg
+        .get("phase")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let updated_at = bg.get("updated_at").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let age_secs = if updated_at > 0.0 {
+        (now_ts - updated_at).max(0.0)
+    } else {
+        f64::INFINITY
+    };
+
+    let is_live_vm = |cand: &str| -> bool {
+        !cand.is_empty()
+            && (online_names.iter().any(|n| n == cand)
+                || creating_names.iter().any(|n| n == cand)
+                || busy
+                    .get(cand)
+                    .map(|b| b == "creating" || b == "deploying_llm")
+                    .unwrap_or(false))
+    };
+
+    if matches!(
+        phase.as_str(),
+        "switching" | "initializing" | "warming_up" | "deploying"
+    ) && age_secs <= 1800.0
+    {
+        return Some(bg);
+    }
+
+    if phase == "failed" {
+        let failed_sess = bg
+            .get("failed_session")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim();
+        if is_live_vm(failed_sess) || age_secs <= 600.0 {
+            return Some(bg);
+        }
+        return None;
+    }
+
+    let prefix = bg
+        .get("session_prefix")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("llm");
+    let blue_name = format!("{prefix}-blue");
+    let green_name = format!("{prefix}-green");
+    let active_sess = bg
+        .get("active_session")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
+
+    if is_live_vm(&blue_name) || is_live_vm(&green_name) || is_live_vm(active_sess) {
+        Some(bg)
+    } else {
+        None
+    }
+}
+
+async fn fetch_telemetry(
+    app: &AppState,
+    a: &Assignment,
+    vm_name: Option<&str>,
+    bg: Option<&Value>,
+) -> TelemetryEntry {
     match app
         .client
         .contents_read_text(a, "content/.colab_pilot_telemetry.json")
@@ -486,34 +1229,35 @@ async fn fetch_telemetry(app: &AppState, a: &Assignment) -> TelemetryEntry {
     {
         Ok(Some(text)) => match serde_json::from_str::<Value>(&text) {
             Ok(mut v) => {
-                // 若该实例为蓝绿 LLM 节点且本地 SSH 隧道已打通，直接合并本地隧道 <50ms 的实时计量快照
-                let slot = v
-                    .pointer("/llm/slot")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_lowercase());
-                let local_port = match slot.as_deref() {
-                    Some("blue") => Some(18081u16),
-                    Some("green") => Some(18082u16),
-                    _ => None,
-                };
+                // 匹配蓝绿槽位固定端口或独立 LLM 实例在 llm_api_keys.json 中登记的专属本地端口，合并实时指标
+                let local_port = vm_name.and_then(|n| {
+                    bluegreen_tunnel_port_for_vm(n, bg)
+                        .or_else(|| cli::lookup_vm_api_key_meta(n).and_then(|(_, p)| p))
+                });
                 if let Some(port) = local_port {
                     if let Some(client) = local_metrics_client() {
-                        if let Ok(resp) = client
-                            .get(format!("http://127.0.0.1:{port}/pilot/metrics"))
-                            .send()
-                            .await
-                        {
+                        let mut req_builder =
+                            client.get(format!("http://127.0.0.1:{port}/pilot/metrics"));
+                        if let Some(n) = vm_name {
+                            req_builder = req_builder.header("X-Colab-Vm", n);
+                        }
+                        if let Ok(resp) = req_builder.send().await {
                             if resp.status().is_success() {
                                 if let Ok(live_llm) = resp.json::<Value>().await {
-                                    // 仅当本机网关返回完整的计量结构时才按字段合并，绝不用残缺 fallback 覆盖云端完整指标
-                                    // 且仅当本机快照不比云端快照更旧时才合并（避免旧数据回滚曲线）
+                                    let ep_matches = live_llm
+                                        .get("endpoint")
+                                        .and_then(|x| x.as_str())
+                                        .filter(|s| !s.is_empty())
+                                        .map(|ep| ep == a.endpoint)
+                                        .unwrap_or(true);
                                     let live_ts = live_llm.get("timestamp").and_then(|x| x.as_f64());
                                     let cloud_ts = v.pointer("/llm/timestamp").and_then(|x| x.as_f64());
                                     let not_older = match (live_ts, cloud_ts) {
                                         (Some(l), Some(c)) => l >= c,
                                         _ => true,
                                     };
-                                    if not_older
+                                    if ep_matches
+                                        && not_older
                                         && live_llm.get("total_completion_tokens").is_some()
                                         && live_llm.get("tps_history").is_some()
                                     {
@@ -542,7 +1286,12 @@ async fn fetch_telemetry(app: &AppState, a: &Assignment) -> TelemetryEntry {
             Err(e) => TelemetryEntry { data: None, error: Some(format!("遥测解析失败: {e}")) },
         },
         Ok(None) => TelemetryEntry { data: None, error: Some("正在自动注入遥测探针…".into()) },
-        Err(e) => TelemetryEntry { data: None, error: Some(e.to_string()) },
+        Err(e) => {
+            if colab::is_proxy_auth_error(&e) {
+                *app.last_assignments.l() = None;
+            }
+            TelemetryEntry { data: None, error: Some(e.to_string()) }
+        }
     }
 }
 
@@ -568,30 +1317,63 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
         ..Default::default()
     };
 
-    // Google Drive 状态始终在后台异步刷新（绝不阻塞 Colab 计费与秒级资源遥测轮询）
-    {
-        let mut gd = app.gdrive.lock().await;
-        let stale = gd.1.map(|t| t.elapsed() > Duration::from_secs(30)).unwrap_or(true);
-        if (stale || force_gdrive) && env.rclone_ok && env.rclone_conf_ok {
-            gd.1 = Some(Instant::now());
-            let app_bg = app.clone();
-            tokio::spawn(async move {
-                let status = fetch_gdrive_status(DEFAULT_GDRIVE_DIR).await;
-                let mut g = app_bg.gdrive.lock().await;
-                g.0 = Some(status);
-            });
+    // Google Drive 状态刷新（带 in_flight 防并发风暴；首次手动/无头诊断时直接等待结果，确保 --print-overview 不返回 null）
+    let target_gdrive_dir = app.active_relay_gdrive_dir();
+    if env.rclone_ok && env.rclone_conf_ok {
+        let sync_wait_needed = {
+            let gd = app.gdrive.lock().await;
+            force_gdrive && !gd.in_flight
+        };
+        if sync_wait_needed {
+            {
+                let mut gd = app.gdrive.lock().await;
+                gd.in_flight = true;
+            }
+            let status = fetch_gdrive_status(&target_gdrive_dir).await;
+            let mut gd = app.gdrive.lock().await;
+            gd.status = Some(status.clone());
+            gd.updated_at = Some(Instant::now());
+            gd.in_flight = false;
+            ov.gdrive = Some(status);
+        } else {
+            let mut gd = app.gdrive.lock().await;
+            let dir_changed = gd
+                .status
+                .as_ref()
+                .map(|s| s.dir != target_gdrive_dir)
+                .unwrap_or(false);
+            let stale = gd
+                .updated_at
+                .map(|t| t.elapsed() > Duration::from_secs(30))
+                .unwrap_or(true);
+            if !gd.in_flight && (stale || force_gdrive || dir_changed) {
+                gd.in_flight = true;
+                let app_bg = app.clone();
+                let dir_bg = target_gdrive_dir.clone();
+                tokio::spawn(async move {
+                    let status = fetch_gdrive_status(&dir_bg).await;
+                    let mut g = app_bg.gdrive.lock().await;
+                    g.status = Some(status);
+                    g.updated_at = Some(Instant::now());
+                    g.in_flight = false;
+                });
+            }
+            ov.gdrive = gd.status.clone();
         }
-        ov.gdrive = gd.0.clone();
+    } else {
+        ov.gdrive = app.gdrive.lock().await.status.clone();
     }
 
-    // 本地会话表读取涉及磁盘 I/O，放入阻塞线程池执行，绝不阻塞异步运行时
-    let sessions = tokio::task::spawn_blocking(cli::read_sessions)
-        .await
-        .unwrap_or_default();
+    // 本地会话表与蓝绿状态读取涉及磁盘 I/O，放入阻塞线程池执行
+    let (sessions, bg_snapshot) = tokio::task::spawn_blocking(|| {
+        (cli::read_sessions(), cli::read_llm_bluegreen_state())
+    })
+    .await
+    .unwrap_or_default();
     let mut assignments: Vec<Assignment> = vec![];
 
     if !env.token_ok {
-        ov.error = Some("未检测到 Colab 登录凭证，请在终端运行 `colab status` 完成 Google 授权".into());
+        ov.error = Some("未检测到 Colab 登录凭证，请在终端运行 `colab auth login` 或 `colab status` 完成 Google 授权".into());
     } else {
         // 高频遥测优化：8 秒内直接复用已缓存的计费实例列表与 CU 信息，省去跨洋 /tun/m/ 串行等待，直奔实例遥测快照
         let cached_fresh = if !force_gdrive {
@@ -644,9 +1426,53 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
     }
     ov.server_count = assignments.len();
 
+    // 优先绑定正式受管会话名（避免历史残留 orphan-* 遮蔽新注册的命名会话）
+    let mut ep_to_name: HashMap<String, String> = HashMap::new();
+    for (n, v) in &sessions {
+        if let Some(ep) = session_endpoint(v) {
+            let replace = match ep_to_name.get(&ep) {
+                None => true,
+                Some(prev) => prev.starts_with("orphan-") && !n.starts_with("orphan-"),
+            };
+            if replace {
+                ep_to_name.insert(ep, n.clone());
+            }
+        }
+    }
+
+    let busy = app.busy.l().clone();
+    let creating_map = app.creating_vms.l().clone();
+    let creating_names: Vec<String> = creating_map.keys().cloned().collect();
+    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+
+    let prelim_online_names: Vec<String> = assignments
+        .iter()
+        .map(|a| {
+            ep_to_name
+                .get(&a.endpoint)
+                .cloned()
+                .unwrap_or_else(|| orphan_name(&a.endpoint))
+        })
+        .collect();
+    let live_bg_prelim = filter_live_bluegreen_state(
+        bg_snapshot,
+        &prelim_online_names,
+        &busy,
+        &creating_names,
+        now,
+    );
+
     // 并发拉取每台在线虚拟机的遥测快照（Contents API，不占用 Kernel）
     // 采用 Stale-While-Revalidate：单次网络抖动失败时保留上一份有效遥测快照，避免界面闪断或误触发重连探针
-    let fetched = join_all(assignments.iter().map(|a| fetch_telemetry(app, a))).await;
+    let fetched = join_all(assignments.iter().map(|a| {
+        fetch_telemetry(
+            app,
+            a,
+            ep_to_name.get(&a.endpoint).map(|s| s.as_str()),
+            live_bg_prelim.as_ref(),
+        )
+    }))
+    .await;
     {
         let mut t = app.telemetry.l();
         t.retain(|ep, _| assignments.iter().any(|a| &a.endpoint == ep));
@@ -666,13 +1492,6 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
         }
     }
 
-    let ep_to_name: HashMap<String, String> = sessions
-        .iter()
-        .filter_map(|(n, v)| session_endpoint(v).map(|ep| (ep, n.clone())))
-        .collect();
-    let busy = app.busy.l().clone();
-    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-
     struct VmDraft {
         a: Assignment,
         name: String,
@@ -686,7 +1505,8 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
 
     for a in &assignments {
         let (name, managed) = match ep_to_name.get(&a.endpoint) {
-            Some(n) => (n.clone(), true),
+            Some(n) if !n.starts_with("orphan-") => (n.clone(), true),
+            Some(n) => (n.clone(), false),
             None => (orphan_name(&a.endpoint), false),
         };
         let sess = sessions.get(&name).cloned();
@@ -738,6 +1558,32 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
         });
     }
 
+    // 维护每台在线受管实例的本机按需 SSH WebSocket 桥接监听，并自动回收已下线实例的桥接器
+    let active_draft_names: std::collections::HashSet<String> =
+        drafts.iter().map(|d| d.name.clone()).collect();
+    {
+        let mut bridges = app.ssh_bridges.l();
+        let stale_keys: Vec<String> = bridges
+            .keys()
+            .filter(|k| !active_draft_names.contains(*k))
+            .cloned()
+            .collect();
+        for k in stale_keys {
+            if let Some(b) = bridges.remove(&k) {
+                b.shutdown();
+            }
+        }
+    }
+    let mut bridge_ports: HashMap<String, Option<u16>> = HashMap::new();
+    let mut ssh_entries: Vec<(String, u16)> = Vec::new();
+    for d in &drafts {
+        let port = ensure_vm_ssh_bridge(app, &d.name, &d.a).await;
+        if let Some(p) = port.filter(|&p| p > 0) {
+            ssh_entries.push((d.name.clone(), p));
+        }
+        bridge_ports.insert(d.name.clone(), port);
+    }
+
     let mut seen: Vec<String> = drafts.iter().map(|d| d.name.clone()).collect();
 
     // 接力换棒间隙（旧实例已销毁、新实例未分配）与正在创建中的虚拟机也保留卡片
@@ -753,37 +1599,201 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
         .collect();
     seen.extend(gaps.iter().map(|(n, _)| n.clone()));
 
-    // 历史事件解析、工作区推断、近期会话与蓝绿状态读取均为同步磁盘 I/O，统一放入阻塞线程池批量执行
-    let vm_jobs: Vec<(String, String, Option<Value>, Option<Value>)> = drafts
-        .iter()
-        .map(|d| (d.name.clone(), d.a.endpoint.clone(), d.sess.clone(), d.tel.clone()))
+    let creating_pending: Vec<(String, CreatingVmMeta)> = creating_map
+        .into_iter()
+        .filter(|(n, _)| !seen.contains(n))
         .collect();
+    seen.extend(creating_pending.iter().map(|(n, _)| n.clone()));
+
+    let sync_items: Vec<(String, String, String, String, i64, String, String, bool)> = drafts
+        .iter()
+        .map(|d| {
+            (
+                d.name.clone(),
+                d.a.endpoint.clone(),
+                d.a.runtime_proxy_info.url.clone(),
+                d.a.runtime_proxy_info.token.clone(),
+                d.a.runtime_proxy_info.token_expires_in_seconds,
+                d.a.accelerator.clone(),
+                d.a.variant_label(),
+                d.a.is_high_ram(),
+            )
+        })
+        .collect();
+
+    // 会话同步、SSH Config 写入、历史事件解析、工作区推断、API Key 解析均为同步磁盘 I/O，统一放入阻塞线程池批量执行
+    let vm_jobs: Vec<(
+        String,
+        Assignment,
+        Option<u16>,
+        Option<Value>,
+        Option<Value>,
+    )> = drafts
+        .iter()
+        .map(|d| {
+            (
+                d.name.clone(),
+                d.a.clone(),
+                bridge_ports.get(&d.name).copied().flatten(),
+                d.sess.clone(),
+                d.tel.clone(),
+            )
+        })
+        .collect();
+    let online_names_bg: Vec<String> = drafts.iter().map(|d| d.name.clone()).collect();
     let gap_jobs: Vec<String> = gaps.iter().map(|(n, _)| n.clone()).collect();
+    let creating_jobs: Vec<(String, CreatingVmMeta)> = creating_pending.clone();
     let seen_bg = seen.clone();
-    let (vm_extra, gap_extra, recent, bg) = tokio::task::spawn_blocking(move || {
-        let vm_extra: Vec<(Vec<CliEventView>, WorkspaceInfo)> = vm_jobs
-            .iter()
-            .map(|(name, ep, sess, tel)| {
-                let (cli_events, history_paths) = cli::read_session_events(name, 12);
-                let workspace =
-                    cli::resolve_workspace_for_vm(name, Some(ep), sess.as_ref(), tel.as_ref(), &history_paths);
-                (cli_events, workspace)
-            })
-            .collect();
-        let gap_extra: Vec<(Vec<CliEventView>, WorkspaceInfo)> = gap_jobs
-            .iter()
-            .map(|name| {
-                let (cli_events, history_paths) = cli::read_session_events(name, 12);
-                let workspace = cli::resolve_workspace_for_vm(name, None, None, None, &history_paths);
-                (cli_events, workspace)
-            })
-            .collect();
-        let recent = cli::read_recent_sessions(&seen_bg, 8);
-        let bg = cli::read_llm_bluegreen_state();
-        (vm_extra, gap_extra, recent, bg)
-    })
-    .await
-    .unwrap_or_default();
+    let busy_bg = busy.clone();
+    let creating_names_bg = creating_names.clone();
+    let sync_sessions_allowed = ov.auth_ok && ov.error.is_none();
+
+    let (vm_extra, gap_extra, creating_extra, recent, live_bg) =
+        tokio::task::spawn_blocking(move || {
+            if sync_sessions_allowed {
+                cli::sync_sessions_with_assignments(&sync_items, !creating_names_bg.is_empty());
+                cli::sync_ssh_config_hosts(&ssh_entries);
+            }
+            let bg_raw = cli::read_llm_bluegreen_state();
+            let live_bg = filter_live_bluegreen_state(
+                bg_raw,
+                &online_names_bg,
+                &busy_bg,
+                &creating_names_bg,
+                now,
+            );
+
+            let vm_extra: Vec<(
+                Vec<CliEventView>,
+                WorkspaceInfo,
+                VmSshInfo,
+                Option<LlmApiAccessInfo>,
+            )> = vm_jobs
+                .iter()
+                .map(|(name, a, bridge_port, sess, tel)| {
+                    let (cli_events, history_paths) = cli::read_session_events(name, 12);
+                    let workspace = cli::resolve_workspace_for_vm(
+                        name,
+                        Some(&a.endpoint),
+                        sess.as_ref(),
+                        tel.as_ref(),
+                        &history_paths,
+                    );
+                    let ssh_info = build_vm_ssh_info(name, a, *bridge_port);
+
+                    let llm_tel = tel.as_ref().and_then(|t| t.get("llm")).filter(|v| v.is_object());
+                    let has_llm_proc = tel
+                        .as_ref()
+                        .map(|t| t["threads"]["llm_process"].is_object())
+                        .unwrap_or(false);
+                    let bg_port = bluegreen_tunnel_port_for_vm(name, live_bg.as_ref());
+                    let is_bg_active_session = live_bg
+                        .as_ref()
+                        .and_then(|v| v.get("active_session"))
+                        .and_then(|x| x.as_str())
+                        .map(|s| s == name)
+                        .unwrap_or(false);
+                    let is_deploying_llm = busy_bg
+                        .get(name)
+                        .map(|b| b == "deploying_llm")
+                        .unwrap_or(false);
+                    let has_reg_key =
+                        !name.starts_with("orphan-") && cli::has_registered_llm_api_key(name);
+
+                    let llm_api = if llm_tel.is_some()
+                        || has_llm_proc
+                        || bg_port.is_some()
+                        || is_bg_active_session
+                        || is_deploying_llm
+                        || has_reg_key
+                    {
+                        let slot = llm_tel
+                            .and_then(|l| l.get("slot"))
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| match bg_port {
+                                Some(18081) => Some("blue".into()),
+                                Some(18082) => Some("green".into()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| "standalone".into());
+                        let engine = llm_tel
+                            .and_then(|l| l.get("engine"))
+                            .and_then(|x| x.as_str())
+                            .or_else(|| {
+                                live_bg
+                                    .as_ref()
+                                    .filter(|_| bg_port.is_some() || is_bg_active_session)
+                                    .and_then(|b| b.get("engine"))
+                                    .and_then(|x| x.as_str())
+                            })
+                            .unwrap_or("vllm");
+                        let model_name = llm_tel
+                            .and_then(|l| l.get("model_name"))
+                            .and_then(|x| x.as_str())
+                            .or_else(|| {
+                                live_bg
+                                    .as_ref()
+                                    .filter(|_| bg_port.is_some() || is_bg_active_session)
+                                    .and_then(|b| b.get("model_name"))
+                                    .and_then(|x| x.as_str())
+                            })
+                            .unwrap_or("default");
+                        let remote_port = llm_tel
+                            .and_then(|l| l.get("port"))
+                            .and_then(|x| x.as_u64())
+                            .map(|p| p as u16)
+                            .unwrap_or(8000);
+                        Some(cli::resolve_or_create_llm_api_info(
+                            name,
+                            &slot,
+                            engine,
+                            bg_port.unwrap_or(0),
+                            remote_port,
+                            model_name,
+                        ))
+                    } else {
+                        None
+                    };
+
+                    (cli_events, workspace, ssh_info, llm_api)
+                })
+                .collect();
+
+            let gap_extra: Vec<(Vec<CliEventView>, WorkspaceInfo)> = gap_jobs
+                .iter()
+                .map(|name| {
+                    let (cli_events, history_paths) = cli::read_session_events(name, 12);
+                    let workspace =
+                        cli::resolve_workspace_for_vm(name, None, None, None, &history_paths);
+                    (cli_events, workspace)
+                })
+                .collect();
+
+            let creating_extra: Vec<(Vec<CliEventView>, WorkspaceInfo)> = creating_jobs
+                .iter()
+                .map(|(name, meta)| {
+                    let (cli_events, history_paths) = cli::read_session_events(name, 12);
+                    let mut workspace =
+                        cli::resolve_workspace_for_vm(name, None, None, None, &history_paths);
+                    if !meta.workspace_name.is_empty() {
+                        workspace.name = meta.workspace_name.clone();
+                    }
+                    if meta.workspace_path.is_some() {
+                        workspace.path = meta.workspace_path.clone();
+                    }
+                    if meta.description.is_some() && workspace.description.is_none() {
+                        workspace.description = meta.description.clone();
+                    }
+                    (cli_events, workspace)
+                })
+                .collect();
+
+            let recent = cli::read_recent_sessions(&seen_bg, 8);
+            (vm_extra, gap_extra, creating_extra, recent, live_bg)
+        })
+        .await
+        .unwrap_or_default();
 
     let fallback_extra = |name: &str| {
         (
@@ -795,9 +1805,21 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
         )
     };
 
+    let deploy_errs = app.deploy_errors.l().clone();
     let mut vm_extra = vm_extra.into_iter();
     for d in drafts {
-        let (cli_events, workspace) = vm_extra.next().unwrap_or_else(|| fallback_extra(&d.name));
+        let (cli_events, workspace, ssh_info, llm_api) = match vm_extra.next() {
+            Some(x) => x,
+            None => {
+                let (ev, ws) = fallback_extra(&d.name);
+                let ssh = build_vm_ssh_info(
+                    &d.name,
+                    &d.a,
+                    bridge_ports.get(&d.name).copied().flatten(),
+                );
+                (ev, ws, ssh, None)
+            }
+        };
         let cur_busy = app.busy.l().get(&d.name).cloned();
         let sess = d.sess.as_ref();
         let a = &d.a;
@@ -834,6 +1856,9 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             telemetry_error: d.terr,
             relay: app.relay(&d.name).map(|h| h.snapshot()),
             busy: cur_busy,
+            ssh: Some(ssh_info),
+            llm_api,
+            deploy_error: deploy_errs.get(&d.name).cloned(),
         });
     }
 
@@ -853,12 +1878,51 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             cli_events,
             relay: Some(snap),
             busy: cur_busy,
+            deploy_error: deploy_errs.get(&name).cloned(),
             ..Default::default()
         });
     }
-    ov.vms.sort_by(|a, b| a.workspace.name.cmp(&b.workspace.name).then(a.name.cmp(&b.name)));
+
+    let mut creating_extra = creating_extra.into_iter();
+    for (name, meta) in creating_pending {
+        let (cli_events, workspace) =
+            creating_extra.next().unwrap_or_else(|| fallback_extra(&name));
+        let acc_upper = meta.accelerator.trim().to_uppercase();
+        let variant = if matches!(acc_upper.as_str(), "V5E1" | "V6E1") {
+            "TPU".to_string()
+        } else if acc_upper.is_empty() || acc_upper == "CPU" || acc_upper == "NONE" {
+            "DEFAULT".to_string()
+        } else {
+            "GPU".to_string()
+        };
+        let cur_busy = app
+            .busy
+            .l()
+            .get(&name)
+            .cloned()
+            .or_else(|| Some("creating".into()));
+        ov.vms.push(VmView {
+            name: name.clone(),
+            workspace,
+            accelerator: if acc_upper.is_empty() || acc_upper == "NONE" {
+                "CPU".into()
+            } else {
+                acc_upper
+            },
+            variant,
+            high_ram: meta.high_mem,
+            managed: true,
+            cli_events,
+            busy: cur_busy,
+            deploy_error: deploy_errs.get(&name).cloned(),
+            ..Default::default()
+        });
+    }
+
+    ov.vms
+        .sort_by(|a, b| a.workspace.name.cmp(&b.workspace.name).then(a.name.cmp(&b.name)));
     ov.recent_sessions = recent;
-    ov.llm_bluegreen = bg;
+    ov.llm_bluegreen = live_bg;
 
     *app.overview.write().await = ov.clone();
     ov
@@ -866,7 +1930,92 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
 
 // ───────────────────────────── 彻底销毁（保留底层能力供 CLI 测试使用） ─────────────────────────────
 
-fn cleanup_llm_bluegreen_after_terminate(terminated_name: &str, remaining_endpoints: &[String], steps: &mut Vec<String>) {
+#[cfg(windows)]
+fn query_process_image_path(pid: u32) -> Option<PathBuf> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
+        fn QueryFullProcessImageNameW(
+            process: isize,
+            flags: u32,
+            exe_name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+        fn CloseHandle(object: isize) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; 1024];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
+        let _ = CloseHandle(h);
+        if ok == 0 || size == 0 {
+            return None;
+        }
+        Some(PathBuf::from(String::from_utf16_lossy(&buf[..size as usize])))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn query_process_image_path(pid: u32) -> Option<PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn query_process_image_path(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+fn is_same_executable_pid(pid: u32) -> bool {
+    let Some(target) = query_process_image_path(pid) else {
+        return false;
+    };
+    let Ok(me) = std::env::current_exe() else {
+        return false;
+    };
+    if let (Ok(c1), Ok(c2)) = (std::fs::canonicalize(&target), std::fs::canonicalize(&me)) {
+        return c1 == c2;
+    }
+    #[cfg(windows)]
+    {
+        target
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&me.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        target == me
+    }
+}
+
+fn is_python_process_pid(pid: u32) -> bool {
+    let Some(img) = query_process_image_path(pid) else {
+        return false;
+    };
+    img.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|stem| {
+            let lower = stem.to_ascii_lowercase();
+            lower.starts_with("python") || lower == "uv"
+        })
+        .unwrap_or(false)
+}
+
+fn cleanup_llm_bluegreen_after_terminate(
+    terminated_name: &str,
+    remaining_endpoints: &[String],
+    steps: &mut Vec<String>,
+) {
     let state_path = cli::llm_bluegreen_state_path();
     let Some(mut bg) = cli::read_llm_bluegreen_state() else {
         return;
@@ -876,15 +2025,26 @@ fn cleanup_llm_bluegreen_after_terminate(terminated_name: &str, remaining_endpoi
         .and_then(|x| x.as_str())
         .unwrap_or("llm")
         .to_string();
+    let active_session = bg
+        .get("active_session")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     let blue_name = format!("{prefix}-blue");
     let green_name = format!("{prefix}-green");
-    if terminated_name != blue_name && terminated_name != green_name && !terminated_name.starts_with("llm-") {
+    let relevant = terminated_name == blue_name
+        || terminated_name == green_name
+        || terminated_name == active_session
+        || terminated_name.starts_with("llm-")
+        || terminated_name.starts_with("orphan-")
+        || remaining_endpoints.is_empty();
+    if !relevant {
         return;
     }
 
     let sessions = cli::read_sessions();
     let slot_still_on_server = |slot_vm: &str| -> bool {
-        if slot_vm == terminated_name {
+        if slot_vm.is_empty() || slot_vm == terminated_name {
             return false;
         }
         sessions
@@ -902,15 +2062,8 @@ fn cleanup_llm_bluegreen_after_terminate(terminated_name: &str, remaining_endpoi
         let pid_path = cli::colab_config_dir().join("llm_local_gateway.pid");
         if let Ok(raw_pid) = std::fs::read_to_string(&pid_path) {
             if let Ok(pid) = raw_pid.trim().parse::<u32>() {
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/F", "/T", "/PID", &pid.to_string()])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .creation_flags(0x0800_0000)
-                        .status();
+                if pid > 0 && pid != std::process::id() && is_python_process_pid(pid) {
+                    kill_process_tree(pid);
                 }
             }
             let _ = std::fs::remove_file(&pid_path);
@@ -918,18 +2071,50 @@ fn cleanup_llm_bluegreen_after_terminate(terminated_name: &str, remaining_endpoi
         steps.push("已同步清理本机 LLM 蓝绿状态与本地网关隧道进程".into());
     } else {
         let surviving_slot = if blue_alive { "blue" } else { "green" };
+        let surviving_sess = format!("{prefix}-{surviving_slot}");
         if let Some(obj) = bg.as_object_mut() {
             obj.insert("active_slot".into(), Value::String(surviving_slot.into()));
+            obj.insert("active_session".into(), Value::String(surviving_sess));
             obj.insert("standby_slot".into(), Value::Null);
             obj.insert("phase".into(), Value::String("serving".into()));
         }
         if let Ok(raw) = serde_json::to_string_pretty(&bg) {
-            let _ = std::fs::write(&state_path, raw);
+            let tmp = state_path.with_extension("json.tmp");
+            if std::fs::write(&tmp, &raw).is_ok() {
+                let _ = std::fs::rename(&tmp, &state_path);
+            } else {
+                let _ = std::fs::write(&state_path, raw);
+            }
         }
         steps.push(format!(
             "已更新蓝绿状态：当前由剩余在线槽位 [{}] 继续提供服务",
             surviving_slot.to_uppercase()
         ));
+    }
+}
+
+fn cleanup_local_vm_artifacts(app: &AppState, name: &str) {
+    app.set_deploy_error(name, None);
+    app.creating_vms.l().remove(name);
+    let remaining_ssh: Option<Vec<(String, u16)>> = {
+        let mut bridges = app.ssh_bridges.l();
+        if let Some(b) = bridges.remove(name) {
+            b.shutdown();
+            Some(
+                bridges
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.local_port))
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    };
+    if let Some(entries) = remaining_ssh {
+        cli::sync_ssh_config_hosts(&entries);
+    }
+    if name.starts_with("orphan-") {
+        cli::remove_llm_api_key_entry(name);
     }
 }
 
@@ -945,42 +2130,150 @@ pub async fn hard_terminate(
     };
 
     let mut stopped_local_relay = false;
-    if stop_relay {
-        if let Some(h) = app.relay(name) {
-            if h.is_running() {
+    let mut stopped_during_provisioning = false;
+    let mut pre_prov_endpoints: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    if let Some(h) = app.relay(name) {
+        pre_prov_endpoints = h.pre_provision_endpoints.l().clone();
+        if stop_relay {
+            h.keep_vm_on_stop
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            if h.is_running() || h.task_alive.load(std::sync::atomic::Ordering::SeqCst) {
                 h.stop().await;
                 stopped_local_relay = true;
-                r.steps.push("已停止本机接力监工任务并结束 colab exec 进程树".into());
+                stopped_during_provisioning = h
+                    .stopped_during_provisioning
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                r.steps
+                    .push("已停止本机接力监工任务并结束 colab 子进程树".into());
             }
+        } else {
+            stopped_during_provisioning = h
+                .stopped_during_provisioning
+                .load(std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    if stopped_local_relay {
+        tokio::time::sleep(Duration::from_millis(if cfg!(test) { 10 } else { 300 })).await;
     }
 
     let sessions = cli::read_sessions();
     let managed = sessions.contains_key(name);
+    let other_session_endpoints: std::collections::HashSet<String> = sessions
+        .iter()
+        .filter(|(k, _)| k.as_str() != name && !k.starts_with("orphan-"))
+        .filter_map(|(_, v)| session_endpoint(v))
+        .collect();
+
+    let mut initial_assignments = app.client.list_assignments().await;
     let mut endpoint = endpoint_hint
         .filter(|e| !e.is_empty())
         .or_else(|| sessions.get(name).and_then(session_endpoint));
     if endpoint.is_none() {
-        if let Ok(list) = app.client.list_assignments().await {
+        if let Ok(ref list) = initial_assignments {
             endpoint = list
                 .iter()
-                .find(|a| orphan_name(&a.endpoint) == name)
+                .find(|a| matches_orphan_name(&a.endpoint, name))
                 .map(|a| a.endpoint.clone());
         }
     }
+
+    // 若刚中止了 provisioning 阶段的 colab new，服务端分配可能晚几百毫秒才出现在 /tun/m/assignments
+    if endpoint.is_none() && (stopped_during_provisioning || stopped_local_relay) {
+        let max_probes = if stopped_during_provisioning { 3 } else { 1 };
+        for probe in 0..max_probes {
+            if let Ok(ref list) = initial_assignments {
+                let newly_leaked: Vec<String> = list
+                    .iter()
+                    .map(|a| a.endpoint.clone())
+                    .filter(|e| !other_session_endpoints.contains(e) && !pre_prov_endpoints.contains(e))
+                    .collect();
+                if newly_leaked.len() == 1 {
+                    let leaked_ep = newly_leaked[0].clone();
+                    r.steps.push(format!(
+                        "捕获到取消分配期间新诞生的残留实例 {leaked_ep}，正在自动释放"
+                    ));
+                    endpoint = Some(leaked_ep);
+                    break;
+                }
+            }
+            if probe + 1 < max_probes {
+                tokio::time::sleep(Duration::from_millis(if cfg!(test) { 15 } else { 700 })).await;
+                initial_assignments = app.client.list_assignments().await;
+                if let Ok(ref list) = initial_assignments {
+                    if let Some(ep_found) = list
+                        .iter()
+                        .find(|a| matches_orphan_name(&a.endpoint, name))
+                        .map(|a| a.endpoint.clone())
+                    {
+                        endpoint = Some(ep_found);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     r.endpoint = endpoint.clone();
 
     let Some(ep) = endpoint else {
-        if stopped_local_relay {
-            r.verified_unassigned = true;
-            r.steps.push("当前处于换棒间隙（云端无计费实例），本机接力任务已终止".into());
-        } else if let Ok(list) = app.client.list_assignments().await {
-            r.remaining_endpoints = list.iter().map(|a| a.endpoint.clone()).collect();
-            r.verified_unassigned = true;
-            r.steps.push("服务端计费列表中已不存在该实例（无需重复释放）".into());
-            cleanup_llm_bluegreen_after_terminate(name, &r.remaining_endpoints, &mut r.steps);
-        } else {
-            r.error = Some("无法确定该虚拟机的 endpoint，服务端计费列表中也未找到".into());
+        match initial_assignments {
+            Ok(list) => {
+                r.remaining_endpoints = list.iter().map(|a| a.endpoint.clone()).collect();
+                let unaccounted: Vec<String> = r
+                    .remaining_endpoints
+                    .iter()
+                    .filter(|e| !other_session_endpoints.contains(*e))
+                    .cloned()
+                    .collect();
+                let can_verify_absent = list.is_empty()
+                    || ((stopped_local_relay || managed) && unaccounted.is_empty());
+                if can_verify_absent {
+                    r.verified_unassigned = true;
+                    if stopped_local_relay {
+                        r.steps.push(
+                            "服务端核验通过：未产生未受管残留计费实例，本机接力任务已终止".into(),
+                        );
+                    } else {
+                        r.steps
+                            .push("服务端计费列表中已不存在该实例（无需重复释放）".into());
+                    }
+                    if managed && cli::colab_bin().exists() {
+                        let _ = cli::run_simple(
+                            &cli::colab_bin(),
+                            &s(&["sessions"]),
+                            Duration::from_secs(60),
+                        )
+                        .await;
+                    }
+                    cleanup_local_vm_artifacts(app, name);
+                    cleanup_llm_bluegreen_after_terminate(
+                        name,
+                        &r.remaining_endpoints,
+                        &mut r.steps,
+                    );
+                } else if !unaccounted.is_empty() {
+                    r.verified_unassigned = false;
+                    r.error = Some(format!(
+                        "无法将 [{name}] 映射到会话表，但服务端仍存在 {} 台未关联计费实例（{}），请刷新总览后销毁残留孤儿实例",
+                        unaccounted.len(),
+                        unaccounted.join(", ")
+                    ));
+                } else {
+                    r.verified_unassigned = false;
+                    r.error = Some(format!(
+                        "未找到名为 [{name}] 的本地会话或匹配实例（当前服务端仍有 {} 台其他受管实例在线），未执行任何释放操作",
+                        r.remaining_endpoints.len()
+                    ));
+                }
+            }
+            Err(e) => {
+                r.verified_unassigned = false;
+                r.error = Some(format!(
+                    "无法确定 [{name}] 的 endpoint，且查询服务端计费列表失败：{e}"
+                ));
+            }
         }
         if let Ok(c) = app.client.ccu_info().await {
             r.ccu = Some(c);
@@ -988,11 +2281,18 @@ pub async fn hard_terminate(
         return r;
     };
 
-    if managed && cli::colab_bin().exists() {
-        match cli::run_simple(&cli::colab_bin(), &s(&["stop", "-s", name]), Duration::from_secs(120)).await {
+    if managed && !name.starts_with("orphan-") && cli::colab_bin().exists() {
+        match cli::run_simple(
+            &cli::colab_bin(),
+            &s(&["stop", "-s", name]),
+            Duration::from_secs(120),
+        )
+        .await
+        {
             Ok(o) => {
-                let last = o.output.trim().lines().last().unwrap_or("").to_string();
-                r.steps.push(format!("colab stop -s {name}：{}", if last.is_empty() { "已执行".into() } else { last }));
+                let cleaned = cli::strip_colab_cli_banners(&o.output);
+                let last = cli::last_meaningful_cli_line(&cleaned, "已执行");
+                r.steps.push(format!("colab stop -s {name}：{last}"));
             }
             Err(e) => r.steps.push(format!("colab stop 执行失败：{e}")),
         }
@@ -1011,13 +2311,28 @@ pub async fn hard_terminate(
                     break;
                 }
                 match app.client.unassign(&ep).await {
-                    Ok(_) => r.steps.push(format!("第 {attempt} 次直接调用 /tun/m/unassign/{ep} 成功")),
+                    Ok(_) => r
+                        .steps
+                        .push(format!("第 {attempt} 次直接调用 /tun/m/unassign/{ep} 成功")),
                     Err(e) => r.steps.push(format!("第 {attempt} 次 unassign 返回：{e}")),
                 }
             }
             Err(e) => r.steps.push(format!("第 {attempt} 次核验请求失败：{e}")),
         }
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tokio::time::sleep(Duration::from_millis(if cfg!(test) { 10 } else { 1500 })).await;
+    }
+
+    if !r.verified_unassigned {
+        if let Ok(list) = app.client.list_assignments().await {
+            r.remaining_endpoints = list.iter().map(|a| a.endpoint.clone()).collect();
+            if !r.remaining_endpoints.contains(&ep) {
+                r.verified_unassigned = true;
+                r.steps.push(format!(
+                    "最终核验通过：/tun/m/assignments 中已不存在 {ep}（剩余计费实例 {} 台）",
+                    r.remaining_endpoints.len()
+                ));
+            }
+        }
     }
 
     if r.verified_unassigned {
@@ -1026,12 +2341,15 @@ pub async fn hard_terminate(
             list.retain(|a| a.endpoint != ep);
         }
         if cli::read_sessions().contains_key(name) && cli::colab_bin().exists() {
-            let _ = cli::run_simple(&cli::colab_bin(), &s(&["sessions"]), Duration::from_secs(60)).await;
+            let _ =
+                cli::run_simple(&cli::colab_bin(), &s(&["sessions"]), Duration::from_secs(60)).await;
             r.steps.push("已同步清理 colab-cli 本地会话表".into());
         }
+        cleanup_local_vm_artifacts(app, name);
         cleanup_llm_bluegreen_after_terminate(name, &r.remaining_endpoints, &mut r.steps);
     } else {
-        r.error = Some("服务端计费列表中仍存在该实例，未执行本地移除（避免假性删除），请重试".into());
+        r.error =
+            Some("服务端计费列表中仍存在该实例，未执行本地移除（避免假性删除），请重试".into());
     }
 
     if let Ok(c) = app.client.ccu_info().await {
@@ -1071,23 +2389,588 @@ async fn refresh_now(handle: AppHandle, state: AppStateRef<'_>) -> Result<Overvi
     Ok(ov)
 }
 
-#[derive(Deserialize)]
-struct CreateVmRequest {
-    name: Option<String>,
-    accelerator: String,
-    high_mem: bool,
-    auto_relay: bool,
-    relay_config: Option<RelayConfig>,
+#[derive(Deserialize, Serialize, Clone, Default, Debug)]
+pub struct CreateVmLlmConfig {
+    pub engine: String,
+    #[serde(alias = "model")]
+    pub model_name: String,
+    #[serde(default)]
+    pub slot: Option<String>,
+    #[serde(default)]
+    pub gdrive_model_path: Option<String>,
+    #[serde(default)]
+    pub custom_api_key: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Default, Debug)]
+pub struct CreateVmEnvConfig {
+    #[serde(default)]
+    pub sync_rclone: bool,
+    #[serde(default)]
+    pub mount_gdrive: bool,
+    #[serde(default)]
+    pub pip_packages: Option<String>,
+    #[serde(default)]
+    pub install_workspace_requirements: bool,
+    #[serde(default)]
+    pub startup_script: Option<String>,
+    #[serde(default)]
+    pub env_vars: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Default, Debug)]
+pub struct CreateVmRequest {
+    pub name: Option<String>,
+    pub accelerator: String,
+    #[serde(default)]
+    pub high_mem: bool,
+    #[serde(default)]
+    pub auth_mode: Option<String>,
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub boot_mode: Option<String>,
+    #[serde(default)]
+    pub auto_relay: bool,
+    #[serde(default)]
+    pub relay_config: Option<RelayConfig>,
+    #[serde(default)]
+    pub llm_config: Option<CreateVmLlmConfig>,
+    #[serde(default)]
+    pub env_config: Option<CreateVmEnvConfig>,
 }
 
 fn valid_name(n: &str) -> bool {
     !n.is_empty()
         && n.len() <= 40
-        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && !n.starts_with('-')
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+pub(crate) fn normalize_llm_engine(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "vllm" => "vllm".into(),
+        "ollama" => "ollama".into(),
+        "llamacpp" | "llama_cpp" | "llama.cpp" | "gguf" => "llama.cpp".into(),
+        "transformers" | "hf" => "transformers".into(),
+        "builtin" => "builtin".into(),
+        other => other.into(),
+    }
+}
+
+fn normalize_llm_slot(slot_opt: Option<&str>, vm_name: &str) -> String {
+    let raw = slot_opt.unwrap_or("").trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "blue" | "green" | "standalone" => raw,
+        _ if vm_name.ends_with("-blue") => "blue".into(),
+        _ if vm_name.ends_with("-green") => "green".into(),
+        _ => "standalone".into(),
+    }
+}
+
+pub(crate) fn validate_pip_packages(raw: &str) -> Result<Vec<String>, String> {
+    let mut pkgs = Vec::new();
+    for tok in raw.split_whitespace() {
+        if tok.starts_with('-') {
+            return Err(format!("pip 包名不允许携带命令行选项 `{tok}`"));
+        }
+        if tok.len() > 160
+            || !tok.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(
+                        c,
+                        '_' | '.' | '-' | '[' | ']' | '=' | '<' | '>' | '!' | '~' | '+' | ','
+                    )
+            })
+        {
+            return Err(format!("非法的 pip 包依赖格式 `{tok}`"));
+        }
+        pkgs.push(tok.to_string());
+    }
+    Ok(pkgs)
+}
+
+fn parse_env_vars(raw: &str) -> Result<Vec<(String, String)>, String> {
+    let mut pairs = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let body = trimmed
+            .strip_prefix("export ")
+            .map(str::trim)
+            .unwrap_or(trimmed);
+        let Some((k, v)) = body.split_once('=') else {
+            return Err(format!("环境变量格式应为 KEY=VALUE：`{trimmed}`"));
+        };
+        let key = k.trim();
+        let mut chars = key.chars();
+        let valid_key = match chars.next() {
+            Some(first) if first.is_ascii_alphabetic() || first == '_' => {
+                key.len() <= 64 && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }
+            _ => false,
+        };
+        if !valid_key {
+            return Err(format!("非法的环境变量名 `{key}`"));
+        }
+        let upper = key.to_ascii_uppercase();
+        if matches!(upper.as_str(), "LD_PRELOAD" | "LD_LIBRARY_PATH" | "PROMPT_COMMAND") {
+            return Err(format!("出于安全限制，不允许覆盖系统敏感变量 `{key}`"));
+        }
+        let mut val = v.trim().to_string();
+        if val.len() >= 2
+            && ((val.starts_with('"') && val.ends_with('"'))
+                || (val.starts_with('\'') && val.ends_with('\'')))
+        {
+            val = val[1..val.len() - 1].to_string();
+        }
+        pairs.push((key.to_string(), val));
+    }
+    Ok(pairs)
+}
+
+fn write_if_changed(path: &Path, content: &str) -> bool {
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    let unchanged = std::fs::read_to_string(path)
+        .map(|cur| cur == content)
+        .unwrap_or(false);
+    if unchanged {
+        return true;
+    }
+    std::fs::write(path, content).is_ok()
+}
+
+/// 确保 5 个内嵌 Python 技能脚本在 `~/.config/colab-cli/skills` 下始终与当前二进制版本一致并落盘：
+/// - 正式构建（`not(debug_assertions)`）及任何外部用户工作区一律返回释放自 `include_str!` 的最新内嵌脚本路径，
+///   严禁盲目信任用户工作区（如旧版项目目录 `.agents/skills`）中未同步升级的旧脚本；
+/// - 仅在 `debug_assertions` 开发态且 `workspace` 恰好为当前编译期源码仓库根目录时，才直接复用源码目录脚本。
+fn ensure_skill_scripts(workspace: &Path) -> Option<PathBuf> {
+    let root = cli::colab_config_dir().join("skills");
+    let bg_dir = root.join("colab-llm-bluegreen").join("scripts");
+    let relay_dir = root.join("colab-dl-relay").join("scripts");
+
+    let mgr_path = bg_dir.join("llm_bluegreen_manager.py");
+    let gw_path = bg_dir.join("llm_local_gateway.py");
+    let sidecar_path = bg_dir.join("llm_metrics_sidecar.py");
+    let relay_path = relay_dir.join("dl_relay_runner.py");
+    let adapter_path = relay_dir.join("colab_relay_adapter.py");
+
+    let embedded_ok = write_if_changed(&mgr_path, LLM_BLUEGREEN_MANAGER_PY)
+        && write_if_changed(&gw_path, LLM_LOCAL_GATEWAY_PY)
+        && write_if_changed(&sidecar_path, LLM_METRICS_SIDECAR_PY);
+    let _ = write_if_changed(&relay_path, DL_RELAY_RUNNER_PY);
+    let _ = write_if_changed(&adapter_path, COLAB_RELAY_ADAPTER_PY);
+
+    #[cfg(debug_assertions)]
+    {
+        let is_current_dev_repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|dev_root| dev_root == workspace)
+            .unwrap_or(false);
+        if is_current_dev_repo {
+            let ws_bg_dir = workspace
+                .join(".agents")
+                .join("skills")
+                .join("colab-llm-bluegreen")
+                .join("scripts");
+            let ws_mgr = ws_bg_dir.join("llm_bluegreen_manager.py");
+            let ws_gw = ws_bg_dir.join("llm_local_gateway.py");
+            let ws_sidecar = ws_bg_dir.join("llm_metrics_sidecar.py");
+            if ws_mgr.exists() && ws_gw.exists() && ws_sidecar.exists() {
+                return Some(ws_mgr);
+            }
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = workspace;
+
+    if embedded_ok {
+        Some(mgr_path)
+    } else {
+        None
+    }
+}
+
+fn ensure_gateway_script_path(workspace: &Path) -> Option<PathBuf> {
+    let mgr = ensure_skill_scripts(workspace)?;
+    let gw = mgr.with_file_name("llm_local_gateway.py");
+    if gw.exists() {
+        Some(gw)
+    } else {
+        None
+    }
+}
+
+fn has_enabled_env_steps(cfg: &CreateVmEnvConfig) -> bool {
+    cfg.sync_rclone
+        || cfg.mount_gdrive
+        || cfg.install_workspace_requirements
+        || cfg
+            .pip_packages
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        || cfg
+            .startup_script
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        || cfg
+            .env_vars
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+}
+
+async fn apply_post_boot_env_config(
+    app: &Arc<AppState>,
+    vm_name: &str,
+    workspace_dir: &Path,
+    cfg: &CreateVmEnvConfig,
+) -> anyhow::Result<()> {
+    let pip_list = match cfg.pip_packages.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => {
+            validate_pip_packages(raw).map_err(|e| anyhow::anyhow!(e))?
+        }
+        _ => Vec::new(),
+    };
+    let env_pairs = match cfg.env_vars.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => parse_env_vars(raw).map_err(|e| anyhow::anyhow!(e))?,
+        _ => Vec::new(),
+    };
+    let startup_sh = cfg
+        .startup_script
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let a = app
+        .find_assignment_by_name(vm_name)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("未找到刚创建的云端实例 [{vm_name}]"))?;
+
+    let need_rclone = cfg.sync_rclone || cfg.mount_gdrive;
+    if need_rclone {
+        let conf_path = cli::rclone_conf_path();
+        let bytes = std::fs::read(&conf_path).with_context(|| {
+            format!(
+                "未读取到本机 rclone.conf（{}），请先配置 Google Drive",
+                conf_path.display()
+            )
+        })?;
+        app.client
+            .contents_upload(&a, "content/rclone.conf", &bytes)
+            .await
+            .context("上传 rclone.conf 到云端失败")?;
+    }
+
+    let mut uploaded_reqs = false;
+    if cfg.install_workspace_requirements {
+        let req_path = workspace_dir.join("requirements.txt");
+        if let Ok(raw) = std::fs::read_to_string(&req_path) {
+            let has_pkg = raw
+                .lines()
+                .map(str::trim)
+                .any(|l| !l.is_empty() && !l.starts_with('#'));
+            if has_pkg {
+                app.client
+                    .contents_upload(&a, "content/requirements.txt", raw.as_bytes())
+                    .await
+                    .context("上传 requirements.txt 到云端失败")?;
+                uploaded_reqs = true;
+            }
+        }
+    }
+
+    if let Some(ref script_body) = startup_sh {
+        let normalized = script_body.replace("\r\n", "\n");
+        app.client
+            .contents_upload(
+                &a,
+                "content/.colab_pilot_startup.sh",
+                format!("#!/usr/bin/env bash\nset -e\n{normalized}\n").as_bytes(),
+            )
+            .await
+            .context("上传自定义启动脚本失败")?;
+    }
+
+    let payload = serde_json::json!({
+        "need_rclone": need_rclone,
+        "mount_gdrive": cfg.mount_gdrive,
+        "uploaded_reqs": uploaded_reqs,
+        "pip_list": pip_list,
+        "env_pairs": env_pairs,
+        "has_startup": startup_sh.is_some(),
+    });
+    let payload_json = serde_json::to_string(&payload)?;
+    let remote_py = format!(
+        r##"
+import json, os, shlex, shutil, subprocess
+
+cfg = json.loads({payload_literal})
+os.chdir("/content")
+
+env_map = dict(cfg.get("env_pairs") or [])
+if env_map:
+    with open("/content/.colab_pilot_env.json", "w", encoding="utf-8") as f:
+        json.dump(env_map, f, ensure_ascii=False, indent=2)
+    bashrc = os.path.expanduser("~/.bashrc")
+    lines = []
+    for k, v in env_map.items():
+        os.environ[k] = v
+        lines.append(f"export {{k}}={{shlex.quote(v)}}")
+    block = "\n# >>> colab-pilot env >>>\n" + "\n".join(lines) + "\n# <<< colab-pilot env <<<\n"
+    cur = open(bashrc, "r", encoding="utf-8", errors="ignore").read() if os.path.exists(bashrc) else ""
+    if "# >>> colab-pilot env >>>" not in cur:
+        with open(bashrc, "a", encoding="utf-8") as f:
+            f.write(block)
+
+if cfg.get("need_rclone"):
+    if os.path.exists("/content/rclone.conf"):
+        os.chmod("/content/rclone.conf", 0o600)
+        rc_dir = os.path.expanduser("~/.config/rclone")
+        os.makedirs(rc_dir, exist_ok=True)
+        shutil.copy2("/content/rclone.conf", os.path.join(rc_dir, "rclone.conf"))
+    if not shutil.which("rclone"):
+        subprocess.run("curl -fsSL https://rclone.org/install.sh | sudo bash", shell=True, check=False)
+
+if cfg.get("mount_gdrive") and shutil.which("rclone") and os.path.exists("/content/rclone.conf"):
+    os.makedirs("/content/drive", exist_ok=True)
+    subprocess.Popen(
+        [
+            "rclone", "--config", "/content/rclone.conf",
+            "mount", "gdrive:", "/content/drive",
+            "--vfs-cache-mode", "writes", "--allow-non-empty",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+use_uv = shutil.which("uv") is not None
+if cfg.get("uploaded_reqs") and os.path.exists("/content/requirements.txt"):
+    cmd = ["uv", "pip", "install", "--system", "-r", "/content/requirements.txt"] if use_uv else ["pip", "install", "-q", "-r", "/content/requirements.txt"]
+    r = subprocess.run(cmd, check=False)
+    if r.returncode != 0:
+        raise RuntimeError(f"安装 requirements.txt 依赖失败 (exit={{r.returncode}})")
+
+pkgs = cfg.get("pip_list") or []
+if pkgs:
+    cmd = (["uv", "pip", "install", "--system"] + pkgs) if use_uv else (["pip", "install", "-q"] + pkgs)
+    r = subprocess.run(cmd, check=False)
+    if r.returncode != 0:
+        raise RuntimeError(f"安装自定义 pip 包失败 (exit={{r.returncode}})")
+
+if cfg.get("has_startup") and os.path.exists("/content/.colab_pilot_startup.sh"):
+    os.chmod("/content/.colab_pilot_startup.sh", 0o700)
+    r = subprocess.run(["bash", "/content/.colab_pilot_startup.sh"], env=os.environ.copy(), check=False)
+    if r.returncode != 0:
+        raise RuntimeError(f"执行启动脚本失败 (exit={{r.returncode}})")
+
+print("ENV_INIT_OK", flush=True)
+"##,
+        payload_literal = serde_json::to_string(&payload_json)?
+    );
+
+    let out = cli::run_streaming(
+        &cli::colab_bin(),
+        &s(&["exec", "-s", vm_name, "--timeout", "600"]),
+        Some(remote_py),
+        Duration::from_secs(630),
+        None,
+        None,
+        |_| {},
+    )
+    .await?;
+
+    if out.code != 0 || !out.output.contains("ENV_INIT_OK") {
+        let cleaned = cli::strip_colab_cli_banners(&out.output);
+        anyhow::bail!(
+            "初始化环境配置失败：{}",
+            cli::last_meaningful_cli_line(&cleaned, "执行返回非零状态")
+        );
+    }
+    Ok(())
+}
+
+fn spawn_llm_deployment_task(
+    app: Arc<AppState>,
+    handle: AppHandle,
+    vm_name: String,
+    accelerator: String,
+    high_mem: bool,
+    workspace_dir: PathBuf,
+    config: CreateVmLlmConfig,
+) -> LlmApiAccessInfo {
+    let norm_engine = normalize_llm_engine(&config.engine);
+    let slot = normalize_llm_slot(config.slot.as_deref(), &vm_name);
+    let model_name = {
+        let m = config.model_name.trim();
+        if m.is_empty() {
+            "Qwen/Qwen2.5-7B-Instruct".to_string()
+        } else {
+            m.to_string()
+        }
+    };
+    let custom_key = config
+        .custom_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| s.len() >= 8)
+        .map(|s| s.to_string());
+    let gdrive_model = config
+        .gdrive_model_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let preferred_port = match slot.as_str() {
+        "blue" if vm_name.ends_with("-blue") => 18081,
+        "green" if vm_name.ends_with("-green") => 18082,
+        _ => 0,
+    };
+    let api_info = if custom_key.is_some() {
+        cli::rotate_llm_api_key_entry(
+            &vm_name,
+            &slot,
+            &norm_engine,
+            custom_key.as_deref(),
+            preferred_port,
+            8000,
+            &model_name,
+        )
+    } else {
+        cli::resolve_or_create_llm_api_info(
+            &vm_name,
+            &slot,
+            &norm_engine,
+            preferred_port,
+            8000,
+            &model_name,
+        )
+    };
+
+    app.set_deploy_error(&vm_name, None);
+    app.set_busy(&vm_name, Some("deploying_llm"));
+    spawn_refresh(&app, &handle);
+
+    let effective_hm = high_mem && relay::supports_high_mem(&accelerator);
+    tokio::spawn(async move {
+        let Some(mgr_script) = ensure_skill_scripts(&workspace_dir) else {
+            app.release_busy(&vm_name, "deploying_llm");
+            app.set_deploy_error(
+                &vm_name,
+                Some("无法释放内置大模型蓝绿管理脚本 llm_bluegreen_manager.py".into()),
+            );
+            spawn_refresh(&app, &handle);
+            return;
+        };
+
+        let acc_arg = {
+            let u = accelerator.trim().to_uppercase();
+            if u.is_empty() || u == "NONE" {
+                "CPU".to_string()
+            } else {
+                u
+            }
+        };
+        let mut args = vec![
+            "-u".to_string(),
+            mgr_script.to_string_lossy().to_string(),
+            "deploy".to_string(),
+            "--session-name".to_string(),
+            vm_name.clone(),
+            "--slot".to_string(),
+            slot.clone(),
+            "--workspace".to_string(),
+            workspace_dir.to_string_lossy().to_string(),
+            "--gpu".to_string(),
+            acc_arg,
+            if effective_hm {
+                "--high-mem".to_string()
+            } else {
+                "--no-high-mem".to_string()
+            },
+            "--engine".to_string(),
+            norm_engine,
+            "--model-name".to_string(),
+            model_name,
+            "--keep-vm-on-fail".to_string(),
+            "--gateway-port".to_string(),
+            "18080".to_string(),
+        ];
+        if let Some(ref gp) = gdrive_model {
+            args.push("--gdrive-model-path".into());
+            args.push(gp.clone());
+        }
+        if let Some(ref ck) = custom_key {
+            args.push("--api-key".into());
+            args.push(ck.clone());
+        }
+
+        let py = cli::colab_python_bin();
+        let res = cli::run_streaming(
+            &py,
+            &args,
+            None,
+            Duration::from_secs(2700),
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+
+        app.release_busy(&vm_name, "deploying_llm");
+        match res {
+            Ok(o) if o.code == 0 => {
+                app.set_deploy_error(&vm_name, None);
+                spawn_local_gateway_async(workspace_dir).await;
+                if let Some(a) = app.find_assignment_by_name(&vm_name).await {
+                    let bg = cli::read_llm_bluegreen_state();
+                    let entry = fetch_telemetry(&app, &a, Some(&vm_name), bg.as_ref()).await;
+                    if entry.data.is_some() {
+                        app.telemetry.l().insert(a.endpoint.clone(), entry);
+                    }
+                }
+            }
+            Ok(o) => {
+                let cleaned = cli::strip_colab_cli_banners(&o.output);
+                let msg = if o.timed_out {
+                    "云端大模型拉取与预热超时（45 分钟），虚拟机已保留，请通过 SSH 查看 /content/engine.log".to_string()
+                } else {
+                    cli::last_meaningful_cli_line(&cleaned, "大模型引擎启动或预热失败").to_string()
+                };
+                app.set_deploy_error(&vm_name, Some(msg));
+            }
+            Err(e) => {
+                let cleaned = cli::strip_colab_cli_banners(&format!("{e:#}"));
+                app.set_deploy_error(&vm_name, Some(cleaned));
+            }
+        }
+        let ov = refresh_overview_opts(&app, false, true).await;
+        emit_overview(&handle, &ov);
+    });
+
+    api_info
 }
 
 #[tauri::command]
-async fn create_vm(handle: AppHandle, state: AppStateRef<'_>, req: CreateVmRequest) -> Result<String, String> {
+async fn create_vm(
+    handle: AppHandle,
+    state: AppStateRef<'_>,
+    req: CreateVmRequest,
+) -> Result<String, String> {
     let app = state.inner().clone();
     let name = req
         .name
@@ -1095,38 +2978,201 @@ async fn create_vm(handle: AppHandle, state: AppStateRef<'_>, req: CreateVmReque
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| format!("vm-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]));
     if !valid_name(&name) {
-        return Err("名称只能包含字母、数字、- 和 _（不超过 40 个字符）".into());
+        return Err("名称只能包含字母、数字、- 和 _，且不能以 - 开头（不超过 40 个字符）".into());
     }
-    if cli::read_sessions().contains_key(&name) || app.busy.l().contains_key(&name) {
+    if name.starts_with("orphan-") {
+        return Err("实例名称不能以保留前缀 `orphan-` 开头".into());
+    }
+
+    let boot_mode = req
+        .boot_mode
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if req.auto_relay {
+                "relay".into()
+            } else if req.llm_config.is_some() {
+                "llm".into()
+            } else {
+                "general".into()
+            }
+        });
+
+    let effective_high_mem = req.high_mem && relay::supports_high_mem(&req.accelerator);
+
+    // 预先校验附加环境与模式参数，避免分配计费实例后因本地配置错误中断
+    if let Some(ref env_cfg) = req.env_config {
+        if let Some(ref raw_pkgs) = env_cfg.pip_packages {
+            if !raw_pkgs.trim().is_empty() {
+                validate_pip_packages(raw_pkgs)?;
+            }
+        }
+        if let Some(ref raw_env) = env_cfg.env_vars {
+            if !raw_env.trim().is_empty() {
+                parse_env_vars(raw_env)?;
+            }
+        }
+        if (env_cfg.sync_rclone || env_cfg.mount_gdrive) && !cli::rclone_conf_path().exists() {
+            return Err("未检测到本机 rclone.conf，请先完成 Google Drive 授权后再勾选 rclone 同步/挂载".into());
+        }
+    }
+
+    let validated_relay_cfg = if boot_mode == "relay" || req.auto_relay {
+        if !cli::rclone_conf_path().exists() {
+            return Err("未检测到 rclone.conf，请先完成 Google Drive 授权后再开启自动接力".into());
+        }
+        let mut cfg = req.relay_config.unwrap_or_default();
+        cfg.gpu_type = if req.accelerator.trim().eq_ignore_ascii_case("CPU")
+            || req.accelerator.trim().is_empty()
+        {
+            "T4".into()
+        } else {
+            req.accelerator.trim().to_uppercase()
+        };
+        cfg.high_mem = effective_high_mem;
+        relay::validate_relay_config(&cfg).map_err(|e| e.to_string())?;
+        Some(cfg)
+    } else {
+        None
+    };
+
+    let validated_llm_cfg = if boot_mode == "llm" {
+        let cfg = req
+            .llm_config
+            .clone()
+            .ok_or_else(|| "大模型部署模式缺少模型配置参数".to_string())?;
+        let eng = normalize_llm_engine(&cfg.engine);
+        if eng != "builtin" && cfg.model_name.trim().is_empty() {
+            return Err("请填写要部署的大语言模型名称（如 Qwen/Qwen2.5-7B-Instruct）".into());
+        }
+        if cfg
+            .gdrive_model_path
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+            && !cli::rclone_conf_path().exists()
+        {
+            return Err("指定了 Google Drive 模型路径，但本机未检测到 rclone.conf".into());
+        }
+        Some(cfg)
+    } else {
+        None
+    };
+
+    let custom_ws_path = req
+        .workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    if let Some(ref p) = custom_ws_path {
+        if !p.is_dir() {
+            return Err(format!("指定的工作区目录不存在或不是文件夹：{}", p.display()));
+        }
+    }
+    let effective_ws_dir = custom_ws_path
+        .clone()
+        .unwrap_or_else(|| app.workspace.clone());
+    let ws_display_name = effective_ws_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default")
+        .to_string();
+    let desc_clean = req
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    if cli::read_sessions().contains_key(&name)
+        || app.busy.l().contains_key(&name)
+        || app.creating_vms.l().contains_key(&name)
+    {
         return Err(format!("名称 [{name}] 已被占用"));
     }
     if !cli::colab_bin().exists() {
-        return Err("未找到 colab-cli，可执行文件应位于 ~/.local/bin/colab.exe".into());
+        return Err("未找到 colab-cli，可执行文件应位于 ~/.local/bin/colab".into());
     }
 
     if !app.try_claim_busy(&name, "creating") {
         return Err(format!("名称 [{name}] 已被占用"));
     }
+    app.set_deploy_error(&name, None);
+    app.creating_vms.l().insert(
+        name.clone(),
+        CreatingVmMeta {
+            accelerator: req.accelerator.clone(),
+            high_mem: effective_high_mem,
+            workspace_name: ws_display_name.clone(),
+            workspace_path: Some(effective_ws_dir.to_string_lossy().to_string()),
+            description: desc_clean.clone(),
+        },
+    );
+    let had_ws_entry = cli::has_workspace_entry(&name);
+    cli::register_workspace_entry(
+        &name,
+        &ws_display_name,
+        Some(&effective_ws_dir.to_string_lossy()),
+        desc_clean.as_deref(),
+    );
     spawn_refresh(&app, &handle);
 
-    let res = relay::colab_new(&name, &req.accelerator, req.high_mem, &|_l: &str| {}).await;
+    let res = relay::colab_new_with_opts(
+        &name,
+        &req.accelerator,
+        effective_high_mem,
+        req.auth_mode.as_deref(),
+        None,
+        None,
+        &|_l: &str| {},
+    )
+    .await;
+    app.creating_vms.l().remove(&name);
+    *app.last_assignments.l() = None;
+
     if let Err(e) = res {
+        if !had_ws_entry && !cli::read_sessions().contains_key(&name) {
+            cli::remove_workspace_entry(&name);
+        }
         app.set_busy(&name, None);
         spawn_refresh(&app, &handle);
-        return Err(e.to_string());
+        return Err(format!("{e:#}"));
     }
 
     app.set_busy(&name, Some("probing"));
     spawn_refresh(&app, &handle);
     let _ = deploy_probe_inner(&app, &name).await;
+
+    if let Some(ref env_cfg) = req.env_config {
+        if has_enabled_env_steps(env_cfg) {
+            app.set_busy(&name, Some("initializing_env"));
+            spawn_refresh(&app, &handle);
+            if let Err(e) =
+                apply_post_boot_env_config(&app, &name, &effective_ws_dir, env_cfg).await
+            {
+                app.set_deploy_error(&name, Some(format!("{e:#}")));
+            }
+        }
+    }
     app.set_busy(&name, None);
 
-    if req.auto_relay {
-        let mut cfg = req.relay_config.unwrap_or_default();
-        cfg.gpu_type = if req.accelerator == "CPU" { "T4".into() } else { req.accelerator.clone() };
-        cfg.high_mem = req.high_mem;
+    if let Some(cfg) = validated_relay_cfg {
         start_relay_inner(&app, &name, cfg);
+    } else if let Some(llm_cfg) = validated_llm_cfg {
+        spawn_llm_deployment_task(
+            app.clone(),
+            handle.clone(),
+            name.clone(),
+            req.accelerator.clone(),
+            effective_high_mem,
+            effective_ws_dir,
+            llm_cfg,
+        );
     }
+
     spawn_refresh(&app, &handle);
     Ok(name)
 }
@@ -1139,7 +3185,7 @@ async fn delete_vm(
     endpoint: Option<String>,
 ) -> Result<TerminateReceipt, String> {
     let app = state.inner().clone();
-    if app.busy.l().get(&name).map(|b| b == "deleting").unwrap_or(false) {
+    if app.is_deleting(&name) {
         return Err("该虚拟机正在销毁中".into());
     }
     app.set_busy(&name, Some("deleting"));
@@ -1154,7 +3200,11 @@ async fn delete_vm(
 }
 
 #[tauri::command]
-async fn deploy_probe(handle: AppHandle, state: AppStateRef<'_>, name: String) -> Result<(), String> {
+async fn deploy_probe(
+    handle: AppHandle,
+    state: AppStateRef<'_>,
+    name: String,
+) -> Result<(), String> {
     let app = state.inner().clone();
     // 仅在实例空闲时占用 probing 标记；若后台自动探针正在注入则复用其标记，绝不覆盖 deleting / creating
     let claimed = app.try_claim_busy(&name, "probing");
@@ -1169,7 +3219,7 @@ async fn deploy_probe(handle: AppHandle, state: AppStateRef<'_>, name: String) -
         app.release_busy(&name, "probing");
     }
     spawn_refresh(&app, &handle);
-    res.map_err(|e| e.to_string())
+    res.map_err(|e| format!("{e:#}"))
 }
 
 fn start_relay_inner(app: &Arc<AppState>, name: &str, cfg: RelayConfig) -> RelayStatus {
@@ -1187,7 +3237,13 @@ fn start_relay_inner(app: &Arc<AppState>, name: &str, cfg: RelayConfig) -> Relay
         h.log("上一轮接力任务仍在退出中，请稍候");
         return h.snapshot();
     }
-    h.task_alive.store(true, std::sync::atomic::Ordering::SeqCst);
+    h.keep_vm_on_stop
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    h.stopped_during_provisioning
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    h.pre_provision_endpoints.l().clear();
+    h.task_alive
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     h.gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     *h.cancel.l() = tokio_util::sync::CancellationToken::new();
     {
@@ -1209,9 +3265,17 @@ async fn start_relay(
     handle: AppHandle,
     state: AppStateRef<'_>,
     name: String,
-    config: RelayConfig,
+    mut config: RelayConfig,
 ) -> Result<RelayStatus, String> {
     let app = state.inner().clone();
+    if !valid_name(&name) {
+        return Err("非法的实例名称".into());
+    }
+    if app.is_deleting(&name) {
+        return Err("该实例正在销毁中，请稍候".into());
+    }
+    config.high_mem = config.high_mem && relay::supports_high_mem(&config.gpu_type);
+    relay::validate_relay_config(&config).map_err(|e| e.to_string())?;
     if !cli::rclone_conf_path().exists() {
         return Err("未检测到 rclone.conf，请先完成 Google Drive 授权".into());
     }
@@ -1228,25 +3292,54 @@ async fn stop_relay(
     destroy_vm: bool,
 ) -> Result<Option<TerminateReceipt>, String> {
     let app = state.inner().clone();
+    if app.is_deleting(&name) {
+        return Err("该虚拟机正在销毁中".into());
+    }
+    let busy_tag = if destroy_vm { "deleting" } else { "stopping" };
+    app.set_busy(&name, Some(busy_tag));
+    spawn_refresh(&app, &handle);
+
     let mut receipt = None;
-    if let Some(h) = app.relay(&name) {
+    let relay_handle = app.relay(&name);
+    if let Some(ref h) = relay_handle {
+        h.keep_vm_on_stop
+            .store(!destroy_vm, std::sync::atomic::Ordering::SeqCst);
         h.stop().await;
         h.log("⏹ 已关闭接力训练");
-        if destroy_vm {
+    }
+
+    if destroy_vm {
+        if let Some(ref h) = relay_handle {
             h.log("🧹 正在销毁实例并核验停止计费…");
-            let r = hard_terminate(&app, &name, None, false).await;
-            h.log(if r.verified_unassigned { "✅ 实例已彻底销毁，计费已停止" } else { "⚠️ 销毁未通过核验，请重试删除" });
-            receipt = Some(r);
-        } else if cli::read_sessions().contains_key(&name) {
-            let _ = cli::run_simple(
-                &cli::colab_bin(),
-                &s(&["restart-kernel", "-s", &name]),
-                Duration::from_secs(90),
-            )
-            .await;
+        }
+        let r = hard_terminate(&app, &name, None, false).await;
+        if let Some(ref h) = relay_handle {
+            h.log(if r.verified_unassigned {
+                "✅ 实例已彻底销毁，计费已停止"
+            } else {
+                "⚠️ 销毁未通过核验，请重试删除"
+            });
+        }
+        if r.verified_unassigned {
+            app.relays.l().remove(&name);
+        }
+        receipt = Some(r);
+    } else if relay_handle.is_some()
+        && !name.starts_with("orphan-")
+        && cli::read_sessions().contains_key(&name)
+    {
+        let _ = cli::run_simple(
+            &cli::colab_bin(),
+            &s(&["restart-kernel", "-s", &name]),
+            Duration::from_secs(90),
+        )
+        .await;
+        if let Some(ref h) = relay_handle {
             h.log("🔁 已重启远程 Kernel，云端训练进程已中断（实例保留，仍在计费）");
         }
     }
+
+    app.release_busy(&name, busy_tag);
     spawn_refresh(&app, &handle);
     Ok(receipt)
 }
@@ -1269,23 +3362,313 @@ fn read_workspace_files(state: AppStateRef<'_>) -> WorkspaceFiles {
 }
 
 #[tauri::command]
-fn save_workspace_files(state: AppStateRef<'_>, train_py: String, requirements_txt: String) -> Result<(), String> {
+fn save_workspace_files(
+    state: AppStateRef<'_>,
+    train_py: String,
+    requirements_txt: String,
+) -> Result<(), String> {
+    const MAX_BYTES: usize = 1024 * 1024;
+    if train_py.len() > MAX_BYTES || requirements_txt.len() > MAX_BYTES {
+        return Err("脚本文本大小超出 1 MiB 限制".into());
+    }
     let ws = &state.workspace;
+    for fname in ["train.py", "requirements.txt"] {
+        let target = ws.join(fname);
+        if let Ok(meta) = std::fs::symlink_metadata(&target) {
+            if meta.file_type().is_symlink() {
+                return Err(format!("拒绝写入符号链接文件: {fname}"));
+            }
+        }
+    }
     std::fs::write(ws.join("train.py"), train_py).map_err(|e| e.to_string())?;
     std::fs::write(ws.join("requirements.txt"), requirements_txt).map_err(|e| e.to_string())?;
     Ok(())
 }
 
+#[tauri::command]
+async fn open_vm_ssh_terminal(state: AppStateRef<'_>, name: String) -> Result<String, String> {
+    let vm_name = name.trim().to_string();
+    if !cli::is_safe_vm_alias(&vm_name) {
+        return Err("非法的实例名称".into());
+    }
+    let app = state.inner().clone();
+    let a = app
+        .find_assignment_by_name(&vm_name)
+        .await
+        .ok_or_else(|| format!("服务端未找到在线实例 [{vm_name}]，请先刷新状态"))?;
+
+    let tty_script = cli::colab_config_dir().join("pilot_tty_console.py");
+    if !write_if_changed(&tty_script, INTERACTIVE_TTY_CONSOLE_PY) {
+        return Err("无法写入交互式远程终端桥接脚本 pilot_tty_console.py".into());
+    }
+
+    let is_orphan = vm_name.starts_with("orphan-") || !cli::read_sessions().contains_key(&vm_name);
+    let colab_bin = cli::colab_bin();
+    let py_bin = cli::colab_python_bin();
+    let ssh_key_path = tokio::task::spawn_blocking(|| {
+        let ssh_dir = cli::ssh_dir();
+        let cfg_path = cli::ssh_config_path();
+        cli::ensure_ssh_dir_and_config_acl(
+            &ssh_dir,
+            cfg_path.exists().then_some(cfg_path.as_path()),
+        );
+        cli::ensure_ssh_keypair()
+    })
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .map(|(p, _)| p)
+    .unwrap_or_else(cli::pilot_ssh_private_key_path);
+    let has_ssh_key = ssh_key_path.exists() && cli::pilot_ssh_public_key_path().exists();
+
+    #[cfg(windows)]
+    {
+        use base64::Engine as _;
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
+        // 零拼接静态 PowerShell 脚本：所有动态路径与凭据均通过子进程私有环境变量传递，不在命令行暴露代理令牌
+        const PS_LAUNCH_SCRIPT: &str = r#"
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$vm = $env:COLAB_PILOT_VM_NAME
+$host.UI.RawUI.WindowTitle = "Colab Pilot Terminal - $vm"
+if ($env:COLAB_PILOT_IS_ORPHAN -eq "1" -or -not (Test-Path -LiteralPath $env:COLAB_PILOT_BIN)) {
+    Write-Host "[Colab Pilot] 正在通过内置 Jupyter /api/terminals 交互终端直连云端容器 ($vm) ..." -ForegroundColor Cyan
+    & $env:COLAB_PILOT_PY_BIN -u $env:COLAB_PILOT_TTY_SCRIPT
+} else {
+    Write-Host "[Colab Pilot] 正在通过 colab ssh 连接云端实例 ($vm) ..." -ForegroundColor Cyan
+    if ($env:COLAB_PILOT_HAS_SSH_KEY -eq "1" -and (Test-Path -LiteralPath $env:COLAB_PILOT_SSH_KEY)) {
+        & $env:COLAB_PILOT_BIN ssh -i $env:COLAB_PILOT_SSH_KEY -s $vm
+    } else {
+        & $env:COLAB_PILOT_BIN ssh -s $vm
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host "[Colab Pilot] colab ssh 返回退出码 $LASTEXITCODE，正在无缝回退至 Jupyter /api/terminals 交互终端 ..." -ForegroundColor Yellow
+        & $env:COLAB_PILOT_PY_BIN -u $env:COLAB_PILOT_TTY_SCRIPT
+    }
+}
+Remove-Item Env:COLAB_PILOT_PROXY_TOKEN -ErrorAction SilentlyContinue
+"#;
+        let utf16_bytes: Vec<u8> = PS_LAUNCH_SCRIPT
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&utf16_bytes);
+
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args([
+            "-NoLogo",
+            "-NoExit",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            &encoded,
+        ])
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("COLAB_PILOT_VM_NAME", &vm_name)
+        .env("COLAB_PILOT_IS_ORPHAN", if is_orphan { "1" } else { "0" })
+        .env("COLAB_PILOT_BIN", &colab_bin)
+        .env("COLAB_PILOT_PY_BIN", &py_bin)
+        .env("COLAB_PILOT_TTY_SCRIPT", &tty_script)
+        .env("COLAB_PILOT_SSH_KEY", &ssh_key_path)
+        .env("COLAB_PILOT_HAS_SSH_KEY", if has_ssh_key { "1" } else { "0" })
+        .env("COLAB_PILOT_PROXY_URL", &a.runtime_proxy_info.url)
+        .env("COLAB_PILOT_PROXY_TOKEN", &a.runtime_proxy_info.token)
+        .creation_flags(CREATE_NEW_CONSOLE);
+
+        cmd.spawn()
+            .map_err(|e| format!("无法拉起 PowerShell 交互终端窗口：{e}"))?;
+    }
+
+    #[cfg(not(windows))]
+    {
+        let shell_cmd = r#"if [ "$COLAB_PILOT_IS_ORPHAN" = "1" ] || [ ! -x "$COLAB_PILOT_BIN" ]; then "$COLAB_PILOT_PY_BIN" -u "$COLAB_PILOT_TTY_SCRIPT"; elif [ "$COLAB_PILOT_HAS_SSH_KEY" = "1" ] && [ -f "$COLAB_PILOT_SSH_KEY" ]; then "$COLAB_PILOT_BIN" ssh -i "$COLAB_PILOT_SSH_KEY" -s "$COLAB_PILOT_VM_NAME" || "$COLAB_PILOT_PY_BIN" -u "$COLAB_PILOT_TTY_SCRIPT"; else "$COLAB_PILOT_BIN" ssh -s "$COLAB_PILOT_VM_NAME" || "$COLAB_PILOT_PY_BIN" -u "$COLAB_PILOT_TTY_SCRIPT"; fi; exec "${SHELL:-bash}""#;
+        let mut launched = false;
+        for (term, flag) in [
+            ("x-terminal-emulator", "-e"),
+            ("gnome-terminal", "--"),
+            ("konsole", "-e"),
+            ("xfce4-terminal", "-x"),
+            ("xterm", "-e"),
+        ] {
+            let mut cmd = std::process::Command::new(term);
+            cmd.args([flag, "sh", "-c", shell_cmd])
+                .env("PYTHONUTF8", "1")
+                .env("COLAB_PILOT_VM_NAME", &vm_name)
+                .env("COLAB_PILOT_IS_ORPHAN", if is_orphan { "1" } else { "0" })
+                .env("COLAB_PILOT_BIN", &colab_bin)
+                .env("COLAB_PILOT_PY_BIN", &py_bin)
+                .env("COLAB_PILOT_TTY_SCRIPT", &tty_script)
+                .env("COLAB_PILOT_SSH_KEY", &ssh_key_path)
+                .env("COLAB_PILOT_HAS_SSH_KEY", if has_ssh_key { "1" } else { "0" })
+                .env("COLAB_PILOT_PROXY_URL", &a.runtime_proxy_info.url)
+                .env("COLAB_PILOT_PROXY_TOKEN", &a.runtime_proxy_info.token);
+            if cmd.spawn().is_ok() {
+                launched = true;
+                break;
+            }
+        }
+        if !launched {
+            return Err("未找到系统图形终端模拟器，请复制卡片上的 SSH 命令在终端中执行".into());
+        }
+    }
+
+    Ok(if is_orphan {
+        format!("已打开 [{vm_name}] 的 /colab/tty 云端交互终端窗口")
+    } else {
+        format!("已打开 [{vm_name}] 的 SSH 交互终端窗口")
+    })
+}
+
+#[tauri::command]
+async fn rotate_llm_api_key(
+    handle: AppHandle,
+    state: AppStateRef<'_>,
+    vm_name: String,
+    custom_key: Option<String>,
+) -> Result<LlmApiAccessInfo, String> {
+    let target = vm_name.trim().to_string();
+    if !cli::is_safe_vm_alias(&target) {
+        return Err("非法的实例名称".into());
+    }
+    if let Some(ref ck) = custom_key {
+        let trimmed = ck.trim();
+        if !trimmed.is_empty() && trimmed.len() < 8 {
+            return Err("自定义 API Key 长度至少需要 8 个字符".into());
+        }
+        if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err("自定义 API Key 不能包含空格或控制字符".into());
+        }
+    }
+
+    let app = state.inner().clone();
+    let existing_vm = app
+        .overview
+        .read()
+        .await
+        .vms
+        .iter()
+        .find(|v| v.name == target)
+        .cloned();
+
+    let (slot, engine, local_port, remote_port, model_name) = match existing_vm
+        .as_ref()
+        .and_then(|v| v.llm_api.as_ref())
+    {
+        Some(cur) => (
+            cur.slot.clone(),
+            cur.engine.clone(),
+            cur.local_port,
+            cur.remote_port,
+            cur.model_name.clone(),
+        ),
+        None => {
+            let slot = normalize_llm_slot(None, &target);
+            let lp = match slot.as_str() {
+                "blue" if target.ends_with("-blue") => 18081,
+                "green" if target.ends_with("-green") => 18082,
+                _ => 0,
+            };
+            (slot, "vllm".into(), lp, 8000, "default".into())
+        }
+    };
+
+    let ck_clean = custom_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let workspace_dir = app.workspace.clone();
+
+    let updated = tokio::task::spawn_blocking(move || {
+        cli::rotate_llm_api_key_entry(
+            &target,
+            &slot,
+            &engine,
+            ck_clean.as_deref(),
+            local_port,
+            remote_port,
+            &model_name,
+        )
+    })
+    .await
+    .map_err(|e| format!("更新 API Key 失败: {e}"))?;
+
+    spawn_local_gateway_async(workspace_dir).await;
+    spawn_refresh(&app, &handle);
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn deploy_llm_on_vm(
+    handle: AppHandle,
+    state: AppStateRef<'_>,
+    name: String,
+    config: CreateVmLlmConfig,
+) -> Result<LlmApiAccessInfo, String> {
+    let vm_name = name.trim().to_string();
+    if !valid_name(&vm_name) {
+        return Err("非法的实例名称".into());
+    }
+    if vm_name.starts_with("orphan-") {
+        return Err("浏览器未纳管孤儿实例不支持直接部署蓝绿推理栈，请通过界面新建受管实例".into());
+    }
+    let eng = normalize_llm_engine(&config.engine);
+    if eng != "builtin" && config.model_name.trim().is_empty() {
+        return Err("请填写要部署的大语言模型名称（如 Qwen/Qwen2.5-7B-Instruct）".into());
+    }
+
+    let app = state.inner().clone();
+    if let Some(cur_busy) = app.busy.l().get(&vm_name).cloned() {
+        if matches!(
+            cur_busy.as_str(),
+            "deleting" | "creating" | "deploying_llm" | "initializing_env"
+        ) {
+            return Err(format!("实例 [{vm_name}] 当前正处于 `{cur_busy}` 状态，请稍候重试"));
+        }
+    }
+
+    let a = app
+        .find_assignment_by_name(&vm_name)
+        .await
+        .ok_or_else(|| format!("服务端未找到在线实例 [{vm_name}]，请确认虚拟机仍在运行"))?;
+
+    let ws_dir = app
+        .overview
+        .read()
+        .await
+        .vms
+        .iter()
+        .find(|v| v.name == vm_name)
+        .and_then(|v| v.workspace.path.as_deref())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| app.workspace.clone());
+
+    let info = spawn_llm_deployment_task(
+        app,
+        handle,
+        vm_name,
+        a.hardware_label(),
+        a.is_high_ram(),
+        ws_dir,
+        config,
+    );
+    Ok(info)
+}
+
 // ───────────────────────────── 大语言模型 (LLM) 流式对话网关与云端桥接 ─────────────────────────────
 
-const REMOTE_LLM_CHAT_STREAM_PY: &str = r#"
+pub(crate) const REMOTE_LLM_CHAT_STREAM_PY: &str = r#"
 import base64, json, sys
 
 url = sys.argv[1]
 token = sys.argv[2]
 pref_port = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 8000
 kernel_id = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
-session_id = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
 
 req_raw = sys.stdin.buffer.read()
 req_b64 = base64.b64encode(req_raw).decode("ascii")
@@ -1301,6 +3684,7 @@ for p in ({pref_port}, 8000, 8001, 11434):
 
 conn = None
 resp = None
+http_err = None
 last_err = "未能连接到云端推理端口 (8000 / 8001 / 11434)"
 for port in ports:
     try:
@@ -1311,15 +3695,19 @@ for port in ports:
             conn = c
             resp = r
             break
-        else:
-            err_txt = r.read().decode("utf-8", "ignore")[:280]
-            last_err = f"端口 {{port}} 返回 HTTP {{r.status}}: {{err_txt}}"
-            c.close()
+        err_txt = r.read().decode("utf-8", "ignore")[:280]
+        http_err = f"端口 {{port}} 返回 HTTP {{r.status}}: {{err_txt}}"
+        last_err = http_err
+        c.close()
+        # 若该端口服务已响应明确业务/引擎错误（非 404 路径不存在），立即停止跨端口重放，防止二次执行或被后续连接拒绝覆盖真实报错
+        if r.status != 404:
+            break
     except Exception as e:
-        last_err = f"端口 {{port}} 连接异常: {{e}}"
+        if http_err is None:
+            last_err = f"端口 {{port}} 连接异常: {{e}}"
 
 if resp is None:
-    print("PILOT_ERR:" + json.dumps({{"error": last_err}}, ensure_ascii=False), flush=True)
+    print("PILOT_ERR:" + json.dumps({{"error": http_err or last_err}}, ensure_ascii=False), flush=True)
 else:
     ctype = (resp.getheader("Content-Type") or "").lower()
     if "text/event-stream" in ctype:
@@ -1337,6 +3725,11 @@ else:
                 continue
             try:
                 obj = json.loads(data_str)
+                if isinstance(obj, dict) and obj.get("error"):
+                    err_v = obj["error"]
+                    err_m = err_v.get("message") if isinstance(err_v, dict) else str(err_v)
+                    print("PILOT_ERR:" + json.dumps({{"error": f"云端流式推理异常: {{err_m or err_v}}"}}, ensure_ascii=False), flush=True)
+                    break
                 choices = obj.get("choices") or []
                 if choices:
                     delta = choices[0].get("delta") or {{}}
@@ -1353,6 +3746,11 @@ else:
                 if ln.startswith("data:") and ln[5:].strip() != "[DONE]":
                     try:
                         obj = json.loads(ln[5:].strip())
+                        if isinstance(obj, dict) and obj.get("error"):
+                            err_v = obj["error"]
+                            err_m = err_v.get("message") if isinstance(err_v, dict) else str(err_v)
+                            print("PILOT_ERR:" + json.dumps({{"error": f"云端流式推理异常: {{err_m or err_v}}"}}, ensure_ascii=False), flush=True)
+                            break
                         delta = (obj.get("choices") or [{{}}])[0].get("delta") or {{}}
                         piece = delta.get("content") or delta.get("reasoning_content") or ""
                         if piece:
@@ -1362,12 +3760,17 @@ else:
         else:
             try:
                 obj = json.loads(raw_resp)
-                choices = obj.get("choices") or []
-                if choices:
-                    msg = choices[0].get("message") or {{}}
-                    piece = msg.get("content") or choices[0].get("text") or ""
-                    if piece:
-                        print("PILOT_DELTA:" + json.dumps({{"d": piece}}, ensure_ascii=False), flush=True)
+                if isinstance(obj, dict) and obj.get("error"):
+                    err_v = obj["error"]
+                    err_m = err_v.get("message") if isinstance(err_v, dict) else str(err_v)
+                    print("PILOT_ERR:" + json.dumps({{"error": f"云端推理异常: {{err_m or err_v}}"}}, ensure_ascii=False), flush=True)
+                else:
+                    choices = obj.get("choices") or []
+                    if choices:
+                        msg = choices[0].get("message") or {{}}
+                        piece = msg.get("content") or choices[0].get("text") or ""
+                        if piece:
+                            print("PILOT_DELTA:" + json.dumps({{"d": piece}}, ensure_ascii=False), flush=True)
             except Exception as e:
                 print("PILOT_ERR:" + json.dumps({{"error": f"解析云端响应失败: {{e}} ({{raw_resp[:200]}})"}}), flush=True)
     try:
@@ -1395,6 +3798,9 @@ try:
             sys.stdout.flush()
 
     rt.execute_code(remote_code, output_hook=on_out, timeout=300)
+    if getattr(rt, "kernel_id", None):
+        sys.stdout.write(f"PILOT_KID:{rt.kernel_id}\n")
+        sys.stdout.flush()
 finally:
     rt.stop()
 "#;
@@ -1412,50 +3818,64 @@ fn estimate_tokens(text: &str) -> u32 {
             ascii_chars += 1;
         }
     }
-    let non_cjk = if ascii_chars > 0 { (ascii_chars / 4).max(1) } else { 0 };
+    let non_cjk = if ascii_chars > 0 {
+        (ascii_chars / 4).max(1)
+    } else {
+        0
+    };
     (cjk + non_cjk).max(1)
 }
 
-/// 若本机存在蓝绿网关脚本且尚未启动，静默在后台拉起以预热 SSH 隧道
+/// 若本机存在蓝绿网关脚本且尚未启动（或需同步新监听端口），静默在后台拉起以预热网关通道
 /// （同步阻塞实现，须通过 `spawn_local_gateway_async` 在阻塞线程池中调用；15 秒内最多拉起一次）
 fn maybe_spawn_local_gateway(workspace: &Path) {
     static LAST_SPAWN: Mutex<Option<Instant>> = Mutex::new(None);
-    if LAST_SPAWN
-        .l()
-        .map(|t| t.elapsed() < Duration::from_secs(15))
-        .unwrap_or(false)
-    {
+    let addr: std::net::SocketAddr = match "127.0.0.1:18080".parse() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
         return;
     }
-    if let Ok(addr) = "127.0.0.1:18080".parse() {
-        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+    {
+        let mut guard = LAST_SPAWN.l();
+        if guard
+            .map(|t| t.elapsed() < Duration::from_secs(15))
+            .unwrap_or(false)
+        {
             return;
         }
+        let Some(gw_script) = ensure_gateway_script_path(workspace) else {
+            return;
+        };
+        let py = cli::colab_python_bin();
+        let mut cmd = std::process::Command::new(py);
+        cmd.arg(gw_script)
+            .arg("--port")
+            .arg("18080")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        let Ok(mut child) = cmd.spawn() else {
+            return;
+        };
+        *guard = Some(Instant::now());
+        // 回收子进程退出状态，杜绝 Unix 僵尸进程累积
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
     }
-    let gw_script = workspace
-        .join(".agents")
-        .join("skills")
-        .join("colab-llm-bluegreen")
-        .join("scripts")
-        .join("llm_local_gateway.py");
-    if !gw_script.exists() {
-        return;
-    }
-    let py = cli::colab_python_bin();
-    let mut cmd = std::process::Command::new(py);
-    cmd.arg(gw_script)
-        .arg("--port")
-        .arg("18080")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    if cmd.spawn().is_ok() {
-        *LAST_SPAWN.l() = Some(Instant::now());
+    // 等待本地网关监听端口就绪（最多约 1.5 秒），使首轮本地通道请求即可命中
+    for _ in 0..15 {
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(80)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -1463,27 +3883,55 @@ async fn spawn_local_gateway_async(workspace: PathBuf) {
     let _ = tokio::task::spawn_blocking(move || maybe_spawn_local_gateway(&workspace)).await;
 }
 
-struct ResolvedLlmTarget {
-    vm_name: String,
-    slot: Option<String>,
-    model: String,
-    remote_port: u16,
-    local_tunnel_port: Option<u16>,
-    kernel_id: Option<String>,
-    session_id: Option<String>,
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedLlmTarget {
+    pub vm_name: String,
+    pub slot: Option<String>,
+    pub model: String,
+    pub remote_port: u16,
+    pub local_tunnel_port: Option<u16>,
+    pub api_key: Option<String>,
+    pub kernel_id: Option<String>,
 }
 
-async fn resolve_llm_target(app: &Arc<AppState>, req: &LlmChatRequest) -> anyhow::Result<ResolvedLlmTarget> {
+pub(crate) async fn resolve_llm_target(
+    app: &Arc<AppState>,
+    req: &LlmChatRequest,
+) -> anyhow::Result<ResolvedLlmTarget> {
     let mut ov = app.overview.read().await.clone();
     if ov.vms.is_empty() {
         ov = refresh_overview(app, false).await;
     }
-    let bg = cli::read_llm_bluegreen_state();
+    let online_names: Vec<String> = ov
+        .vms
+        .iter()
+        .filter(|v| v.on_server)
+        .map(|v| v.name.clone())
+        .collect();
+    let busy_snapshot = app.busy.l().clone();
+    let creating_names: Vec<String> = app.creating_vms.l().keys().cloned().collect();
+    let now_ts = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+    let bg = filter_live_bluegreen_state(
+        cli::read_llm_bluegreen_state(),
+        &online_names,
+        &busy_snapshot,
+        &creating_names,
+        now_ts,
+    );
+
     let prefix = bg
         .as_ref()
         .and_then(|v| v.get("session_prefix"))
         .and_then(|x| x.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
         .unwrap_or("llm");
+    let bg_active_session = bg
+        .as_ref()
+        .and_then(|v| v.get("active_session"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let bg_active_slot = bg
         .as_ref()
         .and_then(|v| v.get("active_slot"))
@@ -1497,20 +3945,16 @@ async fn resolve_llm_target(app: &Arc<AppState>, req: &LlmChatRequest) -> anyhow
 
     let wanted = req.target_vm.trim();
     let vm_opt = if wanted.is_empty() || wanted.eq_ignore_ascii_case("auto") {
-        // 1. 优先匹配蓝绿 ACTIVE 槽位在线实例
-        let by_bg = bg_active_slot.as_ref().and_then(|slot| {
-            let expected = format!("{prefix}-{slot}");
-            ov.vms.iter().find(|v| {
-                v.on_server
-                    && (v.name == expected
-                        || v.name.ends_with(&format!("-{slot}"))
-                        || v.telemetry
-                            .as_ref()
-                            .and_then(|t| t["llm"]["slot"].as_str())
-                            .map(|s| s.eq_ignore_ascii_case(slot))
-                            .unwrap_or(false))
-            })
-        });
+        // 1. 优先严格匹配蓝绿状态记录的 active_session 或 `{prefix}-{slot}`
+        let by_bg = bg_active_session
+            .as_ref()
+            .and_then(|sess| ov.vms.iter().find(|v| v.on_server && &v.name == sess))
+            .or_else(|| {
+                bg_active_slot.as_ref().and_then(|slot| {
+                    let expected = format!("{prefix}-{slot}");
+                    ov.vms.iter().find(|v| v.on_server && v.name == expected)
+                })
+            });
         // 2. 匹配任意 telemetry.llm.online == true 且 role == active 的实例
         let by_active_llm = ov.vms.iter().find(|v| {
             v.on_server
@@ -1518,40 +3962,62 @@ async fn resolve_llm_target(app: &Arc<AppState>, req: &LlmChatRequest) -> anyhow
                     .as_ref()
                     .map(|t| {
                         t["llm"]["online"].as_bool() == Some(true)
-                            && t["llm"]["role"].as_str().unwrap_or("active").eq_ignore_ascii_case("active")
+                            && t["llm"]["role"]
+                                .as_str()
+                                .unwrap_or("active")
+                                .eq_ignore_ascii_case("active")
                     })
                     .unwrap_or(false)
         });
-        // 3. 匹配任意包含 LLM 遥测或 LLM 进程的在线实例
+        // 3. 匹配任意包含 LLM 遥测、LLM 进程或已注册 LLM API 端点的在线实例（绝不劫持普通通用/训练实例！）
         let by_any_llm = ov.vms.iter().find(|v| {
             v.on_server
-                && v.telemetry
-                    .as_ref()
-                    .map(|t| t["llm"].is_object() || t["threads"]["llm_process"].is_object())
-                    .unwrap_or(false)
+                && (v.llm_api.is_some()
+                    || v.telemetry
+                        .as_ref()
+                        .map(|t| t["llm"].is_object() || t["threads"]["llm_process"].is_object())
+                        .unwrap_or(false))
         });
-        by_bg.or(by_active_llm).or(by_any_llm).or_else(|| ov.vms.iter().find(|v| v.on_server))
+        by_bg.or(by_active_llm).or(by_any_llm)
     } else {
-        ov.vms.iter().find(|v| v.name == wanted)
+        ov.vms.iter().find(|v| v.on_server && v.name == wanted)
     };
 
     let Some(vm) = vm_opt else {
-        anyhow::bail!("当前没有在线的大模型 Colab 实例，请先通过 colab-llm-bluegreen 或 colab new 部署实例");
+        if !wanted.is_empty() && !wanted.eq_ignore_ascii_case("auto") {
+            anyhow::bail!("指定的实例 [{wanted}] 当前不在线或不存在");
+        }
+        if ov.vms.iter().any(|v| v.on_server) {
+            anyhow::bail!(
+                "当前在线虚拟机尚未部署大模型推理引擎，请点击实例卡片上的「一键部署 LLM」或新建大模型模式实例"
+            );
+        }
+        anyhow::bail!(
+            "当前没有在线的大模型 Colab 实例，请先点击「新建虚拟机」选择大模型部署模式"
+        );
     };
 
     let llm_tel = vm.telemetry.as_ref().and_then(|t| t.get("llm"));
+    let key_meta = cli::lookup_vm_api_key_meta(&vm.name);
+    let local_tunnel_port = bluegreen_tunnel_port_for_vm(&vm.name, bg.as_ref())
+        .or_else(|| vm.llm_api.as_ref().map(|x| x.local_port).filter(|&p| p > 0))
+        .or_else(|| key_meta.as_ref().and_then(|(_, p)| *p));
+    let api_key = vm
+        .llm_api
+        .as_ref()
+        .map(|x| x.api_key.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| key_meta.map(|(k, _)| k));
+
     let slot = llm_tel
         .and_then(|l| l.get("slot"))
         .and_then(|x| x.as_str())
         .map(|s| s.to_lowercase())
-        .or_else(|| {
-            if vm.name.ends_with("-blue") {
-                Some("blue".into())
-            } else if vm.name.ends_with("-green") {
-                Some("green".into())
-            } else {
-                None
-            }
+        .or_else(|| vm.llm_api.as_ref().map(|x| x.slot.clone()))
+        .or_else(|| match local_tunnel_port {
+            Some(18081) => Some("blue".into()),
+            Some(18082) => Some("green".into()),
+            _ => None,
         });
 
     let model = req
@@ -1564,6 +4030,12 @@ async fn resolve_llm_target(app: &Arc<AppState>, req: &LlmChatRequest) -> anyhow
                 .and_then(|x| x.as_str())
                 .map(|s| s.to_string())
         })
+        .or_else(|| {
+            vm.llm_api
+                .as_ref()
+                .map(|x| x.model_name.clone())
+                .filter(|m| !m.is_empty() && m != "default")
+        })
         .or(bg_model)
         .unwrap_or_else(|| "default".into());
 
@@ -1571,13 +4043,8 @@ async fn resolve_llm_target(app: &Arc<AppState>, req: &LlmChatRequest) -> anyhow
         .and_then(|l| l.get("port"))
         .and_then(|x| x.as_u64())
         .map(|p| p as u16)
+        .or_else(|| vm.llm_api.as_ref().map(|x| x.remote_port).filter(|&p| p > 0))
         .unwrap_or(8000);
-
-    let local_tunnel_port = match slot.as_deref() {
-        Some("blue") => Some(18081),
-        Some("green") => Some(18082),
-        _ => None,
-    };
 
     Ok(ResolvedLlmTarget {
         vm_name: vm.name.clone(),
@@ -1585,11 +4052,57 @@ async fn resolve_llm_target(app: &Arc<AppState>, req: &LlmChatRequest) -> anyhow
         model,
         remote_port,
         local_tunnel_port,
+        api_key,
         kernel_id: vm.kernel_id.clone(),
-        session_id: vm.session_id.clone(),
     })
 }
 
+pub(crate) fn parse_sse_frame(line_bytes: &[u8]) -> Result<Option<String>, String> {
+    let line_owned = String::from_utf8_lossy(line_bytes);
+    let line = line_owned.trim();
+    let Some(raw_data) = line.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let data_str = raw_data.trim();
+    if data_str.is_empty() || data_str == "[DONE]" {
+        return Ok(None);
+    }
+    let Ok(v) = serde_json::from_str::<Value>(data_str) else {
+        return Ok(None);
+    };
+    if let Some(err) = v.get("error") {
+        if !err.is_null() {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| err.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| err.to_string());
+            return Err(format!("云端流式推理异常: {msg}"));
+        }
+    }
+    let piece = v["choices"]
+        .get(0)
+        .and_then(|c| {
+            c["delta"]["content"]
+                .as_str()
+                .or_else(|| c["delta"]["reasoning_content"].as_str())
+                .or_else(|| c["text"].as_str())
+        })
+        .unwrap_or("");
+    if piece.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(piece.to_string()))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn extract_sse_piece(line_bytes: &[u8]) -> Option<String> {
+    parse_sse_frame(line_bytes).ok().flatten()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn try_stream_via_local_tunnel(
     handle: &AppHandle,
     req: &LlmChatRequest,
@@ -1597,7 +4110,12 @@ async fn try_stream_via_local_tunnel(
     local_port: u16,
     body_val: &Value,
     emitted: &mut bool,
+    gateway_handled: &mut bool,
+    chat_cancel: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<LlmChatResponse> {
+    if chat_cancel.is_cancelled() {
+        anyhow::bail!("对话已手动停止");
+    }
     let client = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_millis(650))
@@ -1605,27 +4123,39 @@ async fn try_stream_via_local_tunnel(
         .build()?;
 
     let health_url = format!("http://127.0.0.1:{local_port}/pilot/health");
-    let h_resp = client
+    let mut h_req = client
         .get(&health_url)
-        .timeout(Duration::from_millis(650))
-        .send()
-        .await?;
+        .header("X-Colab-Vm", &target.vm_name)
+        .timeout(Duration::from_millis(650));
+    if let Some(ref k) = target.api_key {
+        h_req = h_req.header("Authorization", format!("Bearer {k}"));
+    }
+    let h_resp = tokio::select! {
+        _ = chat_cancel.cancelled() => anyhow::bail!("对话已手动停止"),
+        r = h_req.send() => r?,
+    };
     if !h_resp.status().is_success() {
-        anyhow::bail!("本地 SSH 隧道端口 {local_port} 尚未就绪");
+        anyhow::bail!("本地网关端口 {local_port} 尚未就绪");
     }
 
     let chat_url = format!("http://127.0.0.1:{local_port}/v1/chat/completions");
-    let mut resp = client
+    let mut c_req = client
         .post(&chat_url)
         .header("Content-Type", "application/json")
-        .json(body_val)
-        .send()
-        .await?;
+        .header("X-Colab-Vm", &target.vm_name);
+    if let Some(ref k) = target.api_key {
+        c_req = c_req.header("Authorization", format!("Bearer {k}"));
+    }
+    let mut resp = tokio::select! {
+        _ = chat_cancel.cancelled() => anyhow::bail!("对话已手动停止"),
+        r = c_req.json(body_val).send() => r?,
+    };
+    *gateway_handled = true;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let err_txt = resp.text().await.unwrap_or_default();
-        anyhow::bail!("本地隧道 HTTP {status}: {err_txt}");
+        anyhow::bail!("本地网关 HTTP {status}: {err_txt}");
     }
 
     let t_start = Instant::now();
@@ -1634,42 +4164,32 @@ async fn try_stream_via_local_tunnel(
     let mut completion_tokens = 0u32;
     // 以字节缓冲按 b'\n' 切分完整行后再解码，绝不对半截 UTF-8 多字节字符（中文等）做有损解码
     let mut buf: Vec<u8> = Vec::new();
+    let mut cancelled = false;
 
     loop {
-        let chunk = match resp.chunk().await {
+        let next = tokio::select! {
+            _ = chat_cancel.cancelled() => {
+                cancelled = true;
+                break;
+            }
+            c = resp.chunk() => c,
+        };
+        let chunk = match next {
             Ok(Some(c)) => c,
             Ok(None) => break,
-            // 已输出部分内容后隧道中断：保留已生成的部分回复，不再报错回退（避免重复回答）
+            // 已输出部分内容后中断：保留已生成的部分回复，不再报错回退（避免重复回答）
             Err(_) if !reply.is_empty() => break,
             Err(e) => return Err(e.into()),
         };
         buf.extend_from_slice(&chunk);
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-            let line_owned = String::from_utf8_lossy(&line_bytes);
-            let line = line_owned.trim();
-            let Some(data_str) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let data_str = data_str.trim();
-            if data_str.is_empty() || data_str == "[DONE]" {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<Value>(data_str) {
-                let piece = v["choices"]
-                    .get(0)
-                    .and_then(|c| {
-                        c["delta"]["content"]
-                            .as_str()
-                            .or_else(|| c["delta"]["reasoning_content"].as_str())
-                            .or_else(|| c["text"].as_str())
-                    })
-                    .unwrap_or("");
-                if !piece.is_empty() {
+            match parse_sse_frame(&line_bytes) {
+                Ok(Some(piece)) => {
                     let first = *t_first.get_or_insert_with(Instant::now);
                     let ttft_ms = first.duration_since(t_start).as_secs_f64() * 1000.0;
-                    completion_tokens += estimate_tokens(piece);
-                    reply.push_str(piece);
+                    completion_tokens += estimate_tokens(&piece);
+                    reply.push_str(&piece);
                     let gen_s = first.elapsed().as_secs_f64().max(0.025);
                     let inst_tps = (completion_tokens as f64) / gen_s;
                     *emitted = true;
@@ -1681,19 +4201,89 @@ async fn try_stream_via_local_tunnel(
                             vm_name: target.vm_name.clone(),
                             slot: target.slot.clone(),
                             model: target.model.clone(),
-                            delta: Some(piece.to_string()),
+                            delta: Some(piece),
                             ttft_ms: Some((ttft_ms * 10.0).round() / 10.0),
                             instant_tps: Some((inst_tps * 10.0).round() / 10.0),
                             avg_tps: Some((inst_tps * 10.0).round() / 10.0),
                             completion_tokens: Some(completion_tokens),
                             elapsed_ms: Some(t_start.elapsed().as_secs_f64() * 1000.0),
-                            transport: Some(format!("SSH 隧道 (:{local_port})")),
+                            transport: Some(format!("本地蓝绿网关 (:{local_port})")),
                             error: None,
                         },
                     );
                 }
+                Ok(None) => {}
+                Err(err_msg) => {
+                    if reply.is_empty() {
+                        anyhow::bail!("{err_msg}");
+                    }
+                    let tail_note = format!("\n\n⚠️ [{err_msg}]");
+                    reply.push_str(&tail_note);
+                    *emitted = true;
+                    let _ = handle.emit(
+                        "llm-chat-event",
+                        LlmChatStreamEvent {
+                            request_id: req.request_id.clone(),
+                            kind: "delta".into(),
+                            vm_name: target.vm_name.clone(),
+                            slot: target.slot.clone(),
+                            model: target.model.clone(),
+                            delta: Some(tail_note),
+                            ttft_ms: None,
+                            instant_tps: None,
+                            avg_tps: None,
+                            completion_tokens: Some(completion_tokens),
+                            elapsed_ms: Some(t_start.elapsed().as_secs_f64() * 1000.0),
+                            transport: Some(format!("本地蓝绿网关 (:{local_port})")),
+                            error: None,
+                        },
+                    );
+                    break;
+                }
             }
         }
+    }
+    if !cancelled && !buf.is_empty() {
+        match parse_sse_frame(&buf) {
+            Ok(Some(piece)) => {
+                let first = *t_first.get_or_insert_with(Instant::now);
+                let ttft_ms = first.duration_since(t_start).as_secs_f64() * 1000.0;
+                completion_tokens += estimate_tokens(&piece);
+                reply.push_str(&piece);
+                let gen_s = first.elapsed().as_secs_f64().max(0.025);
+                let inst_tps = (completion_tokens as f64) / gen_s;
+                *emitted = true;
+                let _ = handle.emit(
+                    "llm-chat-event",
+                    LlmChatStreamEvent {
+                        request_id: req.request_id.clone(),
+                        kind: "delta".into(),
+                        vm_name: target.vm_name.clone(),
+                        slot: target.slot.clone(),
+                        model: target.model.clone(),
+                        delta: Some(piece),
+                        ttft_ms: Some((ttft_ms * 10.0).round() / 10.0),
+                        instant_tps: Some((inst_tps * 10.0).round() / 10.0),
+                        avg_tps: Some((inst_tps * 10.0).round() / 10.0),
+                        completion_tokens: Some(completion_tokens),
+                        elapsed_ms: Some(t_start.elapsed().as_secs_f64() * 1000.0),
+                        transport: Some(format!("本地蓝绿网关 (:{local_port})")),
+                        error: None,
+                    },
+                );
+            }
+            Ok(None) => {}
+            Err(err_msg) if reply.is_empty() => anyhow::bail!("{err_msg}"),
+            Err(err_msg) => {
+                let tail_note = format!("\n\n⚠️ [{err_msg}]");
+                reply.push_str(&tail_note);
+                *emitted = true;
+            }
+        }
+        buf.clear();
+    }
+    if cancelled && reply.is_empty() {
+        anyhow::bail!("对话已手动停止");
     }
 
     let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
@@ -1715,7 +4305,7 @@ async fn try_stream_via_local_tunnel(
         avg_tps,
         completion_tokens,
         elapsed_ms: elapsed_ms.round(),
-        transport: format!("SSH 隧道 (127.0.0.1:{local_port})"),
+        transport: format!("本地蓝绿网关 (127.0.0.1:{local_port})"),
     })
 }
 
@@ -1725,9 +4315,14 @@ async fn stream_via_colab_runtime(
     req: &LlmChatRequest,
     target: &ResolvedLlmTarget,
     body_val: &Value,
+    chat_cancel: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<LlmChatResponse> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
+
+    if chat_cancel.is_cancelled() {
+        anyhow::bail!("对话已手动停止");
+    }
 
     let py = cli::colab_python_bin();
     let mut cmd = Command::new(&py);
@@ -1739,7 +4334,6 @@ async fn stream_via_colab_runtime(
         &a.runtime_proxy_info.token,
         &target.remote_port.to_string(),
         target.kernel_id.as_deref().unwrap_or(""),
-        target.session_id.as_deref().unwrap_or(""),
     ])
     .env("PYTHONUTF8", "1")
     .env("PYTHONIOENCODING", "utf-8")
@@ -1782,7 +4376,10 @@ async fn stream_via_colab_runtime(
         })
     });
 
-    let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("无法读取流式桥接输出"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("无法读取流式桥接输出"))?;
     let mut lines = BufReader::new(stdout).lines();
 
     let t_start = Instant::now();
@@ -1790,14 +4387,20 @@ async fn stream_via_colab_runtime(
     let mut reply = String::new();
     let mut completion_tokens = 0u32;
     let mut remote_err: Option<String> = None;
+    let mut discovered_kid: Option<String> = None;
 
-    // 整体 330 秒截止（云端推理 300 秒超时 + 桥接握手余量），超时立即结束桥接进程树
+    // 整体 330 秒截止（云端推理 300 秒超时 + 桥接握手余量），超时或手动取消立即结束桥接进程树
     let deadline = tokio::time::sleep(Duration::from_secs(330));
     tokio::pin!(deadline);
     let mut timed_out = false;
+    let mut cancelled = false;
 
     loop {
         let line = tokio::select! {
+            _ = chat_cancel.cancelled() => {
+                cancelled = true;
+                break;
+            }
             l = lines.next_line() => match l {
                 Ok(Some(l)) => l,
                 _ => break,
@@ -1832,7 +4435,10 @@ async fn stream_via_colab_runtime(
                                 avg_tps: Some((inst_tps * 10.0).round() / 10.0),
                                 completion_tokens: Some(completion_tokens),
                                 elapsed_ms: Some(t_start.elapsed().as_secs_f64() * 1000.0),
-                                transport: Some(format!("Colab 直连 (:{} 边车)", target.remote_port)),
+                                transport: Some(format!(
+                                    "Colab 直连 (:{} 边车)",
+                                    target.remote_port
+                                )),
                                 error: None,
                             },
                         );
@@ -1845,40 +4451,75 @@ async fn stream_via_colab_runtime(
             } else {
                 remote_err = Some(rest.to_string());
             }
+        } else if let Some(kid) = trimmed.strip_prefix("PILOT_KID:") {
+            if !kid.trim().is_empty() {
+                discovered_kid = Some(kid.trim().to_string());
+            }
         }
     }
 
-    if timed_out {
+    if let Some(kid) = discovered_kid {
+        let ep = a.endpoint.clone();
+        let _ = tokio::task::spawn_blocking(move || cli::update_session_kernel_id(&ep, &kid)).await;
+    }
+
+    if cancelled {
+        cli::kill_tree(&mut child).await;
+        if let Some(t) = stderr_task {
+            t.abort();
+        }
+        if reply.is_empty() {
+            anyhow::bail!("对话已手动停止");
+        }
+    } else if timed_out {
         cli::kill_tree(&mut child).await;
         if let Some(t) = stderr_task {
             t.abort();
         }
         anyhow::bail!("Colab 直连流式超时 (330s)");
-    }
-
-    let status = child.wait().await.ok();
-    let stderr_tail = match stderr_task {
-        Some(t) => tokio::time::timeout(Duration::from_secs(3), t)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default(),
-        None => String::new(),
-    };
-    if let Some(err) = remote_err {
-        if reply.is_empty() {
-            anyhow::bail!("{err}");
+    } else {
+        let status = child.wait().await.ok();
+        let stderr_tail = match stderr_task {
+            Some(t) => tokio::time::timeout(Duration::from_secs(3), t)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        if let Some(err) = remote_err {
+            if reply.is_empty() {
+                anyhow::bail!("{err}");
+            }
+            let tail_note = format!("\n\n⚠️ [{err}]");
+            reply.push_str(&tail_note);
+            let _ = handle.emit(
+                "llm-chat-event",
+                LlmChatStreamEvent {
+                    request_id: req.request_id.clone(),
+                    kind: "delta".into(),
+                    vm_name: target.vm_name.clone(),
+                    slot: target.slot.clone(),
+                    model: target.model.clone(),
+                    delta: Some(tail_note),
+                    ttft_ms: None,
+                    instant_tps: None,
+                    avg_tps: None,
+                    completion_tokens: Some(completion_tokens),
+                    elapsed_ms: Some(t_start.elapsed().as_secs_f64() * 1000.0),
+                    transport: Some(format!("Colab 直连 (:{} 边车)", target.remote_port)),
+                    error: None,
+                },
+            );
         }
-    }
-    if reply.is_empty() && !status.map(|s| s.success()).unwrap_or(false) && !stderr_tail.is_empty() {
-        let last = stderr_tail
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        anyhow::bail!("Colab 直连流式桥接异常退出：{last}");
+        if reply.is_empty()
+            && !status.map(|s| s.success()).unwrap_or(false)
+            && !stderr_tail.is_empty()
+        {
+            let cleaned = cli::strip_colab_cli_banners(&stderr_tail);
+            let last = cli::last_meaningful_cli_line(&cleaned, "未知异常");
+            anyhow::bail!("Colab 直连流式桥接异常退出：{last}");
+        }
     }
 
     let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
@@ -1925,6 +4566,26 @@ fn emit_chat_start(handle: &AppHandle, req: &LlmChatRequest, target: &ResolvedLl
     );
 }
 
+struct ActiveChatGuard {
+    app: Arc<AppState>,
+    request_id: String,
+}
+
+impl Drop for ActiveChatGuard {
+    fn drop(&mut self) {
+        self.app.active_chats.l().remove(&self.request_id);
+    }
+}
+
+#[tauri::command]
+async fn cancel_llm_chat(state: AppStateRef<'_>, request_id: String) -> Result<(), String> {
+    let tok = state.active_chats.l().get(&request_id).cloned();
+    if let Some(t) = tok {
+        t.cancel();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn stream_llm_chat(
     handle: AppHandle,
@@ -1932,14 +4593,25 @@ async fn stream_llm_chat(
     req: LlmChatRequest,
 ) -> Result<LlmChatResponse, String> {
     let app = state.inner().clone();
-    let target = resolve_llm_target(&app, &req).await.map_err(|e| e.to_string())?;
+    let chat_cancel = tokio_util::sync::CancellationToken::new();
+    app.active_chats
+        .l()
+        .insert(req.request_id.clone(), chat_cancel.clone());
+    let _guard = ActiveChatGuard {
+        app: app.clone(),
+        request_id: req.request_id.clone(),
+    };
+
+    let target = resolve_llm_target(&app, &req)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let a = app
         .find_assignment_by_name(&target.vm_name)
         .await
         .ok_or_else(|| format!("服务端未找到在线实例 [{}]", target.vm_name))?;
 
-    if target.local_tunnel_port.is_some() {
+    if target.local_tunnel_port.is_some() && !chat_cancel.is_cancelled() {
         spawn_local_gateway_async(app.workspace.clone()).await;
     }
 
@@ -1953,45 +4625,61 @@ async fn stream_llm_chat(
         "stream": true,
     });
 
-    // 优先使用已就绪的本机蓝绿 SSH 隧道（毫秒级直连），若隧道未就绪则无缝回退至 ColabRuntime 直连流式通道
-    // 若隧道已输出部分内容后才中断，则不再回退（避免同一问题被回答两遍），直接返回部分结果或错误
+    // 优先使用已就绪的本机蓝绿网关，仅在本地网关未就绪/不可达时无缝回退至 ColabRuntime 直连流式通道；
+    // 若本地网关已受理请求并返回业务错误（如 HTTP 400/500/502）、已被用户手动停止或已输出部分内容，则绝不回退重放提示词
     let mut res = if let Some(lport) = target.local_tunnel_port {
         let mut tunnel_emitted = false;
-        match try_stream_via_local_tunnel(&handle, &req, &target, lport, &body_val, &mut tunnel_emitted).await {
-            Ok(r) if !r.reply.is_empty() || tunnel_emitted => Ok(r),
-            Err(e) if tunnel_emitted => Err(e),
+        let mut gateway_handled = false;
+        match try_stream_via_local_tunnel(
+            &handle,
+            &req,
+            &target,
+            lport,
+            &body_val,
+            &mut tunnel_emitted,
+            &mut gateway_handled,
+            &chat_cancel,
+        )
+        .await
+        {
+            Ok(r) if !r.reply.is_empty() || tunnel_emitted || gateway_handled => Ok(r),
+            Err(e) if tunnel_emitted || gateway_handled || chat_cancel.is_cancelled() => Err(e),
             _ => {
-                // 回退前重新广播 start，前端据此重置已显示内容
                 emit_chat_start(&handle, &req, &target);
-                stream_via_colab_runtime(&handle, &a, &req, &target, &body_val).await
+                stream_via_colab_runtime(&handle, &a, &req, &target, &body_val, &chat_cancel).await
             }
         }
     } else {
-        stream_via_colab_runtime(&handle, &a, &req, &target, &body_val).await
+        stream_via_colab_runtime(&handle, &a, &req, &target, &body_val, &chat_cancel).await
     };
 
-    // 对话完成后立即拉取一次该实例的最新遥测快照（同步云端边车实测 tok/s、TTFT 与曲线）并广播给仪表盘
-    if let Ok(ref mut ok_resp) = res {
-        let entry = fetch_telemetry(&app, &a).await;
-        if let Some(ref tel_val) = entry.data {
-            if let Some(sidecar_tps) = tel_val["llm"]["last_request_tps"]
-                .as_f64()
-                .filter(|&x| x > 0.0)
-                .or_else(|| tel_val["llm"]["instant_tps"].as_f64().filter(|&x| x > 0.0))
-            {
-                ok_resp.avg_tps = (sidecar_tps * 10.0).round() / 10.0;
+    // 对话正常完成后立即拉取一次该实例的最新遥测快照（同步云端边车实测 tok/s、TTFT 与曲线）并广播给仪表盘
+    if !chat_cancel.is_cancelled() {
+        if let Ok(ref mut ok_resp) = res {
+            let bg = cli::read_llm_bluegreen_state();
+            let entry =
+                fetch_telemetry(&app, &a, Some(&target.vm_name), bg.as_ref()).await;
+            if let Some(ref tel_val) = entry.data {
+                if let Some(sidecar_tps) = tel_val["llm"]["last_request_tps"]
+                    .as_f64()
+                    .filter(|&x| x > 0.0)
+                    .or_else(|| tel_val["llm"]["instant_tps"].as_f64().filter(|&x| x > 0.0))
+                {
+                    ok_resp.avg_tps = (sidecar_tps * 10.0).round() / 10.0;
+                }
+                if let Some(sidecar_ttft) = tel_val["llm"]["ttft_ms"].as_f64().filter(|&x| x > 0.0)
+                {
+                    ok_resp.ttft_ms = (sidecar_ttft * 10.0).round() / 10.0;
+                }
+                app.telemetry.l().insert(a.endpoint.clone(), entry);
             }
-            if let Some(sidecar_ttft) = tel_val["llm"]["ttft_ms"].as_f64().filter(|&x| x > 0.0) {
-                ok_resp.ttft_ms = (sidecar_ttft * 10.0).round() / 10.0;
-            }
-            app.telemetry.l().insert(a.endpoint.clone(), entry);
+            let app_bg = app.clone();
+            let handle_bg = handle.clone();
+            tokio::spawn(async move {
+                let ov = refresh_overview(&app_bg, false).await;
+                emit_overview(&handle_bg, &ov);
+            });
         }
-        let app_bg = app.clone();
-        let handle_bg = handle.clone();
-        tokio::spawn(async move {
-            let ov = refresh_overview(&app_bg, false).await;
-            emit_overview(&handle_bg, &ov);
-        });
     }
 
     match res {
@@ -2050,6 +4738,7 @@ fn resolve_workspace(app: &tauri::App) -> PathBuf {
             return p;
         }
     }
+    #[cfg(debug_assertions)]
     if let Some(dev) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
         if dev.join("train.py").exists() {
             return dev.to_path_buf();
@@ -2065,7 +4754,10 @@ fn resolve_workspace(app: &tauri::App) -> PathBuf {
         let _ = std::fs::write(dir.join("train.py"), DEFAULT_TRAIN_PY);
     }
     if !dir.join("requirements.txt").exists() {
-        let _ = std::fs::write(dir.join("requirements.txt"), "# 每行一个云端需额外安装的 Python 包\n");
+        let _ = std::fs::write(
+            dir.join("requirements.txt"),
+            "# 每行一个云端需额外安装的 Python 包\n",
+        );
     }
     dir
 }
@@ -2074,23 +4766,25 @@ fn resolve_workspace(app: &tauri::App) -> PathBuf {
 fn print_overview_headless() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_default();
-        let state = Arc::new(AppState {
-            client: ColabClient::new(),
-            workspace,
-            overview: tokio::sync::RwLock::new(Overview::default()),
-            telemetry: Mutex::new(HashMap::new()),
-            last_assignments: Mutex::new(None),
-            last_ccu: Mutex::new(None),
-            relays: Mutex::new(HashMap::new()),
-            busy: Mutex::new(HashMap::new()),
-            probe_cooldown: Mutex::new(HashMap::new()),
-            gdrive: tokio::sync::Mutex::new((None, None)),
-            refresh_lock: tokio::sync::Mutex::new(()),
-        });
+        let workspace = std::env::var("COLAB_PILOT_WORKSPACE")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .or_else(|| {
+                #[cfg(debug_assertions)]
+                {
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .filter(|p| p.is_dir())
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    None
+                }
+            })
+            .unwrap_or_else(|| cli::colab_config_dir().join("workspace"));
+        let state = AppState::new_with(ColabClient::new(), workspace);
         let ov = refresh_overview(&state, true).await;
         println!("{}", serde_json::to_string_pretty(&ov).unwrap_or_default());
     });
@@ -2100,22 +4794,25 @@ fn print_overview_headless() {
 fn selftest_lifecycle() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
-        let state = Arc::new(AppState {
-            client: ColabClient::new(),
-            workspace: Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf(),
-            overview: tokio::sync::RwLock::new(Overview::default()),
-            telemetry: Mutex::new(HashMap::new()),
-            last_assignments: Mutex::new(None),
-            last_ccu: Mutex::new(None),
-            relays: Mutex::new(HashMap::new()),
-            busy: Mutex::new(HashMap::new()),
-            probe_cooldown: Mutex::new(HashMap::new()),
-            gdrive: tokio::sync::Mutex::new((None, None)),
-            refresh_lock: tokio::sync::Mutex::new(()),
-        });
+        let state = AppState::new_with(
+            ColabClient::new(),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+        );
         let name = "selftest-cpu";
         println!("[1] creating {name} …");
-        if let Err(e) = relay::colab_new(name, "CPU", false, &|l: &str| println!("    | {l}")).await {
+        if let Err(e) = relay::colab_new(
+            name,
+            "CPU",
+            false,
+            None,
+            None,
+            &|l: &str| println!("    | {l}"),
+        )
+        .await
+        {
             println!("CREATE FAILED: {e}");
             return;
         }
@@ -2147,7 +4844,11 @@ fn append_crash_log(text: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         use std::io::Write;
         let _ = f.write_all(text.as_bytes());
     }
@@ -2171,15 +4872,56 @@ fn install_panic_hook() {
 }
 
 // ───────────────────────────── 单实例守护 ─────────────────────────────
-// 修复“双击 exe 闪退”：此前残留的无窗口僵尸实例会占用同一 WebView2 用户数据目录，
-// 导致新实例 WebView2 环境创建失败而立即退出。现在通过本机回环端口实现单实例：
-// - 若已有健康实例：唤醒并聚焦其窗口，新进程直接退出；
-// - 若已有实例但没有可见窗口（僵尸）：强制结束僵尸进程树后由新进程接管启动。
-// - 若已有实例窗口位于非交互桌面（如被自动化工具/沙箱从隔离桌面拉起，桌面回收后窗口不可见但句柄仍在），
-//   同样视为僵尸并由交互桌面 (WinSta0\Default) 上的新实例接管。
+// 修复“双击 exe 闪退”并加固单实例 IPC 安全（H-3）：
+// - 使用每用户私有密钥文件 `~/.config/colab-cli/.pilot_instance_token` 双向鉴权；
+// - 限制每个连接最多读取 512 字节，杜绝无换行长报文导致内存耗尽；
+// - 若旧实例正在执行后台接力训练任务，永不返回 NOWIN 自毁；
+// - 新实例在终止无窗口僵尸旧实例前，强制校验目标 PID 的可执行文件路径与当前进程一致。
 
 const SINGLE_INSTANCE_PORT: u16 = 18079;
 const INTERACTIVE_DESKTOP: &str = "WinSta0\\Default";
+
+fn single_instance_token_path() -> PathBuf {
+    cli::colab_config_dir().join(".pilot_instance_token")
+}
+
+fn read_single_instance_token() -> Option<String> {
+    let raw = std::fs::read_to_string(single_instance_token_path()).ok()?;
+    let trimmed = raw.trim().to_string();
+    if trimmed.len() >= 16 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
+fn ensure_single_instance_token() -> String {
+    if let Some(existing) = read_single_instance_token() {
+        return existing;
+    }
+    let tok = uuid::Uuid::new_v4().simple().to_string();
+    let path = single_instance_token_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = f.write_all(tok.as_bytes());
+            return tok;
+        }
+    }
+    let _ = std::fs::write(&path, &tok);
+    tok
+}
 
 /// 当前线程所在的 “窗口站\桌面” 名称（例如用户交互桌面 `WinSta0\Default`）
 #[cfg(windows)]
@@ -2188,7 +4930,13 @@ fn current_desktop_name() -> String {
     extern "system" {
         fn GetThreadDesktop(thread_id: u32) -> isize;
         fn GetProcessWindowStation() -> isize;
-        fn GetUserObjectInformationW(h: isize, index: i32, pv: *mut u16, len: u32, needed: *mut u32) -> i32;
+        fn GetUserObjectInformationW(
+            h: isize,
+            index: i32,
+            pv: *mut u16,
+            len: u32,
+            needed: *mut u32,
+        ) -> i32;
     }
     #[link(name = "kernel32")]
     extern "system" {
@@ -2201,7 +4949,14 @@ fn current_desktop_name() -> String {
         }
         let mut buf = [0u16; 256];
         let mut need = 0u32;
-        if GetUserObjectInformationW(h, UOI_NAME, buf.as_mut_ptr(), (buf.len() * 2) as u32, &mut need) == 0 {
+        if GetUserObjectInformationW(
+            h,
+            UOI_NAME,
+            buf.as_mut_ptr(),
+            (buf.len() * 2) as u32,
+            &mut need,
+        ) == 0
+        {
             return String::new();
         }
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
@@ -2222,65 +4977,105 @@ fn current_desktop_name() -> String {
 }
 
 enum InstanceRole {
-    Primary(std::net::TcpListener),
+    Primary(std::net::TcpListener, String),
     AlreadyRunning,
     NoLock,
 }
 
 fn kill_process_tree(pid: u32) {
-    let mut cmd = std::process::Command::new("taskkill");
-    cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x0800_0000)
+            .status();
     }
-    let _ = cmd.status();
+    #[cfg(not(windows))]
+    {
+        let pid_str = pid.to_string();
+        let _ = std::process::Command::new("pkill")
+            .args(["-TERM", "-P", &pid_str])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid_str])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        std::thread::sleep(Duration::from_millis(120));
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid_str])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 fn acquire_single_instance() -> InstanceRole {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], SINGLE_INSTANCE_PORT));
     let my_desktop = current_desktop_name();
     for _ in 0..3 {
         if let Ok(l) = std::net::TcpListener::bind(addr) {
-            return InstanceRole::Primary(l);
+            let tok = ensure_single_instance_token();
+            return InstanceRole::Primary(l, tok);
         }
-        let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(800)) else {
+        let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(800))
+        else {
             std::thread::sleep(Duration::from_millis(400));
             continue;
         };
+        let tok = read_single_instance_token().unwrap_or_default();
         let _ = s.set_read_timeout(Some(Duration::from_millis(2500)));
-        let _ = s.write_all(format!("SHOW {my_desktop}\n").as_bytes());
+        let _ = s.write_all(format!("SHOW {tok}\t{my_desktop}\n").as_bytes());
         let mut line = String::new();
-        let _ = BufReader::new(&s).read_line(&mut line);
+        let _ = BufReader::new((&s).take(512)).read_line(&mut line);
         let line = line.trim();
         if line.starts_with("OK") {
             return InstanceRole::AlreadyRunning;
         }
-        if let Some(pid) = line.strip_prefix("NOWIN ").and_then(|p| p.trim().parse::<u32>().ok()) {
-            if pid != std::process::id() {
-                append_crash_log(&format!(
-                    "[{}] 检测到无窗口僵尸实例 pid={pid}，已强制结束并接管启动\n",
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-                ));
-                kill_process_tree(pid);
-                std::thread::sleep(Duration::from_millis(900));
+        if let Some(rest) = line.strip_prefix("NOWIN ") {
+            let mut parts = rest.split_whitespace();
+            let resp_tok = parts.next().unwrap_or("");
+            let pid_opt = parts.next().and_then(|p| p.parse::<u32>().ok());
+            if !tok.is_empty() && resp_tok == tok {
+                if let Some(pid) = pid_opt {
+                    if pid != std::process::id() && is_same_executable_pid(pid) {
+                        append_crash_log(&format!(
+                            "[{}] 检测到已验明身份的无窗口僵尸实例 pid={pid}，已结束并接管启动\n",
+                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                        ));
+                        kill_process_tree(pid);
+                        std::thread::sleep(Duration::from_millis(900));
+                        continue;
+                    }
+                }
             }
-            continue;
         }
-        // 端口被非 Colab Pilot 程序占用或对方无响应：放弃单实例锁，照常启动
+        // 端口被非 Colab Pilot 程序占用、令牌不匹配或对方无响应：放弃单实例锁，照常启动
         return InstanceRole::NoLock;
     }
     InstanceRole::NoLock
 }
 
-fn serve_single_instance(listener: std::net::TcpListener, handle: AppHandle) {
-    use std::io::{BufRead, BufReader, Write};
-    // 在主线程（窗口所在线程）记录本实例所处桌面
+fn serve_single_instance(
+    listener: std::net::TcpListener,
+    handle: AppHandle,
+    state: Arc<AppState>,
+    expected_token: String,
+) {
+    use std::io::{BufRead, BufReader, Read, Write};
     let my_desktop = current_desktop_name();
     let i_am_interactive = my_desktop.eq_ignore_ascii_case(INTERACTIVE_DESKTOP);
     std::thread::Builder::new()
@@ -2290,7 +5085,7 @@ fn serve_single_instance(listener: std::net::TcpListener, handle: AppHandle) {
                 let Ok(mut s) = stream else { continue };
                 let _ = s.set_read_timeout(Some(Duration::from_millis(1500)));
                 let mut line = String::new();
-                let _ = BufReader::new(&s).read_line(&mut line);
+                let _ = BufReader::new((&s).take(512)).read_line(&mut line);
                 let line = line.trim();
                 let Some(rest) = line
                     .get(..4)
@@ -2299,14 +5094,32 @@ fn serve_single_instance(listener: std::net::TcpListener, handle: AppHandle) {
                 else {
                     continue;
                 };
-                let requester_desktop = rest.to_string();
-                let same_desktop =
-                    requester_desktop.is_empty() || requester_desktop.eq_ignore_ascii_case(&my_desktop);
-                let reply = if !same_desktop && !i_am_interactive {
-                    // 本实例位于已失效/隔离的非交互桌面：让新实例接管
-                    format!("NOWIN {}\n", std::process::id())
+                let (req_tok, requester_desktop) = match rest.split_once('\t') {
+                    Some((t, d)) => (t.trim(), d.trim()),
+                    None => (rest.trim(), ""),
+                };
+                if expected_token.is_empty() || req_tok != expected_token {
+                    let _ = s.write_all(b"DENIED\n");
+                    continue;
+                }
+
+                let has_active_relay = state.relays.l().values().any(|h| {
+                    h.is_running() || h.task_alive.load(std::sync::atomic::Ordering::SeqCst)
+                });
+                let same_desktop = requester_desktop.is_empty()
+                    || requester_desktop.eq_ignore_ascii_case(&my_desktop);
+
+                let reply = if has_active_relay {
+                    // 后台接力监工运行中：尝试恢复窗口，绝不返回 NOWIN 杀死自己
+                    if let Some(w) = handle.get_webview_window("main") {
+                        let _ = w.unminimize();
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                    "OK\n".to_string()
+                } else if !same_desktop && !i_am_interactive {
+                    format!("NOWIN {expected_token} {}\n", std::process::id())
                 } else if !same_desktop {
-                    // 本实例在用户交互桌面上健康运行，请求方来自隔离桌面：保持现状，让请求方退出
                     let _ = handle.get_webview_window("main").map(|w| w.set_focus());
                     "OK\n".to_string()
                 } else {
@@ -2322,7 +5135,7 @@ fn serve_single_instance(listener: std::net::TcpListener, handle: AppHandle) {
                     if visible {
                         "OK\n".to_string()
                     } else {
-                        format!("NOWIN {}\n", std::process::id())
+                        format!("NOWIN {expected_token} {}\n", std::process::id())
                     }
                 };
                 let _ = s.write_all(reply.as_bytes());
@@ -2365,6 +5178,7 @@ impl Default for WindowStatePrefs {
 struct WindowStateTracker {
     prefs: WindowStatePrefs,
     dirty: bool,
+    scheduled: bool,
     last_saved: Instant,
     ignore_until: Instant,
 }
@@ -2388,56 +5202,88 @@ fn save_window_state(prefs: &WindowStatePrefs) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(json) = serde_json::to_string_pretty(prefs) {
-        let _ = std::fs::write(path, json);
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        } else {
+            let _ = std::fs::write(&path, json);
+        }
     }
 }
 
+fn monitor_logical_bounds(m: &tauri::Monitor) -> (f64, f64) {
+    let wa = m.work_area();
+    let s = wa.size.to_logical::<f64>(m.scale_factor());
+    (
+        (s.width - 16.0).max(MIN_WINDOW_WIDTH),
+        (s.height - 16.0).max(MIN_WINDOW_HEIGHT),
+    )
+}
+
 fn restore_window_state(window: &tauri::WebviewWindow) -> Arc<Mutex<WindowStateTracker>> {
-    let (max_w, max_h) = window
-        .current_monitor()
-        .ok()
-        .flatten()
-        .map(|m| {
-            let s = m.size().to_logical::<f64>(m.scale_factor());
-            (
-                (s.width - 24.0).max(MIN_WINDOW_WIDTH),
-                (s.height - 48.0).max(MIN_WINDOW_HEIGHT),
-            )
-        })
-        .unwrap_or((1920.0, 1080.0));
-
     let prefs = if let Some(mut saved) = load_window_state() {
-        saved.width = saved.width.clamp(MIN_WINDOW_WIDTH, max_w).round();
-        saved.height = saved.height.clamp(MIN_WINDOW_HEIGHT, max_h).round();
-        let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-            saved.width,
-            saved.height,
-        )));
-
-        let pos_valid = match (saved.x, saved.y) {
-            (Some(px), Some(py)) => window
-                .available_monitors()
-                .unwrap_or_default()
-                .iter()
-                .any(|m| {
-                    let mp = m.position();
-                    let ms = m.size();
-                    let check_x = px.saturating_add(80);
-                    let check_y = py.saturating_add(20);
-                    check_x >= mp.x
-                        && check_x < mp.x.saturating_add(ms.width as i32)
-                        && check_y >= mp.y
-                        && check_y < mp.y.saturating_add(ms.height as i32)
-                }),
-            _ => false,
+        let monitors = window.available_monitors().unwrap_or_default();
+        let target_monitor = match (saved.x, saved.y) {
+            (Some(px), Some(py)) => monitors.into_iter().find(|m| {
+                let wa = m.work_area();
+                let wp = wa.position;
+                let ws = wa.size;
+                let check_x = px.saturating_add(80);
+                let check_y = py.saturating_add(20);
+                py >= wp.y.saturating_sub(16)
+                    && check_x >= wp.x
+                    && check_x < wp.x.saturating_add(ws.width as i32)
+                    && check_y >= wp.y
+                    && check_y < wp.y.saturating_add(ws.height as i32)
+            }),
+            _ => None,
         };
-        if pos_valid {
-            if let (Some(px), Some(py)) = (saved.x, saved.y) {
-                let _ = window.set_position(tauri::Position::Physical(
-                    tauri::PhysicalPosition::new(px, py),
-                ));
-            }
+
+        if let (Some(ref m), Some(px), Some(py)) = (&target_monitor, saved.x, saved.y) {
+            // 按目标显示器工作区（扣除 Windows 任务栏）钳制窗口尺寸与坐标，避免标题栏或底边被任务栏遮挡
+            let (max_w, max_h) = monitor_logical_bounds(m);
+            saved.width = saved.width.clamp(MIN_WINDOW_WIDTH, max_w).round();
+            saved.height = saved.height.clamp(MIN_WINDOW_HEIGHT, max_h).round();
+            let wa = m.work_area();
+            let scale = m.scale_factor();
+            let phys_w = (saved.width * scale).round() as i32;
+            let phys_h = (saved.height * scale).round() as i32;
+            let max_x = wa
+                .position
+                .x
+                .saturating_add(wa.size.width as i32)
+                .saturating_sub(phys_w)
+                .max(wa.position.x);
+            let max_y = wa
+                .position
+                .y
+                .saturating_add(wa.size.height as i32)
+                .saturating_sub(phys_h)
+                .max(wa.position.y);
+            let clamped_x = px.clamp(wa.position.x, max_x);
+            let clamped_y = py.clamp(wa.position.y, max_y);
+            saved.x = Some(clamped_x);
+            saved.y = Some(clamped_y);
+            let _ = window.set_position(tauri::Position::Physical(
+                tauri::PhysicalPosition::new(clamped_x, clamped_y),
+            ));
+            let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
+                saved.width,
+                saved.height,
+            )));
         } else {
+            let (max_w, max_h) = window
+                .current_monitor()
+                .ok()
+                .flatten()
+                .map(|m| monitor_logical_bounds(&m))
+                .unwrap_or((1920.0, 1080.0));
+            saved.width = saved.width.clamp(MIN_WINDOW_WIDTH, max_w).round();
+            saved.height = saved.height.clamp(MIN_WINDOW_HEIGHT, max_h).round();
+            let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
+                saved.width,
+                saved.height,
+            )));
             let _ = window.center();
         }
         if saved.maximized {
@@ -2457,6 +5303,7 @@ fn restore_window_state(window: &tauri::WebviewWindow) -> Arc<Mutex<WindowStateT
     Arc::new(Mutex::new(WindowStateTracker {
         prefs,
         dirty: false,
+        scheduled: false,
         last_saved: Instant::now(),
         ignore_until: Instant::now() + Duration::from_millis(550),
     }))
@@ -2497,7 +5344,9 @@ fn record_window_state(
             let scale = window.scale_factor().unwrap_or(1.0);
             if let Ok(phys) = window.inner_size() {
                 let logical = phys.to_logical::<f64>(scale);
-                if logical.width >= MIN_WINDOW_WIDTH - 4.0 && logical.height >= MIN_WINDOW_HEIGHT - 4.0 {
+                if logical.width >= MIN_WINDOW_WIDTH - 4.0
+                    && logical.height >= MIN_WINDOW_HEIGHT - 4.0
+                {
                     g.prefs.width = logical.width.max(MIN_WINDOW_WIDTH).round();
                     g.prefs.height = logical.height.max(MIN_WINDOW_HEIGHT).round();
                 }
@@ -2514,19 +5363,27 @@ fn record_window_state(
             g.dirty = false;
             g.last_saved = now;
             (Some(g.prefs.clone()), false)
-        } else {
+        } else if !g.scheduled {
+            g.scheduled = true;
             (None, true)
+        } else {
+            (None, false)
         }
     };
 
     if let Some(p) = immediate_save {
-        save_window_state(&p);
+        if force_flush {
+            save_window_state(&p);
+        } else {
+            let _ = tauri::async_runtime::spawn_blocking(move || save_window_state(&p));
+        }
     } else if schedule_delayed {
         let tracker_bg = tracker.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_millis(320)).await;
             let to_save = {
                 let mut g = tracker_bg.l();
+                g.scheduled = false;
                 if g.dirty {
                     g.dirty = false;
                     g.last_saved = Instant::now();
@@ -2536,9 +5393,28 @@ fn record_window_state(
                 }
             };
             if let Some(p) = to_save {
-                save_window_state(&p);
+                let _ = tokio::task::spawn_blocking(move || save_window_state(&p)).await;
             }
         });
+    }
+}
+
+fn shutdown_child_processes(app: &AppState) {
+    for tok in app.active_chats.l().values() {
+        tok.cancel();
+    }
+    for bridge in app.ssh_bridges.l().values() {
+        bridge.shutdown();
+    }
+    let handles: Vec<Arc<RelayHandle>> = app.relays.l().values().cloned().collect();
+    for h in handles {
+        h.keep_vm_on_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        h.cancel.l().cancel();
+        let pid = *h.child_pid.l();
+        if let Some(p) = pid {
+            kill_process_tree(p);
+        }
     }
 }
 
@@ -2563,7 +5439,7 @@ pub fn run() {
     }
     let instance_listener = match acquire_single_instance() {
         InstanceRole::AlreadyRunning => return,
-        InstanceRole::Primary(l) => Some(l),
+        InstanceRole::Primary(l, tok) => Some((l, tok)),
         InstanceRole::NoLock => None,
     };
     let instance_listener = Mutex::new(instance_listener);
@@ -2577,23 +5453,16 @@ pub fn run() {
                 let tracker = restore_window_state(&w);
                 *win_tracker_setup.l() = Some(tracker);
             }
-            if let Some(l) = instance_listener.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                serve_single_instance(l, app.handle().clone());
-            }
-            let state = Arc::new(AppState {
-                client: ColabClient::new(),
-                workspace: resolve_workspace(app),
-                overview: tokio::sync::RwLock::new(Overview::default()),
-                telemetry: Mutex::new(HashMap::new()),
-                last_assignments: Mutex::new(None),
-                last_ccu: Mutex::new(None),
-                relays: Mutex::new(HashMap::new()),
-                busy: Mutex::new(HashMap::new()),
-                probe_cooldown: Mutex::new(HashMap::new()),
-                gdrive: tokio::sync::Mutex::new((None, None)),
-                refresh_lock: tokio::sync::Mutex::new(()),
+            let state = AppState::new_with(ColabClient::new(), resolve_workspace(app));
+            let ws_skills = state.workspace.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                let _ = ensure_skill_scripts(&ws_skills);
             });
             app.manage(state.clone());
+
+            if let Some((l, tok)) = instance_listener.l().take() {
+                serve_single_instance(l, app.handle().clone(), state.clone(), tok);
+            }
 
             // 后台高频轮询：每 1.5 秒同步云端资源遥测与实时 tok/s（计费列表每 8 秒刷新），并推送前端
             // 每轮在独立任务中执行：单轮 panic 不会终止整个轮询；出错时指数退避（1.5s → 30s），成功即恢复
@@ -2637,7 +5506,11 @@ pub fn run() {
             stop_relay,
             read_workspace_files,
             save_workspace_files,
-            stream_llm_chat
+            stream_llm_chat,
+            cancel_llm_chat,
+            open_vm_ssh_terminal,
+            rotate_llm_api_key,
+            deploy_llm_on_vm
         ])
         .build(tauri::generate_context!());
     match built {
@@ -2661,7 +5534,7 @@ pub fn run() {
                                 record_window_state(&w, &tr, true);
                             }
                         }
-                        // 主窗口被销毁（含桌面会话被回收等异常情况）时立即刷盘并退出进程，绝不残留无窗口僵尸实例
+                        // 主窗口被销毁时立即刷盘、结束所有本机派生子进程树并退出进程，绝不残留僵尸进程
                         tauri::WindowEvent::Destroyed => {
                             if let Some(tr) = win_tracker_slot.l().clone() {
                                 let to_save = {
@@ -2677,6 +5550,9 @@ pub fn run() {
                                     save_window_state(&p);
                                 }
                             }
+                            if let Some(st) = handle.try_state::<Arc<AppState>>() {
+                                shutdown_child_processes(st.inner());
+                            }
                             handle.exit(0);
                         }
                         _ => {}
@@ -2690,5 +5566,468 @@ pub fn run() {
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn test_bluegreen_tunnel_port_for_vm_strict_prefix_isolation() {
+        let bg = serde_json::json!({ "session_prefix": "qwen" });
+        assert_eq!(bluegreen_tunnel_port_for_vm("qwen-blue", Some(&bg)), Some(18081));
+        assert_eq!(bluegreen_tunnel_port_for_vm("qwen-green", Some(&bg)), Some(18082));
+        assert_eq!(bluegreen_tunnel_port_for_vm("llm-blue", Some(&bg)), None);
+        assert_eq!(bluegreen_tunnel_port_for_vm("other-qwen-blue", Some(&bg)), None);
+        assert_eq!(bluegreen_tunnel_port_for_vm("qwen-blue", None), None);
+    }
+
+    #[test]
+    fn test_orphan_name_avoids_suffix_collision_and_matches_legacy() {
+        let ep1 = "m-s-alpha-123456";
+        let ep2 = "m-s-bravo-123456";
+        let a = orphan_name(ep1);
+        let b = orphan_name(ep2);
+        assert!(a.starts_with("orphan-123456-"));
+        assert!(b.starts_with("orphan-123456-"));
+        assert_ne!(a, b);
+        assert!(matches_orphan_name(ep1, &a));
+        assert!(matches_orphan_name(ep1, "orphan-123456"));
+        assert!(!matches_orphan_name(ep1, &b));
+    }
+
+    #[test]
+    fn test_validate_pip_packages_and_engine_normalization() {
+        assert_eq!(normalize_llm_engine("llamacpp"), "llama.cpp");
+        assert_eq!(normalize_llm_engine("llama.cpp"), "llama.cpp");
+        assert_eq!(normalize_llm_engine("vLLM"), "vllm");
+        assert!(validate_pip_packages("vllm transformers[torch]>=4.46.0").is_ok());
+        assert!(validate_pip_packages("--extra-index-url https://evil.example").is_err());
+        assert!(validate_pip_packages("-e /tmp/pkg").is_err());
+        assert!(parse_env_vars("HF_HUB_ENABLE_HF_TRANSFER=1\nexport WANDB_DISABLED=\"true\"").is_ok());
+        assert!(parse_env_vars("LD_PRELOAD=/tmp/bad.so").is_err());
+    }
+
+    #[test]
+    fn test_extract_sse_piece_variants() {
+        assert_eq!(
+            extract_sse_piece(r#"data:{"choices":[{"delta":{"reasoning_content":"思考"}}]}"#.as_bytes()),
+            Some("思考".to_string())
+        );
+        assert_eq!(
+            extract_sse_piece(r#"data: {"choices":[{"delta":{"content":"你好"}}]}"#.as_bytes()),
+            Some("你好".to_string())
+        );
+        assert_eq!(extract_sse_piece(b"data: [DONE]\n"), None);
+        assert_eq!(extract_sse_piece(b": keep-alive\n"), None);
+        let err_frame = parse_sse_frame(br#"data: {"error":{"message":"CUDA out of memory"}}"#);
+        assert!(err_frame.is_err());
+        assert!(err_frame.unwrap_err().contains("CUDA out of memory"));
+    }
+
+    #[test]
+    fn test_embedded_python_bridges_syntax_and_websocket_client_available() {
+        let py = cli::colab_python_bin();
+        if !py.exists() {
+            return;
+        }
+        let check_code = r#"
+import sys, websocket
+for idx, src in enumerate(sys.argv[1:]):
+    compile(src, f"<embedded_{idx}>", "exec")
+print("SYNTAX_AND_WS_OK")
+"#;
+        let out = std::process::Command::new(&py)
+            .args([
+                "-B",
+                "-c",
+                check_code,
+                WS_SSH_STDIO_BRIDGE_PY,
+                INTERACTIVE_TTY_CONSOLE_PY,
+                SILENT_PROBE_LAUNCHER_PY,
+                REMOTE_LLM_CHAT_STREAM_PY,
+            ])
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .expect("run colab python syntax check");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("SYNTAX_AND_WS_OK"),
+            "embedded python bridge check failed: stdout={stdout} stderr={stderr}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_llm_target_refuses_bare_vm_and_filters_stale_bluegreen() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_llm_route_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(tmp.join("nonexistent_colab"));
+
+        // 写入一份数天前残留的陈旧 serving 状态（对应 llm-blue 早已下线）
+        std::fs::write(
+            cfg_dir.join("llm_bluegreen_state.json"),
+            serde_json::json!({
+                "session_prefix": "llm",
+                "active_slot": "blue",
+                "active_session": "llm-blue",
+                "phase": "serving",
+                "model_name": "stale-model",
+                "updated_at": 1700000000.0
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let tok_file = tmp.join("token.json");
+        std::fs::write(
+            &tok_file,
+            serde_json::json!({
+                "token": "valid-token",
+                "expiry": "2099-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let client = ColabClient::new_for_test("http://127.0.0.1:9".into(), tok_file);
+        let app = AppState::new_with(client, ws_dir);
+
+        // 1. 陈旧蓝绿状态必须被过滤为 None
+        let filtered = filter_live_bluegreen_state(
+            cli::read_llm_bluegreen_state(),
+            &["general-dev".to_string()],
+            &HashMap::new(),
+            &[],
+            1794736000.0,
+        );
+        assert!(filtered.is_none(), "stale serving bluegreen state must be filtered out");
+
+        // 2. 仅有一台普通通用实例在线时，target_vm = "auto" 绝不能劫持该通用实例
+        {
+            let mut ov = app.overview.write().await;
+            ov.vms = vec![VmView {
+                name: "general-dev".into(),
+                on_server: true,
+                managed: true,
+                accelerator: "G4".into(),
+                ..Default::default()
+            }];
+        }
+        let auto_req = LlmChatRequest {
+            request_id: "req-1".into(),
+            target_vm: "auto".into(),
+            model: None,
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+        };
+        let err = resolve_llm_target(&app, &auto_req)
+            .await
+            .expect_err("auto target must refuse bare non-LLM VM");
+        assert!(
+            err.to_string().contains("尚未部署大模型推理引擎"),
+            "unexpected error: {err}"
+        );
+
+        // 3. 当在线实例包含 LLM API 信息时，target_vm = "auto" 正常命中并携带专属端口与 API Key
+        let api_info = cli::resolve_or_create_llm_api_info(
+            "qwen-srv",
+            "standalone",
+            "vllm",
+            0,
+            8000,
+            "Qwen/Qwen2.5-7B-Instruct",
+        );
+        {
+            let mut ov = app.overview.write().await;
+            ov.vms.push(VmView {
+                name: "qwen-srv".into(),
+                on_server: true,
+                managed: true,
+                accelerator: "G4".into(),
+                llm_api: Some(api_info.clone()),
+                ..Default::default()
+            });
+        }
+        let resolved = resolve_llm_target(&app, &auto_req)
+            .await
+            .expect("should resolve online LLM VM");
+        assert_eq!(resolved.vm_name, "qwen-srv");
+        assert_eq!(resolved.local_tunnel_port, Some(api_info.local_port));
+        assert_eq!(resolved.api_key.as_deref(), Some(api_info.api_key.as_str()));
+        assert_eq!(resolved.model, "Qwen/Qwen2.5-7B-Instruct");
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_hard_terminate_c1_endpoint_none_and_m3_sixth_retry() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_lib_test_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(cfg_dir.join("sessions.json"), "{}").unwrap();
+
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(tmp.join("nonexistent_colab_bin"));
+
+        let has_rogue = Arc::new(AtomicBool::new(true));
+        let post_unassign_count = Arc::new(AtomicUsize::new(0));
+        let six_alive = Arc::new(AtomicBool::new(false));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let has_rogue_srv = has_rogue.clone();
+        let post_cnt_srv = post_unassign_count.clone();
+        let six_alive_srv = six_alive.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let hr = has_rogue_srv.clone();
+                let pc = post_cnt_srv.clone();
+                let sa = six_alive_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first = req.lines().next().unwrap_or("");
+                    let body = if first.starts_with("GET /tun/m/assignments") {
+                        let mut items = Vec::new();
+                        if hr.load(Ordering::SeqCst) {
+                            items.push(serde_json::json!({
+                                "endpoint": "m-s-rogue999",
+                                "accelerator": "T4",
+                                "runtimeProxyInfo": { "token": "ptok", "url": "http://127.0.0.1" }
+                            }));
+                        }
+                        if sa.load(Ordering::SeqCst) {
+                            items.push(serde_json::json!({
+                                "endpoint": "m-s-six006",
+                                "accelerator": "A100",
+                                "runtimeProxyInfo": { "token": "ptok", "url": "http://127.0.0.1" }
+                            }));
+                        }
+                        format!(")]}}'\n{}", serde_json::json!({ "assignments": items }))
+                    } else if first.starts_with("GET /tun/m/unassign/") {
+                        r#"{"token":"xsrf-tok"}"#.to_string()
+                    } else if first.starts_with("POST /tun/m/unassign/m-s-six006") {
+                        let c = pc.fetch_add(1, Ordering::SeqCst) + 1;
+                        if c >= 6 {
+                            sa.store(false, Ordering::SeqCst);
+                        }
+                        "{}".to_string()
+                    } else if first.starts_with("GET /tun/m/ccu-info") {
+                        r#"{"currentBalance":99.5}"#.to_string()
+                    } else {
+                        "{}".to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tok_file = tmp.join("token.json");
+        std::fs::write(
+            &tok_file,
+            serde_json::json!({
+                "token": "valid-token",
+                "expiry": "2099-01-01T00:00:00Z",
+                "refresh_token": "rt",
+                "client_id": "cid",
+                "client_secret": "csec"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_file);
+        let app = AppState::new_with(client, ws_dir);
+
+        // 1. C-1: endpoint is None while an unaccounted VM is billing on server -> MUST NOT claim verified_unassigned!
+        let r1 = hard_terminate(&app, "provisioning-vm", None, true).await;
+        assert!(!r1.verified_unassigned, "must refuse false verified_unassigned when unaccounted VM exists");
+        assert_eq!(r1.remaining_endpoints, vec!["m-s-rogue999".to_string()]);
+        assert!(r1.error.is_some());
+
+        // 2. C-1: once server truly has 0 VMs -> verified_unassigned == true
+        has_rogue.store(false, Ordering::SeqCst);
+        let r2 = hard_terminate(&app, "provisioning-vm", None, true).await;
+        assert!(r2.verified_unassigned);
+        assert!(r2.error.is_none());
+
+        // 3. M-3: unassign succeeds only on the 6th attempt -> post-loop final check marks verified_unassigned == true
+        six_alive.store(true, Ordering::SeqCst);
+        let r3 = hard_terminate(&app, "six-vm", Some("m-s-six006".into()), false).await;
+        assert_eq!(post_unassign_count.load(Ordering::SeqCst), 6);
+        assert!(r3.verified_unassigned, "6th unassign should be verified by final list_assignments check");
+
+        // 4. C-1: unknown VM name while another valid session is active on server -> MUST refuse verified_unassigned
+        std::fs::write(
+            cfg_dir.join("sessions.json"),
+            serde_json::json!({
+                "other-active": { "endpoint": "m-s-rogue999" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        has_rogue.store(true, Ordering::SeqCst);
+        let r4 = hard_terminate(&app, "typo-unknown-vm", None, false).await;
+        assert!(
+            !r4.verified_unassigned,
+            "unknown VM must not report verified_unassigned while other server VMs are billing"
+        );
+
+        // 5. C-1: cancelling a relay mid-provisioning catches and unassigns newly leaked server VM
+        six_alive.store(true, Ordering::SeqCst);
+        post_unassign_count.store(5, Ordering::SeqCst); // next unassign on m-s-six006 will drop it
+        {
+            let h = Arc::new(RelayHandle::new("prov-relay"));
+            h.pre_provision_endpoints
+                .l()
+                .insert("m-s-rogue999".to_string());
+            h.status.l().running = true;
+            h.status.l().phase = "provisioning".into();
+            h.task_alive.store(true, Ordering::SeqCst);
+            app.relays.l().insert("prov-relay".to_string(), h);
+        }
+        let r5 = hard_terminate(&app, "prov-relay", None, true).await;
+        assert!(r5.verified_unassigned, "newly leaked provisioning VM should be caught and unassigned");
+        assert_eq!(r5.endpoint.as_deref(), Some("m-s-six006"));
+        assert!(!six_alive.load(Ordering::SeqCst));
+        assert!(has_rogue.load(Ordering::SeqCst), "pre-existing other session VM must remain untouched");
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_orphan_ssh_bridge_identity_and_embedded_relay_adapter() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_ssh_skills_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let empty_ws = tmp.join("packaged_ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&empty_ws).unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+
+        // 1. External user workspace even with stale .agents/skills must NOT override embedded scripts;
+        //    all 5 embedded scripts including colab_relay_adapter.py must be extracted into colab_config_dir()/skills/
+        let stale_bg = empty_ws
+            .join(".agents")
+            .join("skills")
+            .join("colab-llm-bluegreen")
+            .join("scripts");
+        std::fs::create_dir_all(&stale_bg).unwrap();
+        for fname in [
+            "llm_bluegreen_manager.py",
+            "llm_local_gateway.py",
+            "llm_metrics_sidecar.py",
+        ] {
+            std::fs::write(stale_bg.join(fname), "# STALE_2026_11_10_SCRIPT\n").unwrap();
+        }
+        let mgr = ensure_skill_scripts(&empty_ws).expect("ensure_skill_scripts must succeed");
+        assert!(
+            mgr.starts_with(&cfg_dir),
+            "must resolve to embedded skills under colab_config_dir(), not stale user workspace: {}",
+            mgr.display()
+        );
+        let mgr_body = std::fs::read_to_string(&mgr).unwrap();
+        assert!(
+            !mgr_body.contains("STALE_2026_11_10_SCRIPT"),
+            "extracted manager script must match current embedded source"
+        );
+        assert!(mgr.with_file_name("llm_local_gateway.py").exists());
+        assert!(mgr.with_file_name("llm_metrics_sidecar.py").exists());
+        let relay_scripts = cfg_dir.join("skills").join("colab-dl-relay").join("scripts");
+        assert!(relay_scripts.join("dl_relay_runner.py").exists());
+        assert!(
+            relay_scripts.join("colab_relay_adapter.py").exists(),
+            "colab_relay_adapter.py must be extracted alongside dl_relay_runner.py"
+        );
+
+        // 1b. Workspace registry pre-write & rollback helper check
+        assert!(!cli::has_workspace_entry("vm-failed-temp"));
+        cli::register_workspace_entry("vm-failed-temp", "ws", Some("/tmp/ws"), None);
+        assert!(cli::has_workspace_entry("vm-failed-temp"));
+        cli::remove_workspace_entry("vm-failed-temp");
+        assert!(!cli::has_workspace_entry("vm-failed-temp"));
+
+        // 2. Valid orphan-* VM gets SSH bridge port, Host colab-orphan-* in ~/.ssh/config, and -i <pilot_key> when id_ed25519.pub is absent
+        let tok_file = tmp.join("token.json");
+        std::fs::write(
+            &tok_file,
+            r#"{"token":"valid-token","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let client = ColabClient::new_for_test("http://127.0.0.1:9".into(), tok_file);
+        let app = AppState::new_with(client, empty_ws);
+        let orphan_assign: Assignment = serde_json::from_value(serde_json::json!({
+            "endpoint": "m-s-orphan01",
+            "accelerator": "G4",
+            "variant": 1,
+            "machineShape": 0,
+            "runtimeProxyInfo": {
+                "url": "https://8080-m-s-orphan01.prod.colab.dev",
+                "token": "secret-tok",
+                "tokenExpiresInSeconds": 3600
+            }
+        }))
+        .unwrap();
+
+        let port = ensure_vm_ssh_bridge(&app, "orphan-orphan01-1234", &orphan_assign)
+            .await
+            .expect("orphan-* with safe alias must receive local SSH bridge port");
+        assert!(port > 0);
+        cli::sync_ssh_config_hosts(&[("orphan-orphan01-1234".into(), port)]);
+        let ssh_cfg = std::fs::read_to_string(cli::ssh_config_path()).unwrap();
+        assert!(
+            ssh_cfg.contains("Host colab-orphan-orphan01-1234"),
+            "~/.ssh/config must contain Host colab-orphan-*"
+        );
+
+        let info_no_default = build_vm_ssh_info("orphan-orphan01-1234", &orphan_assign, Some(port));
+        assert!(info_no_default.ready, "orphan-* SSH info must be ready when bridge port > 0");
+        assert!(
+            info_no_default.colab_ssh_command.contains(" -i \""),
+            "colab_ssh_command must pass -i <pilot_key> when ~/.ssh/id_ed25519.pub is absent: {}",
+            info_no_default.colab_ssh_command
+        );
+        assert!(!info_no_default.remote_ws_url.contains("secret-tok"));
+
+        // When default ~/.ssh/id_ed25519.pub exists, colab_ssh_command stays concise
+        std::fs::write(cli::ssh_dir().join("id_ed25519.pub"), "ssh-ed25519 AAAATEST test").unwrap();
+        let info_with_default = build_vm_ssh_info("orphan-orphan01-1234", &orphan_assign, Some(port));
+        assert_eq!(
+            info_with_default.colab_ssh_command,
+            "colab ssh -s orphan-orphan01-1234"
+        );
+
+        shutdown_child_processes(&app);
+        *cli::TEST_CONFIG_DIR.l() = None;
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

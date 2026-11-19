@@ -42,6 +42,7 @@ export function ScriptDialog(props: { open: boolean; onClose: () => void }) {
     <Modal
       open={props.open}
       onClose={props.onClose}
+      closable={!saving}
       wide
       icon={<ColabIcon size={24} />}
       iconBg="#fff7e6"
@@ -49,7 +50,7 @@ export function ScriptDialog(props: { open: boolean; onClose: () => void }) {
       sub={ws ? `工作目录：${ws}` : undefined}
       footer={
         <>
-          <button className="btn" onClick={props.onClose}>关闭</button>
+          <button className="btn" onClick={props.onClose} disabled={saving}>关闭</button>
           <button className="btn btn-primary" onClick={save} disabled={saving || loading}>
             {saving ? <Loader2 size={15} className="spin" /> : <Save size={15} />}保存
           </button>
@@ -60,11 +61,25 @@ export function ScriptDialog(props: { open: boolean; onClose: () => void }) {
         <div className="field">
           <label>train.py —— 开机拉取断点 · 原子保存 · 定时 rclone 热备 · 到时安全交接（通过环境变量接收面板参数）</label>
         </div>
-        <textarea className="editor" style={{ height: 380 }} spellCheck={false} value={train} onChange={(e) => setTrain(e.target.value)} />
+        <textarea
+          className="editor"
+          style={{ height: 380 }}
+          spellCheck={false}
+          disabled={loading || saving}
+          value={train}
+          onChange={(e) => setTrain(e.target.value)}
+        />
       </div>
       <div>
         <div className="field"><label>requirements.txt —— 每棒开机通过 colab install -r 安装</label></div>
-        <textarea className="editor" style={{ height: 90 }} spellCheck={false} value={req} onChange={(e) => setReq(e.target.value)} />
+        <textarea
+          className="editor"
+          style={{ height: 90 }}
+          spellCheck={false}
+          disabled={loading || saving}
+          value={req}
+          onChange={(e) => setReq(e.target.value)}
+        />
       </div>
     </Modal>
   );

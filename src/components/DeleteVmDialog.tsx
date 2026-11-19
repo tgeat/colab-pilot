@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { CheckCircle2, Loader2, PowerOff, ShieldAlert, ShieldCheck } from "lucide-react";
 import { ColabIcon, Modal, KV } from "./ui";
+import { errText } from "../api";
 import type { TerminateReceipt, VmView } from "../types";
 import { num } from "../format";
 
@@ -30,11 +31,12 @@ export function DeleteVmDialog(props: {
 
   const run = async () => {
     setStage("running");
+    setReceipt(null);
     setErr(null);
     try {
       setReceipt(await props.onDelete(vm));
     } catch (e) {
-      setErr(String(e));
+      setErr(errText(e));
     }
     setStage("done");
   };

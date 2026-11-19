@@ -3,6 +3,7 @@ import { Repeat2 } from "lucide-react";
 import type { RelayConfig, VmView } from "../types";
 import { DEFAULT_RELAY } from "../types";
 import { fmtDuration, pct } from "../format";
+import { isSingleShapeAccelerator, resolveEffectiveHighMem } from "../chatUtils";
 
 const PHASES = [
   ["preparing_gdrive", "准备网盘"],
@@ -26,12 +27,18 @@ export function RelayPanel(props: {
   const running = !!relay?.running;
   const tr = vm.telemetry?.training ?? null;
 
-  const [cfg, setCfg] = useState<RelayConfig>(() => ({
-    ...DEFAULT_RELAY,
-    gpu_type: vm.accelerator && vm.accelerator !== "CPU" && vm.accelerator !== "…" ? vm.accelerator : "T4",
-    high_mem: vm.high_ram || DEFAULT_RELAY.high_mem,
-    ...(relay?.config ?? {}),
-  }));
+  const [cfg, setCfg] = useState<RelayConfig>(() => {
+    const initGpu =
+      vm.accelerator && vm.accelerator !== "CPU" && vm.accelerator !== "…"
+        ? vm.accelerator
+        : "T4";
+    return {
+      ...DEFAULT_RELAY,
+      gpu_type: initGpu,
+      high_mem: resolveEffectiveHighMem(initGpu, vm.high_ram || DEFAULT_RELAY.high_mem),
+      ...(relay?.config ?? {}),
+    };
+  });
 
   // 运行中以后端配置为准
   useEffect(() => {
@@ -42,11 +49,18 @@ export function RelayPanel(props: {
   const phaseIdx = relay?.phase === "cooldown" ? PHASES.length - 1 : rawIdx;
   const curEpoch = tr?.current_epoch ?? 0;
   const totEpoch = tr?.total_epochs ?? cfg.total_epochs;
-  const epochPct = totEpoch ? (curEpoch / totEpoch) * 100 : 0;
+  const epochPct = totEpoch > 0 ? (curEpoch / totEpoch) * 100 : 0;
   const elapsed = tr?.elapsed_seconds ?? 0;
-  const handoverPct = (elapsed / (cfg.max_session_hours * 3600)) * 100;
+  const sessionSec = Math.max(180, (Number.isFinite(cfg.max_session_hours) ? cfg.max_session_hours : 22.5) * 3600);
+  const handoverPct = (elapsed / sessionSec) * 100;
 
+  const singleShape = isSingleShapeAccelerator(cfg.gpu_type);
+  const effectiveHighMem = resolveEffectiveHighMem(cfg.gpu_type, cfg.high_mem);
   const set = <K extends keyof RelayConfig>(k: K, v: RelayConfig[K]) => setCfg((c) => ({ ...c, [k]: v }));
+  const gdriveValid =
+    /^[A-Za-z0-9_-]{2,}:[^\\\s]+$/.test(cfg.gdrive_dir.trim()) &&
+    !cfg.gdrive_dir.trim().startsWith("-") &&
+    !cfg.gdrive_dir.includes("..");
   const disabled = running || props.pending || !!vm.busy;
 
   let stateLabel = relay?.phase_label ?? "未开启接力";
@@ -66,10 +80,24 @@ export function RelayPanel(props: {
           <div className="sub">{sub}</div>
         </div>
         <button
+          type="button"
           className={`switch ${running ? "on" : ""}`}
-          disabled={props.pending || !!vm.busy}
-          title={running ? "关闭接力训练" : "开启接力训练"}
-          onClick={() => (running ? props.onStopRequest() : props.onStart(cfg))}
+          disabled={props.pending || !!vm.busy || (!running && !gdriveValid)}
+          title={
+            running
+              ? "关闭接力训练"
+              : gdriveValid
+                ? "开启接力训练"
+                : "Google Drive 目录格式必须为 remote:path（如 gdrive:colab_relay）"
+          }
+          onClick={() =>
+            running
+              ? props.onStopRequest()
+              : props.onStart({
+                  ...cfg,
+                  high_mem: effectiveHighMem,
+                })
+          }
         />
       </div>
 
@@ -92,18 +120,48 @@ export function RelayPanel(props: {
         </div>
         <div className="field">
           <label>单棒时长 (h)</label>
-          <input type="number" step={0.5} min={0.1} max={23.5} value={cfg.max_session_hours} disabled={disabled}
-            onChange={(e) => set("max_session_hours", Number(e.target.value))} />
+          <input
+            type="number"
+            step={0.5}
+            min={0.1}
+            max={23.5}
+            value={cfg.max_session_hours}
+            disabled={disabled}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              set("max_session_hours", Number.isFinite(v) ? Math.min(48, Math.max(0.05, v)) : 22.5);
+            }}
+          />
         </div>
         <div className="field">
           <label>热备间隔 (min)</label>
-          <input type="number" step={5} min={1} value={cfg.backup_interval_minutes} disabled={disabled}
-            onChange={(e) => set("backup_interval_minutes", Number(e.target.value))} />
+          <input
+            type="number"
+            step={5}
+            min={1}
+            max={1440}
+            value={cfg.backup_interval_minutes}
+            disabled={disabled}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              set("backup_interval_minutes", Number.isFinite(v) ? Math.min(1440, Math.max(0.5, v)) : 30);
+            }}
+          />
         </div>
         <div className="field">
           <label>总轮数 Epochs</label>
-          <input type="number" step={10} min={1} value={cfg.total_epochs} disabled={disabled}
-            onChange={(e) => set("total_epochs", Math.max(1, Math.round(Number(e.target.value))))} />
+          <input
+            type="number"
+            step={10}
+            min={1}
+            max={1000000}
+            value={cfg.total_epochs}
+            disabled={disabled}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              set("total_epochs", Number.isFinite(v) ? Math.min(1000000, Math.max(1, Math.round(v))) : 1);
+            }}
+          />
         </div>
       </div>
       <div className="field" style={{ marginTop: 8 }}>
@@ -111,9 +169,14 @@ export function RelayPanel(props: {
         <input value={cfg.gdrive_dir} disabled={disabled} onChange={(e) => set("gdrive_dir", e.target.value)} />
       </div>
       <div className="checks">
-        <label>
-          <input type="checkbox" checked={cfg.high_mem} disabled={disabled} onChange={(e) => set("high_mem", e.target.checked)} />
-          High-RAM
+        <label title={singleShape ? `${cfg.gpu_type} 采用固定内存规格，无需开启 High-RAM` : undefined}>
+          <input
+            type="checkbox"
+            checked={effectiveHighMem}
+            disabled={disabled || singleShape}
+            onChange={(e) => set("high_mem", e.target.checked)}
+          />
+          High-RAM {singleShape ? <span className="dim">(该型号固定内存规格)</span> : null}
         </label>
         <label>
           <input type="checkbox" checked={cfg.reset_done_flag} disabled={disabled}

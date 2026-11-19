@@ -1,13 +1,15 @@
 import { useState } from "react";
 import { Loader2, Square, Trash2 } from "lucide-react";
-import { ColabIcon, Modal } from "./ui";
-import type { VmView } from "../types";
+import { errText } from "../api";
+import { ColabIcon, Modal, useToast } from "./ui";
+import type { TerminateReceipt, VmView } from "../types";
 
 export function StopRelayDialog(props: {
   vm: VmView | null;
   onClose: () => void;
-  onStop: (vm: VmView, destroy: boolean) => Promise<void>;
+  onStop: (vm: VmView, destroy: boolean) => Promise<TerminateReceipt | null | void>;
 }) {
+  const toast = useToast();
   const [busy, setBusy] = useState<null | "keep" | "destroy">(null);
   if (!props.vm) return null;
   const vm = props.vm;
@@ -15,8 +17,17 @@ export function StopRelayDialog(props: {
   const go = async (destroy: boolean) => {
     setBusy(destroy ? "destroy" : "keep");
     try {
-      await props.onStop(vm, destroy);
+      const receipt = await props.onStop(vm, destroy);
+      if (destroy && receipt && !receipt.verified_unassigned) {
+        toast(
+          receipt.error ?? "服务端计费核验未通过，请前往实例关机窗口核验重试",
+          "error",
+        );
+        return;
+      }
       props.onClose();
+    } catch (e) {
+      toast(errText(e), "error");
     } finally {
       setBusy(null);
     }

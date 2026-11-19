@@ -18,10 +18,14 @@ Google Colab G4 (NVIDIA RTX PRO 6000 Blackwell 96GB) 上的 Qwen/Qwen3.8-27B。
 """
 
 import argparse
+import atexit
+import ctypes
+import hmac
 import http.client
 import json
 import os
 import queue
+import secrets
 import socket
 import subprocess
 import sys
@@ -33,21 +37,77 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# 启用 Windows 终端 ANSI 颜色支持，并恢复代码页为 936
-if os.name == "nt":
-    os.system("")
+def _setup_console() -> None:
+    """仅在 CLI 主入口调用，避免作为模块被单元测试 import 时污染宿主终端代码页或标准流 (M-11)。"""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+    if os.name == "nt":
+        os.system("")
+        try:
+            _k32 = ctypes.windll.kernel32
+            orig_in = _k32.GetConsoleCP()
+            orig_out = _k32.GetConsoleOutputCP()
+
+            def _restore_cp() -> None:
+                try:
+                    if orig_in:
+                        _k32.SetConsoleCP(orig_in)
+                    if orig_out:
+                        _k32.SetConsoleOutputCP(orig_out)
+                except Exception:
+                    pass
+
+            atexit.register(_restore_cp)
+        except Exception:
+            pass
+
+
+# Windows OAIDL `VARIANT` 标准布局：32 位为 16 字节，64 位为 24 字节 (M-11)
+class _VariantBRecord(ctypes.Structure):
+    _fields_ = [
+        ("pvRecord", ctypes.c_void_p),
+        ("pRecInfo", ctypes.c_void_p),
+    ]
+
+
+class _VariantUnion(ctypes.Union):
+    _fields_ = [
+        ("llVal", ctypes.c_longlong),
+        ("lVal", ctypes.c_long),
+        ("brecVal", _VariantBRecord),
+    ]
+
+
+class COMVariant(ctypes.Structure):
+    _anonymous_ = ("_u",)
+    _fields_ = [
+        ("vt", ctypes.c_ushort),
+        ("wReserved1", ctypes.c_ushort),
+        ("wReserved2", ctypes.c_ushort),
+        ("wReserved3", ctypes.c_ushort),
+        ("_u", _VariantUnion),
+    ]
+
+
+def _com_release(ptr: ctypes.c_void_p) -> None:
+    """安全调用 IUnknown::Release (vtbl[2]) 释放 COM 接口引用计数 (M-11)。"""
+    if not ptr or not ptr.value:
+        return
     try:
-        import ctypes
-        _k32 = ctypes.windll.kernel32
-        _k32.SetConsoleCP(936)
-        _k32.SetConsoleOutputCP(936)
+        vtbl = ctypes.cast(
+            ctypes.cast(ptr.value, ctypes.POINTER(ctypes.c_void_p))[0],
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        ReleaseProto = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+        ReleaseProto(vtbl[2])(ptr.value)
     except Exception:
         pass
+    finally:
+        ptr.value = None
 
 
 # ====================================================================
@@ -183,25 +243,18 @@ def _activate_tsf_chinese_compartments() -> None:
                 arr = (ctypes.c_ubyte * 8)(*u.bytes[8:])
                 return cls(d1, d2, d3, arr)
 
-        class VARIANT(ctypes.Structure):
-            _fields_ = [
-                ("vt", wintypes.WORD),
-                ("wReserved1", wintypes.WORD),
-                ("wReserved2", wintypes.WORD),
-                ("wReserved3", wintypes.WORD),
-                ("lVal", wintypes.LONG),
-                ("pad", wintypes.LONG),
-            ]
-
         # 1. 切换语言到简体中文 (0x0804)
         pipp = ctypes.c_void_p()
-        if msctf.TF_CreateInputProcessorProfiles(ctypes.byref(pipp)) == 0 and pipp.value:
-            ipp_vtbl = ctypes.cast(
-                ctypes.cast(pipp.value, ctypes.POINTER(ctypes.c_void_p))[0],
-                ctypes.POINTER(ctypes.c_void_p),
-            )
-            ChangeLangProto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.WORD)
-            ChangeLangProto(ipp_vtbl[14])(pipp.value, 0x0804)
+        try:
+            if msctf.TF_CreateInputProcessorProfiles(ctypes.byref(pipp)) == 0 and pipp.value:
+                ipp_vtbl = ctypes.cast(
+                    ctypes.cast(pipp.value, ctypes.POINTER(ctypes.c_void_p))[0],
+                    ctypes.POINTER(ctypes.c_void_p),
+                )
+                ChangeLangProto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.WORD)
+                ChangeLangProto(ipp_vtbl[14])(pipp.value, 0x0804)
+        finally:
+            _com_release(pipp)
 
         # 2. 创建并激活 ITfThreadMgr
         if _TSF_THREAD_MGR is None:
@@ -230,26 +283,32 @@ def _activate_tsf_chinese_compartments() -> None:
             ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)
         )
         pcm = ctypes.c_void_p()
-        if QIProto(tm_vtbl[0])(_TSF_THREAD_MGR.value, ctypes.byref(iid_cm), ctypes.byref(pcm)) == 0 and pcm.value:
-            cm_vtbl = ctypes.cast(
-                ctypes.cast(pcm.value, ctypes.POINTER(ctypes.c_void_p))[0],
-                ctypes.POINTER(ctypes.c_void_p),
-            )
-            GetCompProto = ctypes.WINFUNCTYPE(
-                ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)
-            )
-            SetValProto = ctypes.WINFUNCTYPE(
-                ctypes.c_long, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(VARIANT)
-            )
-            for g_obj, val in ((guid_open, 1), (guid_conv, 0x0401)):
-                pcomp = ctypes.c_void_p()
-                if GetCompProto(cm_vtbl[3])(pcm.value, ctypes.byref(g_obj), ctypes.byref(pcomp)) == 0 and pcomp.value:
-                    comp_vtbl = ctypes.cast(
-                        ctypes.cast(pcomp.value, ctypes.POINTER(ctypes.c_void_p))[0],
-                        ctypes.POINTER(ctypes.c_void_p),
-                    )
-                    v = VARIANT(vt=3, lVal=val)
-                    SetValProto(comp_vtbl[3])(pcomp.value, _TSF_CLIENT_ID or 1, ctypes.byref(v))
+        try:
+            if QIProto(tm_vtbl[0])(_TSF_THREAD_MGR.value, ctypes.byref(iid_cm), ctypes.byref(pcm)) == 0 and pcm.value:
+                cm_vtbl = ctypes.cast(
+                    ctypes.cast(pcm.value, ctypes.POINTER(ctypes.c_void_p))[0],
+                    ctypes.POINTER(ctypes.c_void_p),
+                )
+                GetCompProto = ctypes.WINFUNCTYPE(
+                    ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)
+                )
+                SetValProto = ctypes.WINFUNCTYPE(
+                    ctypes.c_long, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(COMVariant)
+                )
+                for g_obj, val in ((guid_open, 1), (guid_conv, 0x0401)):
+                    pcomp = ctypes.c_void_p()
+                    try:
+                        if GetCompProto(cm_vtbl[3])(pcm.value, ctypes.byref(g_obj), ctypes.byref(pcomp)) == 0 and pcomp.value:
+                            comp_vtbl = ctypes.cast(
+                                ctypes.cast(pcomp.value, ctypes.POINTER(ctypes.c_void_p))[0],
+                                ctypes.POINTER(ctypes.c_void_p),
+                            )
+                            v = COMVariant(vt=3, lVal=val)
+                            SetValProto(comp_vtbl[3])(pcomp.value, _TSF_CLIENT_ID or 1, ctypes.byref(v))
+                    finally:
+                        _com_release(pcomp)
+        finally:
+            _com_release(pcm)
     except Exception:
         pass
 
@@ -593,6 +652,36 @@ C_RED = "\033[31m"
 C_MAGENTA = "\033[35m"
 
 
+def resolve_colab_cli_python() -> str:
+    """跨平台定位安装了 `colab_cli` 的 `uv` 工具虚拟环境 Python 解释器 (H-7)。"""
+    candidates: List[str] = []
+    uv_tool_dir = os.environ.get("UV_TOOL_DIR")
+    if uv_tool_dir:
+        candidates.extend(
+            [
+                os.path.join(uv_tool_dir, "google-colab-cli", "Scripts", "pythonw.exe"),
+                os.path.join(uv_tool_dir, "google-colab-cli", "Scripts", "python.exe"),
+                os.path.join(uv_tool_dir, "google-colab-cli", "bin", "python"),
+            ]
+        )
+    if os.name == "nt":
+        for env_key in ("APPDATA", "LOCALAPPDATA"):
+            base = os.environ.get(env_key)
+            if base:
+                candidates.append(os.path.join(base, "uv", "tools", "google-colab-cli", "Scripts", "pythonw.exe"))
+                candidates.append(os.path.join(base, "uv", "tools", "google-colab-cli", "Scripts", "python.exe"))
+        candidates.append(os.path.expanduser("~/.local/share/uv/tools/google-colab-cli/Scripts/python.exe"))
+    else:
+        candidates.append(os.path.expanduser("~/.local/share/uv/tools/google-colab-cli/bin/python"))
+        xdg_data = os.environ.get("XDG_DATA_HOME")
+        if xdg_data:
+            candidates.append(os.path.join(xdg_data, "uv", "tools", "google-colab-cli", "bin", "python"))
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            return cand
+    return sys.executable
+
+
 def ensure_gateway_running(gateway_url: str) -> None:
     parsed = urlparse(gateway_url)
     host = parsed.hostname or "127.0.0.1"
@@ -616,16 +705,18 @@ def ensure_gateway_running(gateway_url: str) -> None:
     if not os.path.exists(gw_script):
         return
 
-    print(f"{C_YELLOW}⚡ 正在唤醒本机蓝绿网关 ({host}:{port}) 与 Colab SSH 隧道...{C_RESET}", flush=True)
+    py_exe = resolve_colab_cli_python()
+    print(f"{C_YELLOW}⚡ 正在唤醒本机蓝绿网关 ({host}:{port})...{C_RESET}", flush=True)
     kwargs: Dict[str, Any] = {"stdin": subprocess.DEVNULL, "close_fds": True}
     if os.name == "nt":
-        kwargs["creationflags"] = 0x08000000 | 0x00000200 | 0x00000008
+        # 严格单独使用 CREATE_NO_WINDOW (0x08000000)，绝不与互斥的 DETACHED_PROCESS (0x08) 叠加 (H-7)
+        kwargs["creationflags"] = 0x08000000
     else:
         kwargs["start_new_session"] = True
     log_path = os.path.join(os.path.expanduser("~/.config/colab-cli"), "llm_local_gateway.log")
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     subprocess.Popen(
-        [sys.executable, gw_script, "--port", str(port)],
+        [py_exe, gw_script, "--port", str(port)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         **kwargs,
@@ -636,11 +727,11 @@ def ensure_gateway_running(gateway_url: str) -> None:
             conn.request("GET", "/pilot/gateway")
             st = json.loads(conn.getresponse().read().decode("utf-8"))
             conn.close()
-            if st.get("tunnel_open"):
+            if st.get("ok"):
                 break
         except Exception:
             pass
-        time.sleep(0.6)
+        time.sleep(0.4)
 
 
 def fetch_gateway_status(gateway_url: str) -> Dict[str, Any]:
@@ -696,44 +787,52 @@ def stream_chat_completion(
     collected: List[str] = []
 
     conn = http.client.HTTPConnection(host, port, timeout=300)
-    conn.request(
-        "POST",
-        "/v1/chat/completions",
-        body=payload,
-        headers={"Content-Type": "application/json", "Authorization": "Bearer colab-pilot"},
-    )
-    resp = conn.getresponse()
-    if resp.status >= 400:
-        err_text = resp.read().decode("utf-8", errors="replace")
-        conn.close()
-        raise RuntimeError(f"HTTP {resp.status}: {err_text}")
+    try:
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=payload,
+            headers={"Content-Type": "application/json", "Authorization": "Bearer colab-pilot"},
+        )
+        resp = conn.getresponse()
+        if resp.status >= 400:
+            err_text = resp.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {resp.status}: {err_text}")
 
-    while True:
-        raw_line = resp.fp.readline()
-        if not raw_line:
-            break
-        line = raw_line.decode("utf-8", errors="replace").strip()
-        if not line.startswith("data: "):
-            continue
-        data_str = line[6:].strip()
-        if data_str == "[DONE]":
-            break
+        while True:
+            raw_line = resp.fp.readline()
+            if not raw_line:
+                break
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                obj = json.loads(data_str)
+            except Exception:
+                continue
+            if isinstance(obj, dict) and obj.get("error"):
+                err_val = obj["error"]
+                err_msg = err_val.get("message") if isinstance(err_val, dict) else str(err_val)
+                raise RuntimeError(f"流式推理异常: {err_msg or err_val}")
+            if isinstance(obj, dict):
+                delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+                piece = delta.get("content") or delta.get("reasoning_content") or ""
+                if piece:
+                    if t_first is None:
+                        t_first = time.perf_counter()
+                    chunks_count += 1
+                    collected.append(piece)
+                    print(piece, end="", flush=True)
+                    if on_token is not None:
+                        on_token(piece)
+    finally:
         try:
-            obj = json.loads(data_str)
-            delta = obj.get("choices", [{}])[0].get("delta", {})
-            piece = delta.get("content") or ""
-            if piece:
-                if t_first is None:
-                    t_first = time.perf_counter()
-                chunks_count += 1
-                collected.append(piece)
-                print(piece, end="", flush=True)
-                if on_token is not None:
-                    on_token(piece)
+            conn.close()
         except Exception:
             pass
-
-    conn.close()
     t_end = time.perf_counter()
     print(flush=True)
 
@@ -872,7 +971,6 @@ _WEB_HTML = """<!DOCTYPE html>
 <div class="toolbar">
   <button onclick="sendCmd('/status')">📊 实时状态 (/status)</button>
   <button onclick="sendCmd('/clear')">🧹 清空对话 (/clear)</button>
-  <button onclick="sendCmd('/switchover')">🔄 蓝绿热切 (/switchover)</button>
   <button onclick="document.getElementById('inp').focus()">🀄 聚焦中文输入框</button>
 </div>
 <div id="chat"></div>
@@ -881,6 +979,7 @@ _WEB_HTML = """<!DOCTYPE html>
   <button id="send" onclick="submitInput()">发送<br>(Enter)</button>
 </footer>
 <script>
+const CSRF_TOKEN = "__QWEN_CSRF_TOKEN__";
 const chat = document.getElementById('chat');
 const inp = document.getElementById('inp');
 const badge = document.getElementById('badge');
@@ -903,7 +1002,7 @@ async function submitInput() {
   inp.focus();
   await fetch('/api/send', {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    headers: {'Content-Type': 'application/json', 'X-Qwen-Token': CSRF_TOKEN},
     body: JSON.stringify({text})
   });
 }
@@ -911,7 +1010,7 @@ async function submitInput() {
 async function sendCmd(cmd) {
   await fetch('/api/send', {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    headers: {'Content-Type': 'application/json', 'X-Qwen-Token': CSRF_TOKEN},
     body: JSON.stringify({text: cmd})
   });
   inp.focus();
@@ -919,7 +1018,9 @@ async function sendCmd(cmd) {
 
 async function poll() {
   try {
-    const r = await fetch('/api/events?since=' + lastSeq);
+    const r = await fetch('/api/events?since=' + lastSeq, {
+      headers: {'X-Qwen-Token': CSRF_TOKEN}
+    });
     const data = await r.json();
     if (data.badge) badge.textContent = data.badge;
     if (data.reset) { chat.innerHTML = ''; }
@@ -941,17 +1042,45 @@ poll();
 """
 
 
+def is_forbidden_web_command(text: str) -> bool:
+    """网页镜像端严禁调用本地文件读取 (`/file`) 与付费 GPU 热切 (`/switchover`) 等高权限指令 (H-2)。"""
+    low = text.strip().lower()
+    return (
+        low == "/file"
+        or low.startswith("/file ")
+        or low == "/switchover"
+        or low.startswith("/switchover ")
+    )
+
+
 class LocalWebMirror:
     """内置轻量级本地网页端镜像服务，提供 100% 浏览器原生中文输入法支持并与 GUI/CLI 实时同步"""
 
-    def __init__(self, on_submit_text: Callable[[str], None]) -> None:
+    def __init__(self, on_submit_text: Callable[[str], None], max_events: int = 400) -> None:
         self.on_submit_text = on_submit_text
         self.lock = threading.Lock()
         self.events: List[Dict[str, Any]] = []
+        self.max_events = max(32, int(max_events))
         self.seq = 0
         self.badge_text = "● 已连接本机蓝绿网关"
         self.url = ""
+        self.csrf_token = secrets.token_hex(16)
         self._server: Optional[ThreadingHTTPServer] = None
+
+    def _is_valid_origin(self, origin: Optional[str]) -> bool:
+        if not origin:
+            return True
+        try:
+            parsed = urlparse(origin.strip())
+        except Exception:
+            return False
+        if parsed.scheme != "http" or (parsed.hostname or "").lower() not in ("127.0.0.1", "localhost"):
+            return False
+        if self.url:
+            expected_port = urlparse(self.url).port
+            if expected_port and parsed.port != expected_port:
+                return False
+        return True
 
     def append(self, text: str, tag: str = "bot_text") -> None:
         cls_map = {
@@ -967,6 +1096,8 @@ class LocalWebMirror:
         with self.lock:
             self.seq += 1
             self.events.append({"seq": self.seq, "text": text, "cls": cls_map.get(tag, "msg-bot-body")})
+            if len(self.events) > self.max_events:
+                del self.events[: len(self.events) - self.max_events]
 
     def clear(self) -> None:
         with self.lock:
@@ -978,6 +1109,19 @@ class LocalWebMirror:
         with self.lock:
             self.badge_text = text
 
+    def stop(self) -> None:
+        srv = self._server
+        self._server = None
+        if srv is not None:
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+            try:
+                srv.server_close()
+            except Exception:
+                pass
+
     def start(self) -> str:
         mirror = self
 
@@ -985,16 +1129,37 @@ class LocalWebMirror:
             def log_message(self, format: str, *args: Any) -> None:
                 return
 
+            def _send_json_resp(self, code: int, obj: Dict[str, Any]) -> None:
+                raw_resp = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw_resp)))
+                self.end_headers()
+                self.wfile.write(raw_resp)
+
+            def _check_csrf_and_origin(self) -> bool:
+                if not mirror._is_valid_origin(self.headers.get("Origin")):
+                    self._send_json_resp(403, {"ok": False, "error": "Forbidden Origin"})
+                    return False
+                tok = self.headers.get("X-Qwen-Token") or ""
+                if not hmac.compare_digest(tok, mirror.csrf_token):
+                    self._send_json_resp(403, {"ok": False, "error": "Invalid or missing CSRF token"})
+                    return False
+                return True
+
             def do_GET(self) -> None:
                 if self.path == "/" or self.path.startswith("/index"):
-                    body = _WEB_HTML.encode("utf-8")
+                    body = _WEB_HTML.replace("__QWEN_CSRF_TOKEN__", mirror.csrf_token).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
                     return
                 if self.path.startswith("/api/events"):
+                    if not self._check_csrf_and_origin():
+                        return
                     since = 0
                     if "since=" in self.path:
                         try:
@@ -1004,36 +1169,43 @@ class LocalWebMirror:
                     with mirror.lock:
                         evs = [e for e in mirror.events if e["seq"] > since]
                         reset = any(e.get("reset") for e in evs)
-                        payload = json.dumps(
-                            {"events": evs, "badge": mirror.badge_text, "reset": reset},
-                            ensure_ascii=False,
-                        ).encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Content-Length", str(len(payload)))
-                    self.end_headers()
-                    self.wfile.write(payload)
+                        payload = {"events": evs, "badge": mirror.badge_text, "reset": reset}
+                    self._send_json_resp(200, payload)
                     return
                 self.send_response(404)
                 self.end_headers()
 
             def do_POST(self) -> None:
                 if self.path == "/api/send":
-                    ln = int(self.headers.get("Content-Length", "0"))
+                    if not self._check_csrf_and_origin():
+                        return
+                    ctype = (self.headers.get("Content-Type") or "").lower()
+                    if not ctype.startswith("application/json"):
+                        self._send_json_resp(415, {"ok": False, "error": "Content-Type must be application/json"})
+                        return
+                    try:
+                        ln = int(self.headers.get("Content-Length", "0") or "0")
+                    except ValueError:
+                        ln = -1
+                    if ln < 0 or ln > 262144:
+                        self._send_json_resp(400, {"ok": False, "error": "Invalid Content-Length"})
+                        return
                     raw = self.rfile.read(ln).decode("utf-8", errors="replace")
                     try:
                         obj = json.loads(raw)
-                        txt = (obj.get("text") or "").strip()
-                        if txt:
-                            mirror.on_submit_text(txt)
+                        if not isinstance(obj, dict):
+                            raise ValueError("JSON body must be an object")
+                        txt = str(obj.get("text") or "").strip()
                     except Exception:
-                        pass
-                    resp = b'{"ok":true}'
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(resp)))
-                    self.end_headers()
-                    self.wfile.write(resp)
+                        self._send_json_resp(400, {"ok": False, "error": "Invalid JSON body"})
+                        return
+                    if is_forbidden_web_command(txt):
+                        mirror.append("✗ 出于安全保护，网页端禁止执行 /file 与 /switchover，请在本地原生窗口或终端中执行。\n", "error")
+                        self._send_json_resp(403, {"ok": False, "error": "Command disabled in web mirror"})
+                        return
+                    if txt:
+                        mirror.on_submit_text(txt)
+                    self._send_json_resp(200, {"ok": True})
                     return
                 self.send_response(404)
                 self.end_headers()
@@ -1147,7 +1319,7 @@ def run_gui_repl(gateway_url: str, model: str, system_prompt: str, max_tokens: i
         return run_cli_repl(gateway_url, model, system_prompt, max_tokens)
 
     ui_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue()
-    web_mirror = LocalWebMirror(on_submit_text=lambda txt: ui_queue.put(("stdin_line", txt)))
+    web_mirror = LocalWebMirror(on_submit_text=lambda txt: ui_queue.put(("web_line", txt)))
     web_url = web_mirror.start()
 
     ensure_gateway_running(gateway_url)
@@ -1344,9 +1516,13 @@ def run_gui_repl(gateway_url: str, model: str, system_prompt: str, max_tokens: i
         sys.stdout.write(f"\n{C_BOLD}{C_GREEN}You > {C_RESET}")
         sys.stdout.flush()
 
-    def _handle_command_or_chat(raw_text: str) -> None:
+    def _handle_command_or_chat(raw_text: str, web_origin: bool = False) -> None:
         user_input = raw_text.strip()
         if not user_input:
+            return
+
+        if web_origin and is_forbidden_web_command(user_input):
+            _append_chat("✗ 出于安全保护，网页端禁止执行 /file 与 /switchover，请在本地原生窗口或终端中执行。\n", "error")
             return
 
         if user_input.lower() in ("/exit", "/quit", "exit", "quit"):
@@ -1437,14 +1613,21 @@ def run_gui_repl(gateway_url: str, model: str, system_prompt: str, max_tokens: i
                 "llm_bluegreen_manager.py",
             )
             st = fetch_gateway_status(gateway_url)
-            gpu = st.get("gpu") or "G4"
+            gpu_opt = st.get("gpu")
+            prefix_opt = st.get("session_prefix")
+            sw_cmd = [sys.executable, mgr, "switchover"]
+            if prefix_opt:
+                sw_cmd.extend(["--session-prefix", str(prefix_opt)])
+            if gpu_opt:
+                sw_cmd.extend(["--gpu", str(gpu_opt)])
             msg = (
-                f"⚡ 已在后台启动 Make-Before-Break 并行蓝绿热切换 (GPU={gpu})...\n"
+                f"⚡ 已在后台启动 Make-Before-Break 并行蓝绿热切换 (GPU={gpu_opt or '继承当前配置'})...\n"
                 "   新槽位完成模型加载与真机 Warmup 冒烟前，您可继续无中断与当前槽位对话！\n"
             )
             _append_chat(f"\n{msg}", "sys_info")
             print(f"\n{C_YELLOW}{msg.strip()}{C_RESET}", flush=True)
-            subprocess.Popen([sys.executable, mgr, "switchover", "--session-prefix", "llm", "--gpu", gpu])
+            sw_kwargs: Dict[str, Any] = {"creationflags": 0x08000000} if os.name == "nt" else {"start_new_session": True}
+            subprocess.Popen(sw_cmd, **sw_kwargs)
             _reprint_cli_prompt()
             return
 
@@ -1615,7 +1798,9 @@ def run_gui_repl(gateway_url: str, model: str, system_prompt: str, max_tokens: i
                 elif kind == "error":
                     _append_chat(f"\n✗ 请求失败: {payload}\n", "error")
                 elif kind == "stdin_line":
-                    _handle_command_or_chat(payload)
+                    _handle_command_or_chat(payload, web_origin=False)
+                elif kind == "web_line":
+                    _handle_command_or_chat(payload, web_origin=True)
                 elif kind == "done":
                     send_btn.configure(state="normal", text="发送\n(Enter)")
                     _activate_ime()
@@ -1626,7 +1811,10 @@ def run_gui_repl(gateway_url: str, model: str, system_prompt: str, max_tokens: i
 
     root.after(80, _init_status_and_ime)
     root.after(20, _poll_with_init)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        web_mirror.stop()
     return 0
 
 
@@ -1711,10 +1899,17 @@ def run_cli_repl(gateway_url: str, model: str, system_prompt: str, max_tokens: i
                 "llm_bluegreen_manager.py",
             )
             st = fetch_gateway_status(gateway_url)
-            gpu = st.get("gpu") or "G4"
-            print(f"{C_YELLOW}⚡ 已在后台启动 Make-Before-Break 并行蓝绿热切换 (GPU={gpu})...{C_RESET}")
+            gpu_opt = st.get("gpu")
+            prefix_opt = st.get("session_prefix")
+            sw_cmd = [sys.executable, mgr, "switchover"]
+            if prefix_opt:
+                sw_cmd.extend(["--session-prefix", str(prefix_opt)])
+            if gpu_opt:
+                sw_cmd.extend(["--gpu", str(gpu_opt)])
+            print(f"{C_YELLOW}⚡ 已在后台启动 Make-Before-Break 并行蓝绿热切换 (GPU={gpu_opt or '继承当前配置'})...{C_RESET}")
             print(f"{C_DIM}   新槽位完成模型加载与真机 Warmup 冒烟前，您可继续无中断与当前槽位对话！{C_RESET}")
-            subprocess.Popen([sys.executable, mgr, "switchover", "--session-prefix", "llm", "--gpu", gpu])
+            sw_kwargs: Dict[str, Any] = {"creationflags": 0x08000000} if os.name == "nt" else {"start_new_session": True}
+            subprocess.Popen(sw_cmd, **sw_kwargs)
             continue
 
         if user_input.lower().startswith("/file "):
@@ -1751,6 +1946,7 @@ def run_cli_repl(gateway_url: str, model: str, system_prompt: str, max_tokens: i
 
 
 def main() -> int:
+    _setup_console()
     parser = argparse.ArgumentParser(
         description="Colab Pilot — Qwen/Qwen3.8-27B 本机客户端 (支持原生 Win32 RichEdit50W 中文 GUI + 内置网页端 + 终端三端同步)"
     )

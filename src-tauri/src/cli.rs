@@ -47,6 +47,15 @@ pub(crate) static TEST_COLAB_BIN: std::sync::Mutex<Option<PathBuf>> = std::sync:
 #[cfg(test)]
 pub(crate) static TEST_CONFIG_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
+#[cfg(test)]
+pub(crate) static TEST_ADC_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) static TEST_RCLONE_BIN: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) static TEST_RCLONE_CONF: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 pub fn colab_bin() -> PathBuf {
     #[cfg(test)]
     if let Some(p) = TEST_COLAB_BIN.l().clone() {
@@ -91,6 +100,10 @@ pub fn colab_python_bin() -> PathBuf {
 }
 
 pub fn rclone_bin() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = TEST_RCLONE_BIN.l().clone() {
+        return p;
+    }
     let p = local_bin("rclone");
     if p.exists() {
         return p;
@@ -99,6 +112,10 @@ pub fn rclone_bin() -> PathBuf {
 }
 
 pub fn rclone_conf_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = TEST_RCLONE_CONF.l().clone() {
+        return p;
+    }
     if let Ok(p) = std::env::var("RCLONE_CONFIG") {
         return PathBuf::from(p);
     }
@@ -108,6 +125,56 @@ pub fn rclone_conf_path() -> PathBuf {
         }
     }
     dirs::config_dir().unwrap_or_default().join("rclone").join("rclone.conf")
+}
+
+pub fn adc_credentials_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = TEST_ADC_PATH.l().clone() {
+        return p;
+    }
+    if let Ok(p) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(cfg_dir) = std::env::var("CLOUDSDK_CONFIG") {
+        let trimmed = cfg_dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("application_default_credentials.json");
+        }
+    }
+    if cfg!(windows) {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            let win_p = PathBuf::from(appdata)
+                .join("gcloud")
+                .join("application_default_credentials.json");
+            if win_p.exists() {
+                return win_p;
+            }
+            let home_p = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".config")
+                .join("gcloud")
+                .join("application_default_credentials.json");
+            if home_p.exists() {
+                return home_p;
+            }
+            return win_p;
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".config")
+        .join("gcloud")
+        .join("application_default_credentials.json")
+}
+
+pub fn is_adc_configured() -> bool {
+    let p = adc_credentials_path();
+    std::fs::metadata(&p)
+        .map(|m| m.is_file() && m.len() > 10)
+        .unwrap_or(false)
 }
 
 pub fn colab_config_dir() -> PathBuf {
@@ -128,6 +195,10 @@ pub fn history_dir() -> PathBuf {
 
 pub fn workspaces_registry_path() -> PathBuf {
     colab_config_dir().join("workspaces.json")
+}
+
+pub fn session_profiles_path() -> PathBuf {
+    colab_config_dir().join("pilot_session_profiles.json")
 }
 
 pub fn llm_api_keys_path() -> PathBuf {
@@ -204,8 +275,15 @@ fn iso_utc_now() -> String {
 }
 
 fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
+    if path.is_dir() {
+        return Err(anyhow!(
+            "无法写入文件 `{}`：目标路径已存在且是一个目录",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建父目录 `{}` 失败", parent.display()))?;
     }
     let tmp = path.with_file_name(format!(
         ".{}.{}.tmp",
@@ -221,16 +299,20 @@ fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
             .write(true)
             .truncate(true)
             .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(content.as_bytes())?;
+            .open(&tmp)
+            .with_context(|| format!("创建临时文件 `{}` 失败", tmp.display()))?;
+        f.write_all(content.as_bytes())
+            .with_context(|| format!("写入临时文件 `{}` 失败", tmp.display()))?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&tmp, content)?;
+        std::fs::write(&tmp, content)
+            .with_context(|| format!("写入临时文件 `{}` 失败", tmp.display()))?;
     }
     if std::fs::rename(&tmp, path).is_err() {
-        let _ = std::fs::write(path, content);
+        let write_res = std::fs::write(path, content);
         let _ = std::fs::remove_file(&tmp);
+        write_res.with_context(|| format!("覆盖写入文件 `{}` 失败", path.display()))?;
     }
     Ok(())
 }
@@ -706,6 +788,132 @@ pub fn remove_workspace_entry(session_name: &str) {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct SessionProfile {
+    #[serde(default)]
+    pub boot_mode: String,
+    #[serde(default)]
+    pub accelerator: String,
+    #[serde(default)]
+    pub high_mem: bool,
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+    #[serde(default)]
+    pub auth_mode: Option<String>,
+    #[serde(default)]
+    pub llm_config: Option<crate::CreateVmLlmConfig>,
+    #[serde(default)]
+    pub relay_config: Option<crate::relay::RelayConfig>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+static PROFILES_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn normalize_auth_mode(auth_mode: Option<&str>) -> Option<String> {
+    match auth_mode.map(str::trim).unwrap_or("").to_ascii_lowercase().as_str() {
+        "adc" => Some("adc".into()),
+        "oauth2" => Some("oauth2".into()),
+        _ => None,
+    }
+}
+
+pub fn read_session_profiles() -> HashMap<String, SessionProfile> {
+    let _lock = PROFILES_IO_LOCK.l();
+    std::fs::read_to_string(session_profiles_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, SessionProfile>>(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn get_session_profile(session_name: &str) -> Option<SessionProfile> {
+    read_session_profiles().remove(session_name)
+}
+
+pub fn save_session_profile(session_name: &str, profile: &SessionProfile) -> Result<()> {
+    if session_name.trim().is_empty() {
+        return Ok(());
+    }
+    let _lock = PROFILES_IO_LOCK.l();
+    let path = session_profiles_path();
+    let mut map: HashMap<String, SessionProfile> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let mut entry = profile.clone();
+    if entry.updated_at.is_none() {
+        entry.updated_at = Some(iso_utc_now());
+    }
+    map.insert(session_name.to_string(), entry);
+    let raw = serde_json::to_string_pretty(&map)?;
+    atomic_write_file(&path, &raw)?;
+    invalidate_recent_sessions_cache();
+    Ok(())
+}
+
+pub fn get_session_auth_mode(session_name: &str) -> Option<String> {
+    get_session_profile(session_name)
+        .and_then(|p| normalize_auth_mode(p.auth_mode.as_deref()))
+}
+
+pub fn build_colab_subcommand_args(auth_mode: Option<&str>, sub_args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(sub_args.len() + 2);
+    if matches!(normalize_auth_mode(auth_mode).as_deref(), Some("adc")) {
+        out.push("--auth".into());
+        out.push("adc".into());
+    }
+    out.extend_from_slice(sub_args);
+    out
+}
+
+pub fn colab_args_for_session(session_name: &str, sub_args: &[String]) -> Vec<String> {
+    let mode = get_session_auth_mode(session_name);
+    build_colab_subcommand_args(mode.as_deref(), sub_args)
+}
+
+/// 查找某个会话已绑定的本地工作区目录（依次查询 workspaces.json、pilot_session_profiles.json、sessions.json）
+pub fn lookup_bound_workspace_path(session_name: &str) -> Option<PathBuf> {
+    let name = session_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if let Ok(raw) = std::fs::read_to_string(workspaces_registry_path()) {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, Value>>(&raw) {
+            if let Some(p) = map
+                .get(name)
+                .and_then(|e| e.get("workspace_path").or_else(|| e.get("path")))
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(PathBuf::from(p));
+            }
+        }
+    }
+    if let Some(prof) = get_session_profile(name) {
+        if let Some(p) = prof
+            .workspace_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(PathBuf::from(p));
+        }
+    }
+    let sessions = read_sessions();
+    if let Some(sv) = sessions.get(name) {
+        if let Some(wp) = sv
+            .get("_workspace_path")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(PathBuf::from(wp));
+        }
+    }
+    None
+}
+
 fn generate_random_hex(byte_len: usize) -> String {
     let mut out = String::with_capacity(byte_len * 2 + 32);
     while out.len() < byte_len * 2 {
@@ -769,7 +977,7 @@ pub fn remove_llm_api_key_entry(vm_name: &str) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn upsert_llm_api_key_record(
+fn try_upsert_llm_api_key_record(
     vm_name: &str,
     slot: &str,
     engine: &str,
@@ -778,7 +986,8 @@ fn upsert_llm_api_key_record(
     preferred_local_port: u16,
     remote_port: u16,
     model_name: &str,
-) -> LlmApiAccessInfo {
+    strict_persist: bool,
+) -> Result<LlmApiAccessInfo> {
     let _lock = API_KEYS_IO_LOCK.l();
     let mut root = read_llm_api_keys_root();
     if root.get("vms").and_then(|v| v.as_object()).is_none() {
@@ -805,7 +1014,7 @@ fn upsert_llm_api_key_record(
         if m.is_empty() { "default".to_string() } else { m.to_string() }
     };
 
-    let mut dirty = false;
+    let mut dirty = strict_persist;
     let (existing_key, existing_port) = root
         .get("vms")
         .and_then(|v| v.get(vm_name))
@@ -905,8 +1114,28 @@ fn upsert_llm_api_key_record(
                 }),
             );
         }
-        if let Ok(raw) = serde_json::to_string_pretty(&root) {
-            let _ = atomic_write_file(&llm_api_keys_path(), &raw);
+        let path = llm_api_keys_path();
+        let raw = serde_json::to_string_pretty(&root).context("序列化 llm_api_keys.json 失败")?;
+        if strict_persist {
+            atomic_write_file(&path, &raw)
+                .with_context(|| format!("持久化写入 `{}` 失败", path.display()))?;
+            let read_back_raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("回读校验 `{}` 失败", path.display()))?;
+            let read_back_val: Value = serde_json::from_str(&read_back_raw)
+                .with_context(|| format!("解析回读 `{}` JSON 失败", path.display()))?;
+            let persisted_key = read_back_val
+                .get("vms")
+                .and_then(|v| v.get(vm_name))
+                .and_then(|e| e.get("api_key"))
+                .and_then(|x| x.as_str());
+            if persisted_key != Some(key_val.as_str()) {
+                return Err(anyhow!(
+                    "API Key 落盘回读校验失败：`{}` 中未读取到刚写入的新密钥",
+                    path.display()
+                ));
+            }
+        } else {
+            let _ = atomic_write_file(&path, &raw);
         }
     }
 
@@ -916,7 +1145,7 @@ fn upsert_llm_api_key_record(
     let python_example = format!(
         "from openai import OpenAI\nclient = OpenAI(base_url=\"{api_base_url}\", api_key=\"{key_val}\")\nresp = client.chat.completions.create(model=\"{model_norm}\", messages=[{{\"role\": \"user\", \"content\": \"你好\"}}])\nprint(resp.choices[0].message.content)"
     );
-    LlmApiAccessInfo {
+    Ok(LlmApiAccessInfo {
         vm_name: vm_name.to_string(),
         slot: slot_norm,
         model_name: model_norm,
@@ -930,7 +1159,7 @@ fn upsert_llm_api_key_record(
         remote_port,
         curl_example,
         python_example,
-    }
+    })
 }
 
 /// 获取或自动签发某台 LLM 实例的本机 OpenAI 兼容 API Key 与调用示例
@@ -942,7 +1171,7 @@ pub fn resolve_or_create_llm_api_info(
     remote_port: u16,
     model_name: &str,
 ) -> LlmApiAccessInfo {
-    upsert_llm_api_key_record(
+    try_upsert_llm_api_key_record(
         vm_name,
         slot,
         engine,
@@ -951,10 +1180,20 @@ pub fn resolve_or_create_llm_api_info(
         local_port,
         remote_port,
         model_name,
+        false,
     )
+    .unwrap_or_else(|_| LlmApiAccessInfo {
+        vm_name: vm_name.to_string(),
+        slot: slot.to_string(),
+        model_name: model_name.to_string(),
+        engine: engine.to_string(),
+        local_port,
+        remote_port,
+        ..Default::default()
+    })
 }
 
-/// 轮换或自定义某台 LLM 实例的 API Key
+/// 轮换或自定义某台 LLM 实例的 API Key（强制落盘并回读校验，写入失败返回 Err）
 pub fn rotate_llm_api_key_entry(
     vm_name: &str,
     slot: &str,
@@ -963,8 +1202,8 @@ pub fn rotate_llm_api_key_entry(
     local_port: u16,
     remote_port: u16,
     model_name: &str,
-) -> LlmApiAccessInfo {
-    upsert_llm_api_key_record(
+) -> Result<LlmApiAccessInfo> {
+    try_upsert_llm_api_key_record(
         vm_name,
         slot,
         engine,
@@ -973,6 +1212,7 @@ pub fn rotate_llm_api_key_entry(
         local_port,
         remote_port,
         model_name,
+        true,
     )
 }
 
@@ -1084,6 +1324,14 @@ pub struct RecentSessionView {
     pub exec_count: usize,
     pub file_op_count: usize,
     pub last_summary: String,
+    #[serde(default)]
+    pub boot_mode: Option<String>,
+    #[serde(default)]
+    pub llm_config: Option<crate::CreateVmLlmConfig>,
+    #[serde(default)]
+    pub relay_config: Option<crate::relay::RelayConfig>,
+    #[serde(default)]
+    pub profile_saved: bool,
 }
 
 /// 从任意本地文件路径向上推导所属工作区根目录
@@ -1473,6 +1721,31 @@ pub fn resolve_workspace_for_vm(
         }
     }
 
+    // 1b. 检查 pilot_session_profiles.json 中持久化的工作区路径
+    if let Some(prof) = get_session_profile(session_name) {
+        if let Some(wp) = prof
+            .workspace_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let name = Path::new(wp)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(session_name)
+                .to_string();
+            return WorkspaceInfo {
+                name,
+                path: Some(wp.to_string()),
+                remote_cwd,
+                source: "会话配置档案 (pilot_session_profiles.json)".into(),
+                active_script,
+                description: None,
+            };
+        }
+    }
+
     // 2. 检查云端 /content/.colab_workspace.json 或进程环境变量 COLAB_WORKSPACE
     if let Some(tel) = telemetry {
         if let Some(wm) = tel.get("workspace_meta").filter(|v| v.is_object()) {
@@ -1597,20 +1870,27 @@ pub fn resolve_workspace_for_vm(
     }
 }
 
+static RECENT_SESSIONS_CACHE: std::sync::Mutex<
+    Option<(Instant, PathBuf, Vec<String>, usize, Vec<RecentSessionView>)>,
+> = std::sync::Mutex::new(None);
+
+pub fn invalidate_recent_sessions_cache() {
+    *RECENT_SESSIONS_CACHE.l() = None;
+}
+
 /// 读取最近结束的历史会话摘要（用于仪表盘展示近期工作区执行记录）
-/// 结果按 (活跃会话集合, limit) 缓存 30 秒；活跃实例增减时立即重新计算
+/// 结果按 (配置目录, 活跃会话集合, limit) 缓存 30 秒；活跃实例增减或配置更新时立即重新计算
 pub fn read_recent_sessions(active_names: &[String], limit: usize) -> Vec<RecentSessionView> {
-    type RecentCache = Option<(Instant, Vec<String>, usize, Vec<RecentSessionView>)>;
-    static CACHE: std::sync::Mutex<RecentCache> = std::sync::Mutex::new(None);
+    let cfg_dir = colab_config_dir();
     let mut key: Vec<String> = active_names.to_vec();
     key.sort();
-    if let Some((t, k, l, v)) = CACHE.l().as_ref() {
-        if t.elapsed() < FS_CACHE_TTL && *k == key && *l == limit {
+    if let Some((t, cdir, k, l, v)) = RECENT_SESSIONS_CACHE.l().as_ref() {
+        if t.elapsed() < FS_CACHE_TTL && *cdir == cfg_dir && *k == key && *l == limit {
             return v.clone();
         }
     }
     let list = read_recent_sessions_uncached(active_names, limit);
-    *CACHE.l() = Some((Instant::now(), key, limit, list.clone()));
+    *RECENT_SESSIONS_CACHE.l() = Some((Instant::now(), cfg_dir, key, limit, list.clone()));
     list
 }
 
@@ -1619,6 +1899,7 @@ fn read_recent_sessions_uncached(active_names: &[String], limit: usize) -> Vec<R
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return vec![];
     };
+    let saved_profiles = read_session_profiles();
     let mut list: Vec<RecentSessionView> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1637,6 +1918,7 @@ fn read_recent_sessions_uncached(active_names: &[String], limit: usize) -> Vec<R
         let mut ep = None;
         let mut acc = "CPU".to_string();
         let mut shape = "STANDARD".to_string();
+        let mut saw_created_event = false;
         let mut created_at = None;
         let mut terminated_at = None;
         let mut last_event_at = String::new();
@@ -1654,6 +1936,7 @@ fn read_recent_sessions_uncached(active_names: &[String], limit: usize) -> Vec<R
             }
             match v.get("event_type").and_then(|x| x.as_str()).unwrap_or("") {
                 "session_created" => {
+                    saw_created_event = true;
                     created_at = Some(ts);
                     ep = v.get("endpoint").and_then(|x| x.as_str()).map(|s| s.to_string());
                     let a = v.get("accelerator").and_then(|x| x.as_str()).unwrap_or("NONE");
@@ -1688,7 +1971,39 @@ fn read_recent_sessions_uncached(active_names: &[String], limit: usize) -> Vec<R
             .first()
             .map(|e| e.summary.clone())
             .unwrap_or_else(|| "会话已结束".into());
-        let ws = resolve_workspace_for_vm(stem, ep.as_deref(), None, None, &discovered_paths);
+        let mut ws = resolve_workspace_for_vm(stem, ep.as_deref(), None, None, &discovered_paths);
+        let (boot_mode, llm_config, relay_config, profile_saved) =
+            if let Some(prof) = saved_profiles.get(stem) {
+                if ws.path.is_none() && prof.workspace_path.is_some() {
+                    ws.path = prof.workspace_path.clone();
+                    if let Some(ref wp) = ws.path {
+                        if let Some(dn) = Path::new(wp)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            ws.name = dn.to_string();
+                        }
+                    }
+                }
+                if !saw_created_event && !prof.accelerator.trim().is_empty() {
+                    let pa = prof.accelerator.trim().to_uppercase();
+                    acc = if pa == "NONE" { "CPU".into() } else { pa };
+                    shape = if prof.high_mem {
+                        "HIGH_RAM".into()
+                    } else {
+                        "STANDARD".into()
+                    };
+                }
+                (
+                    Some(prof.boot_mode.clone()),
+                    prof.llm_config.clone(),
+                    prof.relay_config.clone(),
+                    true,
+                )
+            } else {
+                (None, None, None, false)
+            };
         list.push(RecentSessionView {
             session_name: stem.to_string(),
             workspace_name: ws.name,
@@ -1702,6 +2017,10 @@ fn read_recent_sessions_uncached(active_names: &[String], limit: usize) -> Vec<R
             exec_count,
             file_op_count,
             last_summary,
+            boot_mode,
+            llm_config,
+            relay_config,
+            profile_saved,
         });
     }
     list.sort_by(|a, b| b.last_event_at.cmp(&a.last_event_at));
@@ -1876,7 +2195,8 @@ where
     let mut out_done = false;
     let mut err_done = false;
     let cancel = cancel.unwrap_or_default();
-    let deadline = tokio::time::sleep(timeout);
+    let deadline_instant = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::sleep_until(deadline_instant);
     tokio::pin!(deadline);
 
     let mut cancelled = false;
@@ -1923,10 +2243,34 @@ where
 
     drop(stdout);
     drop(stderr);
-    if cancelled || timed_out {
+    let status = if cancelled || timed_out {
         kill_tree(&mut child).await;
-    }
-    let status = child.wait().await.ok();
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+    } else {
+        // 即使子进程提前关闭了 stdout/stderr 输出流并继续睡眠挂起，child.wait() 仍受总 deadline 与 cancel 约束
+        tokio::select! {
+            res = child.wait() => res.ok(),
+            _ = cancel.cancelled() => {
+                cancelled = true;
+                kill_tree(&mut child).await;
+                tokio::time::timeout(Duration::from_secs(5), child.wait())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+            }
+            _ = tokio::time::timeout_at(deadline_instant, std::future::pending::<()>()) => {
+                timed_out = true;
+                kill_tree(&mut child).await;
+                tokio::time::timeout(Duration::from_secs(5), child.wait())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+            }
+        }
+    };
     if let Some(slot) = pid_slot {
         *slot.l() = None;
     }
@@ -2359,6 +2703,181 @@ mod tests {
         }
 
         *TEST_CONFIG_DIR.l() = prev;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_60_run_streaming_enforces_deadline_after_child_closes_stdout_stderr() {
+        let py = colab_python_bin();
+        if !py.exists() {
+            return;
+        }
+        // Child prints a line, explicitly closes stdout (fd 1) and stderr (fd 2) so pipe readers hit EOF,
+        // and then keeps sleeping long past the timeout.
+        let code = "import os, sys, time; sys.stdout.write('PIPES_CLOSING\\n'); sys.stdout.flush(); os.close(1); os.close(2); time.sleep(30)";
+        let pid_slot: Mutex<Option<u32>> = Mutex::new(None);
+        let started = Instant::now();
+        let out = run_streaming(
+            &py,
+            &s(&["-c", code]),
+            None,
+            Duration::from_millis(400),
+            None,
+            Some(&pid_slot),
+            |_| {},
+        )
+        .await
+        .expect("run_streaming must bound post-EOF child.wait() by deadline");
+
+        assert!(
+            out.timed_out,
+            "child sleeping after closing stdout/stderr must trigger timed_out=true"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "post-EOF hang took too long: {:?}",
+            started.elapsed()
+        );
+        assert!(out.stdout.contains("PIPES_CLOSING"));
+        assert!(pid_slot.l().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_issue_59_rotate_llm_api_key_persists_verifies_and_errors_on_unwritable_path() {
+        let _env_guard = TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_apikey_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = TEST_CONFIG_DIR.l().clone();
+        *TEST_CONFIG_DIR.l() = Some(tmp.clone());
+
+        let ok_info = rotate_llm_api_key_entry(
+            "qwen-prod",
+            "blue",
+            "vllm",
+            Some("sk-custom-verified-123456"),
+            18081,
+            8000,
+            "Qwen/Qwen2.5-7B-Instruct",
+        )
+        .expect("rotate_llm_api_key_entry should succeed on writable config dir");
+        assert_eq!(ok_info.api_key, "sk-custom-verified-123456");
+        assert_eq!(
+            lookup_vm_api_key_meta("qwen-prod"),
+            Some(("sk-custom-verified-123456".to_string(), Some(18081)))
+        );
+
+        // Replace llm_api_keys.json with a directory so persistence fails
+        let key_path = llm_api_keys_path();
+        std::fs::remove_file(&key_path).unwrap();
+        std::fs::create_dir_all(&key_path).unwrap();
+
+        let err = rotate_llm_api_key_entry(
+            "qwen-prod",
+            "blue",
+            "vllm",
+            Some("sk-should-fail-999999"),
+            18081,
+            8000,
+            "Qwen/Qwen2.5-7B-Instruct",
+        )
+        .expect_err("rotate_llm_api_key_entry must return Err when disk persistence fails");
+        assert!(
+            err.to_string().contains("失败") || err.to_string().contains("目录"),
+            "unexpected error: {err:#}"
+        );
+
+        *TEST_CONFIG_DIR.l() = prev;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_43_and_74_adc_detection_subcommand_args_and_session_profile_persistence() {
+        let _env_guard = TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_profiles_{}", uuid::Uuid::new_v4()));
+        let hist = tmp.join("history");
+        std::fs::create_dir_all(&hist).unwrap();
+        let prev_cfg = TEST_CONFIG_DIR.l().clone();
+        let prev_adc = TEST_ADC_PATH.l().clone();
+        *TEST_CONFIG_DIR.l() = Some(tmp.clone());
+
+        let fake_adc = tmp.join("application_default_credentials.json");
+        *TEST_ADC_PATH.l() = Some(fake_adc.clone());
+        assert!(!is_adc_configured());
+        std::fs::write(&fake_adc, r#"{"type":"authorized_user"}"#).unwrap();
+        assert!(is_adc_configured());
+
+        let saved_llm = crate::CreateVmLlmConfig {
+            engine: "vllm".into(),
+            model_name: "Qwen/Qwen2.5-14B-Instruct".into(),
+            slot: Some("blue".into()),
+            gdrive_model_path: None,
+            custom_api_key: None,
+        };
+        save_session_profile(
+            "adc-node",
+            &SessionProfile {
+                boot_mode: "llm".into(),
+                accelerator: "L4".into(),
+                high_mem: false,
+                workspace_path: Some(tmp.display().to_string()),
+                auth_mode: Some("adc".into()),
+                llm_config: Some(saved_llm),
+                relay_config: None,
+                updated_at: None,
+            },
+        )
+        .expect("save_session_profile must succeed");
+
+        assert_eq!(get_session_auth_mode("adc-node").as_deref(), Some("adc"));
+        assert_eq!(
+            colab_args_for_session("adc-node", &s(&["restart-kernel", "-s", "adc-node"])),
+            s(&["--auth", "adc", "restart-kernel", "-s", "adc-node"])
+        );
+        assert_eq!(
+            colab_args_for_session("oauth-node", &s(&["stop", "-s", "oauth-node"])),
+            s(&["stop", "-s", "oauth-node"])
+        );
+
+        // Write history JSONL for both saved `adc-node` and legacy unsaved `llm-legacy`
+        std::fs::write(
+            hist.join("adc-node.jsonl"),
+            r#"{"timestamp":"2026-11-20T00:01:00Z","event_type":"session_created","accelerator":"L4","machine_shape":"STANDARD"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            hist.join("llm-legacy.jsonl"),
+            r#"{"timestamp":"2026-11-20T00:00:30Z","event_type":"session_created","accelerator":"T4","machine_shape":"HIGHMEM"}"#,
+        )
+        .unwrap();
+        invalidate_recent_sessions_cache();
+
+        let recent = read_recent_sessions(&[], 10);
+        let saved_view = recent
+            .iter()
+            .find(|r| r.session_name == "adc-node")
+            .expect("adc-node in recent");
+        assert!(saved_view.profile_saved);
+        assert_eq!(saved_view.boot_mode.as_deref(), Some("llm"));
+        assert_eq!(
+            saved_view
+                .llm_config
+                .as_ref()
+                .map(|c| c.model_name.as_str()),
+            Some("Qwen/Qwen2.5-14B-Instruct")
+        );
+
+        let legacy_view = recent
+            .iter()
+            .find(|r| r.session_name == "llm-legacy")
+            .expect("llm-legacy in recent");
+        assert!(!legacy_view.profile_saved);
+        assert!(
+            legacy_view.boot_mode.is_none(),
+            "unsaved legacy session must NOT guess boot_mode from `llm-` prefix"
+        );
+
+        *TEST_ADC_PATH.l() = prev_adc;
+        *TEST_CONFIG_DIR.l() = prev_cfg;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

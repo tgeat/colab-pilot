@@ -30,10 +30,13 @@ static KEYRING_AUTH_CACHE: std::sync::Mutex<Option<(bool, Instant)>> = std::sync
 struct TokenFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+    #[serde(default)]
     refresh_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token_uri: Option<String>,
+    #[serde(default)]
     client_id: String,
+    #[serde(default)]
     client_secret: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expiry: Option<String>,
@@ -237,11 +240,7 @@ pub struct ColabClient {
 }
 
 pub fn token_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".config")
-        .join("colab-cli")
-        .join("token.json")
+    crate::cli::colab_config_dir().join("token.json")
 }
 
 /// 判断 Contents API 错误是否由过期的 `runtimeProxyInfo.token`（HTTP 401 / 403）触发
@@ -343,6 +342,26 @@ impl ColabClient {
         ok
     }
 
+    pub fn is_client_authorized(&self) -> bool {
+        if let Some(ref p) = self.token_file_path {
+            if p.exists() {
+                return true;
+            }
+            #[cfg(test)]
+            if let Some(ref store) = self.keyring_override {
+                return store
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .and_then(|raw| serde_json::from_str::<TokenFile>(&raw).ok())
+                    .map(|tf| !tf.refresh_token.trim().is_empty())
+                    .unwrap_or(false);
+            }
+            return false;
+        }
+        Self::is_authorized()
+    }
+
     fn effective_token_path(&self) -> PathBuf {
         self.token_file_path.clone().unwrap_or_else(token_path)
     }
@@ -378,7 +397,7 @@ impl ColabClient {
 
         if self.token_file_path.is_some() {
             return Err(anyhow!(
-                "未找到 Colab 授权文件 {}，请先运行 `colab auth login` 完成授权",
+                "未找到 Colab 授权文件 {}，请先运行 `colab auth` 完成授权",
                 path.display()
             ));
         }
@@ -406,7 +425,7 @@ impl ColabClient {
 
         set_keyring_auth_cache(false);
         Err(anyhow!(
-            "未检测到 Colab 授权凭证（~/.config/colab-cli/token.json 或系统密钥环），请先在终端运行 `colab status` 或 `colab auth login` 完成 Google 登录"
+            "未检测到 Colab 授权凭证（~/.config/colab-cli/token.json 或系统密钥环），请先在终端运行 `colab auth` 或 `colab status` 完成 Google 登录"
         ))
     }
 
@@ -539,6 +558,11 @@ impl ColabClient {
 
     /// 向 Google OAuth 端点 POST refresh_token，返回 (access_token, 有效秒数)
     async fn refresh_access_token(&self, tf: &TokenFile) -> Result<(String, u64)> {
+        if tf.refresh_token.trim().is_empty() {
+            return Err(anyhow!(
+                "Colab OAuth 令牌已过期且缺少 refresh_token，请在终端运行 `colab auth` 或 `colab status` 重新授权"
+            ));
+        }
         #[derive(Deserialize)]
         struct RefreshResp {
             access_token: String,

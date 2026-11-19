@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
+import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
+import sys
 import time
 
 TELEMETRY_FILE = "/content/.colab_pilot_telemetry.json"
@@ -10,6 +13,7 @@ TRAINING_STATE_FILE = "/content/.colab_pilot_training_state.json"
 LLM_STATE_FILE = "/content/.colab_pilot_llm_state.json"
 WORKSPACE_META_FILE = "/content/.colab_workspace.json"
 PID_FILE = "/content/.colab_pilot_daemon.pid"
+PROBE_ACK_FILE = "/content/.colab_pilot_probe_ack.json"
 
 
 def _finite(obj):
@@ -292,7 +296,7 @@ def list_content_files():
     return entries
 
 
-def collect_once(prev_idle, prev_total, cpu_model):
+def collect_once(prev_idle, prev_total, cpu_model, probe_nonce=None, daemon_started_at=None):
     idle, total = read_cpu_stat()
     d_idle = idle - prev_idle
     d_total = total - prev_total
@@ -349,8 +353,17 @@ def collect_once(prev_idle, prev_total, cpu_model):
         has_ckpt = False
         ckpt_size_mb = 0.0
 
+    now_ts = time.time()
+    effective_nonce = (
+        probe_nonce
+        if probe_nonce is not None
+        else (os.environ.get("COLAB_PILOT_PROBE_NONCE", "").strip() or None)
+    )
     payload = {
-        "timestamp": time.time(),
+        "timestamp": now_ts,
+        "daemon_pid": os.getpid(),
+        "daemon_started_at": round(daemon_started_at if daemon_started_at is not None else now_ts, 3),
+        "probe_nonce": effective_nonce,
         "uptime_seconds": round(uptime_sec, 1),
         "cpu": {
             "model": cpu_model,
@@ -374,7 +387,10 @@ def collect_once(prev_idle, prev_total, cpu_model):
             "has_rclone_conf": os.path.exists("/content/rclone.conf"),
             "has_checkpoint": has_ckpt,
             "checkpoint_size_mb": ckpt_size_mb,
-            "has_done_flag": os.path.exists("/content/training_done.flag"),
+            "has_done_flag": (
+                os.path.exists("/content/training_done.flag")
+                or os.path.exists("/content/TRAINING_COMPLETED.flag")
+            ),
             "has_results_dir": os.path.isdir("/content/results"),
             "entries": list_content_files(),
         },
@@ -389,6 +405,158 @@ def collect_once(prev_idle, prev_total, cpu_model):
         json.dump(_finite(payload), f, ensure_ascii=False, allow_nan=False)
     os.replace(tmp, TELEMETRY_FILE)
     return idle, total, payload
+
+
+def is_live_telemetry_daemon_pid(pid, proc_root="/proc"):
+    """验证给定 PID 为当前存活的 telemetry_daemon 守护进程（拒绝僵尸进程、已死 PID 或被无关进程复用的 PID）。"""
+    try:
+        pid_int = int(pid)
+    except Exception:
+        return False
+    if pid_int <= 0:
+        return False
+
+    if proc_root and os.path.isdir(proc_root):
+        proc_dir = os.path.join(proc_root, str(pid_int))
+        if not os.path.isdir(proc_dir):
+            return False
+        stat_path = os.path.join(proc_dir, "stat")
+        if os.path.exists(stat_path):
+            try:
+                with open(stat_path, "r", encoding="utf-8", errors="ignore") as f:
+                    stat_txt = f.read()
+                rparen = stat_txt.rfind(")")
+                if rparen != -1:
+                    after = stat_txt[rparen + 1 :].strip().split()
+                    if after and after[0] == "Z":
+                        return False
+            except Exception:
+                pass
+        cmdline_path = os.path.join(proc_dir, "cmdline")
+        try:
+            with open(cmdline_path, "rb") as f:
+                raw_cmd = f.read()
+            cmd_txt = raw_cmd.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return False
+        low = cmd_txt.lower()
+        if not low or "--bootstrap" in low:
+            return False
+        return (".colab_pilot_daemon" in low) or ("telemetry_daemon" in low)
+
+    try:
+        os.kill(pid_int, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _terminate_stale_daemon_if_any(proc_root="/proc"):
+    if not os.path.exists(PID_FILE):
+        return
+    try:
+        with open(PID_FILE, "r", encoding="utf-8") as f:
+            old_pid = int(f.read().strip())
+    except Exception:
+        return
+    if old_pid <= 0 or old_pid == os.getpid():
+        return
+    if not is_live_telemetry_daemon_pid(old_pid, proc_root=proc_root):
+        return
+    try:
+        os.kill(old_pid, signal.SIGTERM)
+    except Exception:
+        return
+    deadline = time.time() + 0.6
+    while time.time() < deadline:
+        if not is_live_telemetry_daemon_pid(old_pid, proc_root=proc_root):
+            return
+        time.sleep(0.05)
+    sig_kill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    try:
+        os.kill(old_pid, sig_kill)
+    except Exception:
+        pass
+
+
+def bootstrap_probe(nonce=None, timeout_sec=6.0, daemon_script=None, proc_root="/proc"):
+    """
+    安全重装/启动遥测探针：
+    1. 若旧 daemon 存活则先行终止（不误杀复用 PID 的无关进程）；
+    2. 清理陈旧的 TELEMETRY_FILE / PID_FILE / PROBE_ACK_FILE；
+    3. 注入本次部署时间戳 launch_ts 与 deploy_nonce 启动新 daemon；
+    4. 严格验证 /proc/<pid> 为存活的 telemetry_daemon 且写出属于本次启动的新样本后才输出 PROBE_OK。
+    """
+    launch_ts = time.time()
+    effective_nonce = (
+        (nonce or os.environ.get("COLAB_PILOT_PROBE_NONCE") or "").strip()
+        or f"nonce-{int(launch_ts * 1000)}-{os.getpid()}"
+    )
+    _terminate_stale_daemon_if_any(proc_root=proc_root)
+    for stale_path in (TELEMETRY_FILE, PID_FILE, PROBE_ACK_FILE):
+        try:
+            if os.path.exists(stale_path):
+                os.remove(stale_path)
+        except OSError:
+            pass
+
+    script_path = daemon_script or os.path.abspath(__file__)
+    child_env = os.environ.copy()
+    child_env["COLAB_PILOT_PROBE_NONCE"] = effective_nonce
+    subprocess.Popen(
+        [sys.executable, script_path, "--nonce", effective_nonce],
+        env=child_env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    deadline = time.time() + max(0.5, float(timeout_sec))
+    while time.time() < deadline:
+        pid_val = None
+        if os.path.exists(PID_FILE):
+            try:
+                with open(PID_FILE, "r", encoding="utf-8") as f:
+                    pid_val = int(f.read().strip())
+            except Exception:
+                pid_val = None
+
+        if pid_val and is_live_telemetry_daemon_pid(pid_val, proc_root=proc_root) and os.path.exists(TELEMETRY_FILE):
+            try:
+                with open(TELEMETRY_FILE, "r", encoding="utf-8") as f:
+                    sample = json.load(f)
+            except Exception:
+                sample = None
+            if isinstance(sample, dict):
+                sample_ts = sample.get("timestamp")
+                sample_pid = sample.get("daemon_pid")
+                sample_nonce = sample.get("probe_nonce")
+                if (
+                    isinstance(sample_ts, (int, float))
+                    and float(sample_ts) >= launch_ts
+                    and sample_pid == pid_val
+                    and sample_nonce == effective_nonce
+                ):
+                    ack = {
+                        "ok": True,
+                        "pid": pid_val,
+                        "nonce": effective_nonce,
+                        "launch_ts": round(launch_ts, 3),
+                        "sample_ts": sample_ts,
+                    }
+                    ack_tmp = f"{PROBE_ACK_FILE}.{os.getpid()}.tmp"
+                    try:
+                        with open(ack_tmp, "w", encoding="utf-8") as f:
+                            json.dump(ack, f, ensure_ascii=False)
+                        os.replace(ack_tmp, PROBE_ACK_FILE)
+                    except OSError:
+                        pass
+                    print(f"PROBE_OK started pid={pid_val} nonce={effective_nonce}", flush=True)
+                    return 0
+        time.sleep(0.15)
+
+    print(f"PROBE_FAIL timeout nonce={effective_nonce}", flush=True)
+    return 1
 
 
 def _acquire_singleton_pid_lock():
@@ -409,16 +577,33 @@ def _acquire_singleton_pid_lock():
     return pid_f
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--bootstrap", action="store_true")
+    parser.add_argument("--nonce", default=None)
+    args, _ = parser.parse_known_args(argv)
+
+    if args.bootstrap:
+        rc = bootstrap_probe(nonce=args.nonce)
+        raise SystemExit(rc)
+
     lock_fh = _acquire_singleton_pid_lock()
     if lock_fh is None:
         return
+    started_at = time.time()
+    effective_nonce = (args.nonce or os.environ.get("COLAB_PILOT_PROBE_NONCE") or "").strip() or None
     cpu_model = get_cpu_model()
     idle, total = read_cpu_stat()
-    time.sleep(0.25)
+    time.sleep(0.15)
     while True:
         try:
-            idle, total, _ = collect_once(idle, total, cpu_model)
+            idle, total, _ = collect_once(
+                idle,
+                total,
+                cpu_model,
+                probe_nonce=effective_nonce,
+                daemon_started_at=started_at,
+            )
         except Exception:
             pass
         time.sleep(1.0)

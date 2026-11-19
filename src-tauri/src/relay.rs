@@ -34,6 +34,52 @@ impl Default for RelayConfig {
     }
 }
 
+pub const DEFAULT_BARE_GDRIVE_DIR: &str = "gdrive:colab_relay";
+
+pub fn sanitize_vm_segment(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(['-', '_', '.']);
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn normalize_gdrive_dir(raw: &str) -> String {
+    raw.trim().trim_end_matches('/').to_string()
+}
+
+/// 当 `gdrive_dir` 为默认裸值 `"gdrive:colab_relay"`（去首尾空白与末尾斜杠后相等）时，
+/// 自动按实例名隔离为 `gdrive:colab_relay/<sanitized_vm_name>`，防止多接力任务互相覆盖断点与完成标记。
+pub fn resolve_isolated_gdrive_dir(raw: &str, vm_name: &str) -> String {
+    let norm = normalize_gdrive_dir(raw);
+    if norm == DEFAULT_BARE_GDRIVE_DIR {
+        format!("{DEFAULT_BARE_GDRIVE_DIR}/{}", sanitize_vm_segment(vm_name))
+    } else {
+        norm
+    }
+}
+
+/// 计算单棒云端 `colab exec --timeout` 秒数与本机流式等待超时：
+/// 确保完整覆盖 `max_session_hours * 3600 + 缓冲时间`，同时不超过云端 86400s (24h) 与本机 90000s 安全上限。
+pub(crate) fn compute_relay_timeouts(max_session_hours: f64) -> (u64, Duration) {
+    let max_secs = (max_session_hours.clamp(0.1, 23.5) * 3600.0).ceil() as u64;
+    let exec_timeout_secs = (max_secs + 1800).clamp(600, 86_400);
+    let local_wait_secs = (exec_timeout_secs + 600).min(90_000);
+    (exec_timeout_secs, Duration::from_secs(local_wait_secs))
+}
+
 /// 严格校验接力配置：杜绝 rclone `--flag` 参数注入、Windows 盘符误传、路径穿越与非法数值
 pub fn validate_relay_config(cfg: &RelayConfig) -> Result<()> {
     let gpu = cfg.gpu_type.trim().to_uppercase();
@@ -78,8 +124,10 @@ pub fn validate_relay_config(cfg: &RelayConfig) -> Result<()> {
         ));
     }
 
-    if !cfg.max_session_hours.is_finite() || !(0.05..=48.0).contains(&cfg.max_session_hours) {
-        return Err(anyhow!("单棒上限时长必须在 0.05 ~ 48.0 小时之间"));
+    if !cfg.max_session_hours.is_finite() || !(0.1..=23.5).contains(&cfg.max_session_hours) {
+        return Err(anyhow!(
+            "单棒上限时长必须在 0.1 ~ 23.5 小时之间（受限于 Colab 单次最长 24 小时执行期限）"
+        ));
     }
     if !cfg.backup_interval_minutes.is_finite()
         || !(0.5..=1440.0).contains(&cfg.backup_interval_minutes)
@@ -159,7 +207,7 @@ pub(crate) fn classify_training_round(out: &cli::RunOutput, remote_done: bool) -
     ))
 }
 
-#[derive(Clone, Serialize, Debug, Default)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct RelayStatus {
     pub vm_name: String,
     pub running: bool,
@@ -171,12 +219,26 @@ pub struct RelayStatus {
     pub config: RelayConfig,
     pub logs: Vec<String>,
     pub child_pid: Option<u32>,
+    #[serde(default)]
+    pub training_completed: bool,
+    #[serde(default)]
+    pub weights_downloaded: bool,
+    #[serde(default)]
+    pub download_error: Option<String>,
+    #[serde(default)]
+    pub local_weights_path: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 pub struct RelayHandle {
     pub status: Mutex<RelayStatus>,
     pub cancel: Mutex<CancellationToken>,
     pub child_pid: Mutex<Option<u32>>,
+    /// 绑定的本地工作区目录（上传 train.py / requirements.txt 及保存最终权重均使用该目录）
+    pub workspace_dir: Mutex<Option<std::path::PathBuf>>,
+    /// 会话授权策略（oauth2 / adc），后续 colab 子命令沿用
+    pub auth_mode: Mutex<Option<String>>,
     /// 记录 provisioning 发起前服务端已有的计费 endpoint 集合，用于在取消分配时精准识别刚诞生的残留孤儿实例
     pub pre_provision_endpoints: Mutex<std::collections::HashSet<String>>,
     /// 标记最近一次 stop 是否发生在 provisioning（colab new）阶段
@@ -200,6 +262,8 @@ impl RelayHandle {
             }),
             cancel: Mutex::new(CancellationToken::new()),
             child_pid: Mutex::new(None),
+            workspace_dir: Mutex::new(None),
+            auth_mode: Mutex::new(None),
             pre_provision_endpoints: Mutex::new(std::collections::HashSet::new()),
             stopped_during_provisioning: AtomicBool::new(false),
             task_alive: AtomicBool::new(false),
@@ -312,7 +376,7 @@ pub(crate) fn format_colab_new_failure(gpu: &str, raw_output: &str) -> String {
         || lower.contains("unauthorized")
         || lower.contains("not logged in")
     {
-        format!("Colab 授权凭证已过期或无效（{tail}），请在终端执行 `colab auth login` 重新授权")
+        format!("Colab 授权凭证已过期或无效（{tail}），请在终端执行 `colab auth`（或 `colab status`）重新授权")
     } else {
         format!("创建实例失败：{tail}")
     }
@@ -412,20 +476,279 @@ pub async fn colab_new(
     colab_new_with_opts(name, gpu, high_mem, None, cancel, pid_slot, log).await
 }
 
-async fn done_flag_exists(gdrive_dir: &str) -> bool {
-    match cli::run_simple(
-        &cli::rclone_bin(),
-        &[
-            s(&["lsf", "--retries=5", "--low-level-retries=20", "--"]),
-            vec![format!("{gdrive_dir}/training_done.flag")],
-        ]
-        .concat(),
-        Duration::from_secs(120),
-    )
-    .await
-    {
-        Ok(o) => o.code == 0 && o.stdout.lines().any(|l| l.trim() == "training_done.flag"),
+pub(crate) fn is_done_flag_filename(name: &str) -> bool {
+    let t = name.trim();
+    t.eq_ignore_ascii_case("training_done.flag")
+        || t.eq_ignore_ascii_case("training_completed.flag")
+}
+
+pub(crate) async fn done_flag_exists_with_conf(
+    rclone_bin: &std::path::PathBuf,
+    rclone_conf: &std::path::Path,
+    gdrive_dir: &str,
+) -> bool {
+    let mut args = Vec::new();
+    if rclone_conf.exists() {
+        args.push("--config".into());
+        args.push(rclone_conf.to_string_lossy().to_string());
+    }
+    args.extend(s(&[
+        "lsf",
+        "--files-only",
+        "--retries=5",
+        "--low-level-retries=20",
+        "--",
+    ]));
+    args.push(gdrive_dir.trim_end_matches('/').to_string());
+    match cli::run_simple(rclone_bin, &args, Duration::from_secs(120)).await {
+        Ok(o) => o.code == 0 && o.stdout.lines().any(is_done_flag_filename),
         Err(_) => false,
+    }
+}
+
+pub(crate) fn find_latest_valid_hf_checkpoint_dir(
+    ws_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let hf_root = ws_dir.join("hf_checkpoints");
+    let entries = std::fs::read_dir(&hf_root).ok()?;
+    let mut best: Option<(u64, std::path::PathBuf)> = None;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let Some(dir_name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(step_str) = dir_name.strip_prefix("checkpoint-") else {
+            continue;
+        };
+        let Ok(step_num) = step_str.parse::<u64>() else {
+            continue;
+        };
+        let state_json = p.join("trainer_state.json");
+        let valid_state = std::fs::read_to_string(&state_json)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| v.is_object())
+            .unwrap_or(false);
+        if valid_state && best.as_ref().map(|(s, _)| step_num >= *s).unwrap_or(true) {
+            best = Some((step_num, p));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// 下载并严格核验最终权重文件（独立维护 `training_completed` 与 `weights_downloaded` 状态，兼容 HF Trainer `hf_checkpoints`）：
+/// 1. 先尝试下载 `{gdrive}/checkpoint.pt`，失败或为空时回退尝试 `{gdrive}/checkpoint_prev.pt`；
+/// 2. 若远端明确无 `checkpoint.pt` 但存在 `hf_checkpoints/`（通过 `rclone lsf` 区分无文件与鉴权/网络错误），自动回退拉取并校验有效 `checkpoint-*/trainer_state.json`；
+/// 3. 必须校验本地目标文件真实存在且字节数 `> 0` 才置 `weights_downloaded = true`、`phase = "completed"`；
+/// 4. 若下载均失败或文件缺失/为空，置 `weights_downloaded = false`、`phase = "download_failed"`、`download_error = Some(...)`。
+pub(crate) async fn download_and_verify_final_weights(
+    h: &RelayHandle,
+    rclone_bin: &std::path::PathBuf,
+    rclone_conf: &std::path::Path,
+    gdrive_dir: &str,
+    ws_dir: &std::path::Path,
+    vm_name: &str,
+) {
+    {
+        let mut st = h.status.l();
+        st.training_completed = true;
+        st.phase = "downloading".into();
+        st.phase_label = "正在从 Google Drive 下载最终训练权重…".into();
+    }
+    let _ = std::fs::create_dir_all(ws_dir);
+    let dst = ws_dir.join(format!("checkpoint_{vm_name}.pt"));
+    let tmp_dst = ws_dir.join(format!(".checkpoint_{vm_name}.pt.downloading"));
+    let _ = std::fs::remove_file(&tmp_dst);
+    h.log(format!("📥 正在下载最终权重到本机：{}", dst.display()));
+
+    let gdrive_clean = gdrive_dir.trim_end_matches('/');
+    let candidates = [
+        format!("{gdrive_clean}/checkpoint.pt"),
+        format!("{gdrive_clean}/checkpoint_prev.pt"),
+    ];
+    let mut errors: Vec<String> = Vec::new();
+    let mut downloaded_non_empty = false;
+
+    for (idx, remote_src) in candidates.iter().enumerate() {
+        let _ = std::fs::remove_file(&tmp_dst);
+        let mut args = Vec::new();
+        if rclone_conf.exists() {
+            args.push("--config".into());
+            args.push(rclone_conf.to_string_lossy().to_string());
+        }
+        args.extend(s(&[
+            "copyto",
+            "--multi-thread-streams=16",
+            "--retries=5",
+            "--low-level-retries=20",
+            "--",
+        ]));
+        args.push(remote_src.clone());
+        args.push(tmp_dst.to_string_lossy().to_string());
+
+        match cli::run_simple(rclone_bin, &args, Duration::from_secs(1800)).await {
+            Ok(o) if o.code == 0 => {
+                let valid = std::fs::metadata(&tmp_dst)
+                    .map(|m| m.is_file() && m.len() > 0)
+                    .unwrap_or(false);
+                if valid {
+                    downloaded_non_empty = true;
+                    break;
+                } else {
+                    errors.push(format!(
+                        "命令 #{} ({remote_src}) 退出码为 0 但本地文件缺失或大小为 0 字节",
+                        idx + 1
+                    ));
+                }
+            }
+            Ok(o) => {
+                let detail = cli::last_meaningful_cli_line(&o.output, "rclone 返回非零状态");
+                errors.push(format!(
+                    "命令 #{} ({remote_src}) 失败 (exit={}): {detail}",
+                    idx + 1,
+                    o.code
+                ));
+            }
+            Err(e) => {
+                errors.push(format!("命令 #{} ({remote_src}) 执行异常: {e}", idx + 1));
+            }
+        }
+    }
+
+    let mut verified_local_path: Option<std::path::PathBuf> = None;
+    if downloaded_non_empty {
+        if std::fs::rename(&tmp_dst, &dst).is_err() {
+            if let Err(e) = std::fs::copy(&tmp_dst, &dst) {
+                errors.push(format!("写入最终权重文件 `{}` 失败: {e}", dst.display()));
+            }
+            let _ = std::fs::remove_file(&tmp_dst);
+        }
+        if std::fs::metadata(&dst)
+            .map(|m| m.is_file() && m.len() > 0)
+            .unwrap_or(false)
+        {
+            verified_local_path = Some(dst.clone());
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp_dst);
+        if std::fs::metadata(&dst).map(|m| m.len() == 0).unwrap_or(false) {
+            let _ = std::fs::remove_file(&dst);
+        }
+
+        // 回退检查是否为 HuggingFace Trainer 目录型断点（仅在 lsf 成功确认无 checkpoint.pt 且存在 hf_checkpoints/ 时回退）
+        let mut lsf_args = Vec::new();
+        if rclone_conf.exists() {
+            lsf_args.push("--config".into());
+            lsf_args.push(rclone_conf.to_string_lossy().to_string());
+        }
+        lsf_args.extend(s(&["lsf", "--retries=3", "--low-level-retries=10", "--"]));
+        lsf_args.push(gdrive_clean.to_string());
+        if let Ok(lsf_out) = cli::run_simple(rclone_bin, &lsf_args, Duration::from_secs(60)).await {
+            if lsf_out.code == 0 {
+                let has_pt = lsf_out.stdout.lines().any(|l| {
+                    let t = l.trim();
+                    t == "checkpoint.pt" || t == "checkpoint_prev.pt"
+                });
+                let has_hf_dir = lsf_out
+                    .stdout
+                    .lines()
+                    .any(|l| l.trim().trim_end_matches('/') == "hf_checkpoints");
+                if !has_pt && has_hf_dir {
+                    let hf_dst = ws_dir.join("hf_checkpoints");
+                    let mut hf_args = Vec::new();
+                    if rclone_conf.exists() {
+                        hf_args.push("--config".into());
+                        hf_args.push(rclone_conf.to_string_lossy().to_string());
+                    }
+                    hf_args.extend(s(&[
+                        "copy",
+                        "--multi-thread-streams=16",
+                        "--retries=5",
+                        "--low-level-retries=20",
+                        "--",
+                    ]));
+                    hf_args.push(format!("{gdrive_clean}/hf_checkpoints"));
+                    hf_args.push(hf_dst.to_string_lossy().to_string());
+                    match cli::run_simple(rclone_bin, &hf_args, Duration::from_secs(1800)).await {
+                        Ok(ho) if ho.code == 0 => {
+                            if let Some(best_hf) = find_latest_valid_hf_checkpoint_dir(ws_dir) {
+                                verified_local_path = Some(best_hf);
+                            } else {
+                                errors.push(
+                                    "hf_checkpoints 同步退出码为 0，但未找到有效的 checkpoint-*/trainer_state.json"
+                                        .into(),
+                                );
+                            }
+                        }
+                        Ok(ho) => {
+                            let detail = cli::last_meaningful_cli_line(
+                                &ho.output,
+                                "rclone copy hf_checkpoints 失败",
+                            );
+                            errors.push(format!(
+                                "回退拉取 hf_checkpoints 失败 (exit={}): {detail}",
+                                ho.code
+                            ));
+                        }
+                        Err(e) => {
+                            errors.push(format!("回退拉取 hf_checkpoints 异常: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(saved_path) = verified_local_path {
+        // 顺带同步远端 results/ 目录（最佳努力，不阻塞主权重回收结果）
+        let results_dst = ws_dir.join("results");
+        let mut res_args = Vec::new();
+        if rclone_conf.exists() {
+            res_args.push("--config".into());
+            res_args.push(rclone_conf.to_string_lossy().to_string());
+        }
+        res_args.extend(s(&["copy", "--retries=3", "--low-level-retries=10", "--"]));
+        res_args.push(format!("{gdrive_clean}/results"));
+        res_args.push(results_dst.to_string_lossy().to_string());
+        let _ = cli::run_simple(rclone_bin, &res_args, Duration::from_secs(300)).await;
+
+        {
+            let mut st = h.status.l();
+            st.training_completed = true;
+            st.weights_downloaded = true;
+            st.download_error = None;
+            st.last_error = None;
+            st.local_weights_path = Some(saved_path.display().to_string());
+            st.phase = "completed".into();
+            st.phase_label = "全部训练轮次已完成，最终权重已回收 (100%)".into();
+        }
+        h.log(format!(
+            "✅ 全部接力训练与权重回收流程执行完毕！已保存至 {}",
+            saved_path.display()
+        ));
+    } else {
+        let err_summary = if errors.is_empty() {
+            format!("未能从 {gdrive_clean} 下载有效非空权重文件")
+        } else {
+            errors.join("；")
+        };
+        {
+            let mut st = h.status.l();
+            st.training_completed = true;
+            st.weights_downloaded = false;
+            st.download_error = Some(err_summary.clone());
+            st.last_error = Some(err_summary.clone());
+            st.local_weights_path = None;
+            st.phase = "download_failed".into();
+            st.phase_label = format!("云端训练已完成，但最终权重下载失败：{err_summary}");
+        }
+        h.log(format!(
+            "❌ 云端训练已完成，但最终权重下载到本地失败（网盘仍保留权重，可点击重试补下载）：{err_summary}"
+        ));
     }
 }
 
@@ -480,8 +803,14 @@ pub async fn run_relay(app: Arc<AppState>, handle: Arc<RelayHandle>) {
     }
 
     if let Err(e) = result {
-        handle.set_phase("error", format!("接力异常：{e}"));
-        handle.log(format!("❌ 接力训练发生异常：{e}"));
+        let err_str = format!("{e:#}");
+        {
+            let mut st = handle.status.l();
+            st.phase = "error".into();
+            st.phase_label = format!("接力异常：{err_str}");
+            st.last_error = Some(err_str.clone());
+        }
+        handle.log(format!("❌ 接力训练发生异常：{err_str}"));
         // 计费保护：接力异常中止时若实例仍在服务端计费列表中，立即彻底销毁并核验停费，绝不空转计费
         if app.find_assignment_by_name(&name).await.is_some() {
             handle.log("🧹 接力已中止，正在销毁残留实例并核验停止计费…");
@@ -499,28 +828,41 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
     let name = h.status.l().vm_name.clone();
     let cfg = h.status.l().config.clone();
     validate_relay_config(&cfg)?;
-    let gdrive = cfg.gdrive_dir.trim().to_string();
+    let gdrive = cfg.gdrive_dir.trim().trim_end_matches('/').to_string();
     let max_secs = cfg.max_session_hours * 3600.0;
     let backup_secs = cfg.backup_interval_minutes * 60.0;
+    let (exec_timeout_secs, host_wait_timeout) = compute_relay_timeouts(cfg.max_session_hours);
+    let ws_dir = h
+        .workspace_dir
+        .l()
+        .clone()
+        .or_else(|| cli::lookup_bound_workspace_path(&name))
+        .unwrap_or_else(|| app.workspace.clone());
+    let eff_auth = h
+        .auth_mode
+        .l()
+        .clone()
+        .or_else(|| cli::get_session_auth_mode(&name));
     let conf = cli::rclone_conf_path();
     let rclone = cli::rclone_bin();
     let colab = cli::colab_bin();
 
     h.set_phase("preparing_gdrive", "准备 Google Drive 接力目录");
+    h.log(format!("📂 绑定工作区目录：{}", ws_dir.display()));
     h.log(format!("🔑 使用本机 Rclone 授权文件：{}", conf.display()));
     if !conf.exists() {
         return Err(anyhow!("未找到 rclone.conf，请先完成 rclone 授权"));
     }
-    let mkdir_out = cli::run_simple(
-        &rclone,
-        &[
-            s(&["mkdir", "--retries=5", "--low-level-retries=20", "--"]),
-            vec![gdrive.clone()],
-        ]
-        .concat(),
-        Duration::from_secs(120),
-    )
-    .await?;
+    let mkdir_args = vec![
+        "--config".into(),
+        conf.to_string_lossy().to_string(),
+        "mkdir".into(),
+        "--retries=5".into(),
+        "--low-level-retries=20".into(),
+        "--".into(),
+        gdrive.clone(),
+    ];
+    let mkdir_out = cli::run_simple(&rclone, &mkdir_args, Duration::from_secs(120)).await?;
     if mkdir_out.code != 0 {
         return Err(anyhow!(
             "创建网盘目录 {} 失败：{}",
@@ -529,17 +871,21 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
         ));
     }
     if cfg.reset_done_flag {
-        h.log(format!("🧹 清理网盘旧完成标记 {gdrive}/training_done.flag"));
-        let _ = cli::run_simple(
-            &rclone,
-            &[
-                s(&["deletefile", "--retries=5", "--low-level-retries=20", "--"]),
-                vec![format!("{gdrive}/training_done.flag")],
-            ]
-            .concat(),
-            Duration::from_secs(120),
-        )
-        .await;
+        h.log(format!(
+            "🧹 清理网盘旧完成标记 {gdrive}/training_done.flag 与 TRAINING_COMPLETED.flag"
+        ));
+        for flag_name in ["training_done.flag", "TRAINING_COMPLETED.flag"] {
+            let del_args = vec![
+                "--config".into(),
+                conf.to_string_lossy().to_string(),
+                "deletefile".into(),
+                "--retries=5".into(),
+                "--low-level-retries=20".into(),
+                "--".into(),
+                format!("{gdrive}/{flag_name}"),
+            ];
+            let _ = cli::run_simple(&rclone, &del_args, Duration::from_secs(120)).await;
+        }
     }
 
     let mut round: u32 = 1;
@@ -548,8 +894,18 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
         if cancel.is_cancelled() {
             return Ok(());
         }
-        if done_flag_exists(&gdrive).await {
-            h.log("🎉 检测到网盘完成标记 training_done.flag，全部接力训练已圆满结束！");
+        if done_flag_exists_with_conf(&rclone, &conf, &gdrive).await {
+            h.status.l().training_completed = true;
+            let local_dst = ws_dir.join(format!("checkpoint_{name}.pt"));
+        let local_ok = std::fs::metadata(&local_dst)
+                .map(|m| m.is_file() && m.len() > 0)
+                .unwrap_or(false)
+                || find_latest_valid_hf_checkpoint_dir(&ws_dir).is_some();
+            if !local_ok {
+                h.log("🎉 检测到网盘已完成标记且本机尚未存在最终权重，立即执行补下载回收！");
+            } else {
+                h.log("🎉 检测到网盘完成标记，全部接力训练已圆满结束，正在核验回收最终权重！");
+            }
             break;
         }
 
@@ -588,10 +944,11 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             }
             h.log(format!("☁️ 正在向 Google Colab 申请实例 [{name}]…"));
             let hh = h.clone();
-            colab_new(
+            colab_new_with_opts(
                 &name,
                 &cfg.gpu_type,
                 cfg.high_mem,
+                eff_auth.as_deref(),
                 Some(cancel.clone()),
                 Some(&h.child_pid),
                 &move |l: &str| hh.log(l),
@@ -608,14 +965,32 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             .ok_or_else(|| anyhow!("服务端未找到实例 [{name}]"))?;
         h.log(format!("✅ 实例就绪，Endpoint：{}", a.endpoint));
 
-        // 2. 上传 rclone.conf 与 train.py
+        // 2. 上传 rclone.conf、工作区标记与绑定工作区的 train.py
         h.set_phase("uploading_auth", format!("第 {round} 棒：上传 rclone.conf 与 train.py"));
         let conf_bytes = std::fs::read(&conf)?;
         app.client.contents_upload(&a, "content/rclone.conf", &conf_bytes).await?;
-        let train_path = app.workspace.join("train.py");
-        let train_bytes = std::fs::read(&train_path)?;
+        let train_path = ws_dir.join("train.py");
+        let train_bytes = std::fs::read(&train_path).map_err(|e| {
+            anyhow!(
+                "无法从绑定工作区读取训练脚本 `{}`：{e}",
+                train_path.display()
+            )
+        })?;
         app.client.contents_upload(&a, "content/train.py", &train_bytes).await?;
-        h.log("📤 rclone.conf 与 train.py 已上传至 /content");
+        let ws_meta_json = serde_json::json!({
+            "name": ws_dir.file_name().and_then(|s| s.to_str()).unwrap_or(&name),
+            "path": ws_dir.display().to_string(),
+        });
+        if let Ok(ws_bytes) = serde_json::to_vec(&ws_meta_json) {
+            let _ = app
+                .client
+                .contents_upload(&a, "content/.colab_workspace.json", &ws_bytes)
+                .await;
+        }
+        h.log(format!(
+            "📤 rclone.conf 与 {} 已上传至 /content",
+            train_path.display()
+        ));
 
         // 遥测探针
         match crate::deploy_probe_inner(&app, &name).await {
@@ -631,9 +1006,13 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
         h.log("🔧 正在云端安装 rclone…");
         let install_code = "import shutil, subprocess\nif not shutil.which('rclone'):\n    subprocess.run(['bash','-c','apt-get update -qq && apt-get install -y -qq rclone'], check=True)\nprint('RCLONE_READY:', shutil.which('rclone'))\n";
         let hh = h.clone();
+        let rclone_exec_args = cli::build_colab_subcommand_args(
+            eff_auth.as_deref(),
+            &s(&["exec", "-s", &name, "--timeout", "600"]),
+        );
         let out = cli::run_streaming(
             &colab,
-            &s(&["exec", "-s", &name, "--timeout", "600"]),
+            &rclone_exec_args,
             Some(install_code.to_string()),
             Duration::from_secs(700),
             Some(cancel.clone()),
@@ -648,16 +1027,26 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             return Err(anyhow!("云端 rclone 安装失败"));
         }
 
-        let req_path = app.workspace.join("requirements.txt");
+        let req_path = ws_dir.join("requirements.txt");
         let has_reqs = std::fs::read_to_string(&req_path)
             .map(|t| t.lines().any(|l| !l.trim().is_empty() && !l.trim().starts_with('#')))
             .unwrap_or(false);
         if has_reqs {
-            h.log("📦 正在安装 requirements.txt 依赖…");
+            h.log(format!(
+                "📦 正在安装 {} 依赖…",
+                req_path.display()
+            ));
             let hh = h.clone();
+            let raw_install_args = [
+                s(&["install", "-s", &name, "-r"]),
+                vec![req_path.to_string_lossy().to_string()],
+            ]
+            .concat();
+            let install_args =
+                cli::build_colab_subcommand_args(eff_auth.as_deref(), &raw_install_args);
             let out = cli::run_streaming(
                 &colab,
-                &[s(&["install", "-s", &name, "-r"]), vec![req_path.to_string_lossy().to_string()]].concat(),
+                &install_args,
                 None,
                 Duration::from_secs(1800),
                 Some(cancel.clone()),
@@ -671,19 +1060,21 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             validate_colab_install_output(&out)?;
         }
 
-        // 4. 执行训练（--timeout 86400，流式日志）
+        // 4. 执行训练（流式日志，超时严格对齐 max_session_hours + 缓冲）
         h.set_phase("training", format!("第 {round} 棒：云端训练 · 定时热备中"));
         h.log(format!(
-            "⏳ 开始训练：单棒上限 {:.2}h，每 {:.0} 分钟同步至 {gdrive}",
-            cfg.max_session_hours, cfg.backup_interval_minutes
+            "⏳ 开始训练：单棒上限 {:.2}h（exec 超时 {}s），每 {:.0} 分钟同步至 {gdrive}",
+            cfg.max_session_hours, exec_timeout_secs, cfg.backup_interval_minutes
         ));
         let exec_started = std::time::Instant::now();
-        let args = vec![
+        let raw_train_args = vec![
             "exec".into(),
             "-s".into(),
             name.clone(),
             "--timeout".into(),
-            "86400".into(),
+            exec_timeout_secs.to_string(),
+            "--env".into(),
+            format!("COLAB_WORKSPACE={}", ws_dir.display()),
             "--env".into(),
             format!("GDRIVE_DIR={gdrive}"),
             "--env".into(),
@@ -699,12 +1090,13 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             "-f".into(),
             train_path.to_string_lossy().to_string(),
         ];
+        let args = cli::build_colab_subcommand_args(eff_auth.as_deref(), &raw_train_args);
         let hh = h.clone();
         let out = cli::run_streaming(
             &colab,
             &args,
             None,
-            Duration::from_secs(90_000),
+            host_wait_timeout,
             Some(cancel.clone()),
             Some(&h.child_pid),
             move |l| {
@@ -730,14 +1122,15 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             return Err(anyhow!("实例销毁未通过核验，为防止空转计费已中止接力"));
         }
 
-        let remote_done = done_flag_exists(&gdrive).await;
+        let remote_done = done_flag_exists_with_conf(&rclone, &conf, &gdrive).await;
         let round_completed = classify_training_round(&out, remote_done)?;
         if round_completed {
+            h.status.l().training_completed = true;
             h.log("🎉 检测到网盘完成标记，全部接力训练已圆满结束！");
             break;
         }
 
-        // 快速失败/异常换棒熔断器：若单棒配置 > 0.1h 但连续 3 棒均在 60 秒内请求换棒，说明计时配置异常，立即熔断
+        // 快速失败/异常换棒熔断器：若单棒配置 >= 0.1h 但连续 3 棒均在 60 秒内请求换棒，说明计时配置异常，立即熔断
         if cfg.max_session_hours >= 0.1 && exec_elapsed < Duration::from_secs(60) {
             consecutive_short_rounds += 1;
             if consecutive_short_rounds >= 3 {
@@ -757,39 +1150,11 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
         }
     }
 
-    {
-        h.set_phase("completed", "全部训练轮次已完成 (100%)");
-        // 确保不残留计费实例
-        if app.find_assignment_by_name(&name).await.is_some() {
-            let _ = hard_terminate(&app, &name, None, false).await;
-        }
-        let dst = app.workspace.join(format!("checkpoint_{name}.pt"));
-        h.log(format!("📥 正在下载最终权重到本机：{}", dst.display()));
-        match cli::run_simple(
-            &rclone,
-            &[
-                s(&["copyto", "--multi-thread-streams=16", "--retries=5", "--low-level-retries=20", "--"]),
-                vec![format!("{gdrive}/checkpoint.pt"), dst.to_string_lossy().to_string()],
-            ]
-            .concat(),
-            Duration::from_secs(1800),
-        )
-        .await
-        {
-            Ok(o) if o.code == 0 && dst.exists() => {
-                h.log("✅ 全部接力训练与权重回收流程执行完毕！");
-            }
-            Ok(o) => {
-                h.log(format!(
-                    "⚠️ 最终权重下载返回非零状态（网盘中仍保留最新权重）：{}",
-                    o.output.lines().last().unwrap_or("")
-                ));
-            }
-            Err(e) => {
-                h.log(format!("⚠️ 最终权重下载失败（网盘中仍保留最新权重）：{e}"));
-            }
-        }
+    // 确保不残留计费实例
+    if app.find_assignment_by_name(&name).await.is_some() {
+        let _ = hard_terminate(&app, &name, None, false).await;
     }
+    download_and_verify_final_weights(&h, &rclone, &conf, &gdrive, &ws_dir, &name).await;
     Ok(())
 }
 
@@ -1035,5 +1400,291 @@ assert caught, "parser should reject trailing --auth after subcommand 'new'"
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn test_issue_44_52_54_gdrive_isolation_cpu_preserved_and_23_5h_session_cap() {
+        // #44: bare default gdrive:colab_relay auto-isolates by sanitized VM name
+        assert_eq!(
+            resolve_isolated_gdrive_dir("gdrive:colab_relay", "resnet-a"),
+            "gdrive:colab_relay/resnet-a"
+        );
+        assert_eq!(
+            resolve_isolated_gdrive_dir("  gdrive:colab_relay/  ", "vm_02"),
+            "gdrive:colab_relay/vm_02"
+        );
+        assert_eq!(
+            resolve_isolated_gdrive_dir("gdrive:colab_relay/custom_shared", "resnet-a"),
+            "gdrive:colab_relay/custom_shared"
+        );
+
+        // #52: CPU gpu_type is valid and preserved
+        let cpu_cfg = RelayConfig {
+            gpu_type: "CPU".into(),
+            high_mem: false,
+            gdrive_dir: "gdrive:colab_relay/cpu-job".into(),
+            max_session_hours: 23.5,
+            backup_interval_minutes: 15.0,
+            total_epochs: 20,
+            reset_done_flag: false,
+        };
+        assert!(validate_relay_config(&cpu_cfg).is_ok());
+
+        // #54: strict 0.1..=23.5h bounds (reject >23.5 such as 24h, 30h, 48h and <=0)
+        for bad_h in [0.0, -1.0, 0.05, 23.51, 24.0, 30.0, 48.0] {
+            let mut c = cpu_cfg.clone();
+            c.max_session_hours = bad_h;
+            assert!(
+                validate_relay_config(&c).is_err(),
+                "max_session_hours={bad_h} must be rejected"
+            );
+        }
+        for ok_h in [0.1, 1.0, 12.0, 22.5, 23.5] {
+            let mut c = cpu_cfg.clone();
+            c.max_session_hours = ok_h;
+            assert!(
+                validate_relay_config(&c).is_ok(),
+                "max_session_hours={ok_h} must be accepted"
+            );
+        }
+
+        let (exec_to_max, local_wait_max) = compute_relay_timeouts(23.5);
+        assert_eq!(exec_to_max, 86_400);
+        assert!(local_wait_max >= Duration::from_secs(87_000));
+        assert!(local_wait_max <= Duration::from_secs(90_000));
+    }
+
+    #[tokio::test]
+    async fn test_issue_53_final_weights_download_verification_and_rerun_recovery() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let py = cli::colab_python_bin();
+        if !py.exists() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("pilot_relay_dl_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let remote_drive = tmp.join("mock_gdrive");
+        let ws_dir = tmp.join("custom_ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&remote_drive).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let rclone_conf = cfg_dir.join("rclone.conf");
+        std::fs::write(&rclone_conf, "[gdrive]\ntype = drive\n").unwrap();
+
+        // Create a cross-platform mock rclone script backed by Python reading MOCK_RCLONE_ROOT & MOCK_RCLONE_MODE
+        let rclone_py = tmp.join("mock_rclone.py");
+        std::fs::write(
+            &rclone_py,
+            r#"import os, shutil, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if "--config" in args:
+    i = args.index("--config")
+    args = args[:i] + args[i+2:]
+clean = [a for a in args if not a.startswith("-") and a != "--"]
+cmd = clean[0] if clean else ""
+root = Path(os.environ["MOCK_RCLONE_ROOT"])
+mode = os.environ.get("MOCK_RCLONE_MODE", "normal")
+
+def map_remote(spec: str) -> Path:
+    _, rel = spec.split(":", 1)
+    return root / rel.strip("/")
+
+if mode == "fail_all" and cmd in ("copyto", "copy"):
+    sys.stderr.write("ERROR : simulated rclone network failure\n")
+    sys.exit(1)
+
+if cmd == "mkdir":
+    map_remote(clean[1]).mkdir(parents=True, exist_ok=True)
+    sys.exit(0)
+elif cmd == "lsf":
+    p = map_remote(clean[1])
+    if not p.exists():
+        sys.exit(0)
+    for child in sorted(p.iterdir()):
+        sys.stdout.write(child.name + ("/\n" if child.is_dir() else "\n"))
+    sys.exit(0)
+elif cmd == "copyto":
+    src = map_remote(clean[1])
+    dst = Path(clean[2])
+    if mode == "zero_byte":
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"")
+        sys.exit(0)
+    if not src.is_file():
+        sys.stderr.write(f"directory not found: {src.name}\n")
+        sys.exit(3)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+    sys.exit(0)
+elif cmd == "copy":
+    src = map_remote(clean[1])
+    dst = Path(clean[2])
+    if not src.exists():
+        sys.exit(0)
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+    sys.exit(0)
+sys.exit(0)
+"#,
+        )
+        .unwrap();
+
+        #[cfg(windows)]
+        let mock_rclone = {
+            let cmd_path = tmp.join("mock_rclone.cmd");
+            std::fs::write(
+                &cmd_path,
+                format!("@echo off\r\n\"{}\" \"{}\" %*\r\n", py.display(), rclone_py.display()),
+            )
+            .unwrap();
+            cmd_path
+        };
+        #[cfg(not(windows))]
+        let mock_rclone = {
+            use std::os::unix::fs::PermissionsExt;
+            let sh_path = tmp.join("mock_rclone.sh");
+            std::fs::write(
+                &sh_path,
+                format!("#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n", py.display(), rclone_py.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            sh_path
+        };
+
+        std::env::set_var("MOCK_RCLONE_ROOT", &remote_drive);
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_RCLONE_BIN.l() = Some(mock_rclone.clone());
+        *cli::TEST_RCLONE_CONF.l() = Some(rclone_conf.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(tmp.join("nonexistent_colab_must_not_be_called"));
+
+        let job_remote = remote_drive.join("colab_relay").join("dl-vm");
+        std::fs::create_dir_all(&job_remote).unwrap();
+        std::fs::write(job_remote.join("TRAINING_COMPLETED.flag"), "done\n").unwrap();
+        assert!(
+            done_flag_exists_with_conf(&mock_rclone, &rclone_conf, "gdrive:colab_relay/dl-vm").await,
+            "must detect uppercase TRAINING_COMPLETED.flag"
+        );
+
+        // 1. Both download commands fail -> phase MUST be download_failed, weights_downloaded=false
+        std::env::set_var("MOCK_RCLONE_MODE", "fail_all");
+        let h1 = Arc::new(RelayHandle::new("dl-vm"));
+        download_and_verify_final_weights(
+            &h1,
+            &mock_rclone,
+            &rclone_conf,
+            "gdrive:colab_relay/dl-vm",
+            &ws_dir,
+            "dl-vm",
+        )
+        .await;
+        let s1 = h1.snapshot();
+        assert!(s1.training_completed);
+        assert!(!s1.weights_downloaded);
+        assert_eq!(s1.phase, "download_failed");
+        assert!(s1.download_error.is_some());
+        assert!(s1.local_weights_path.is_none());
+
+        // 2. rclone exits 0 but writes 0-byte file -> still download_failed!
+        std::env::set_var("MOCK_RCLONE_MODE", "zero_byte");
+        download_and_verify_final_weights(
+            &h1,
+            &mock_rclone,
+            &rclone_conf,
+            "gdrive:colab_relay/dl-vm",
+            &ws_dir,
+            "dl-vm",
+        )
+        .await;
+        let s2 = h1.snapshot();
+        assert!(!s2.weights_downloaded);
+        assert_eq!(s2.phase, "download_failed");
+
+        // 3. Re-running relay_inner (!reset_done_flag) when remote has TRAINING_COMPLETED.flag and local file is missing:
+        //    must perform recovery download into bound ws_dir without allocating a VM, then verify >0 bytes -> completed!
+        std::env::set_var("MOCK_RCLONE_MODE", "normal");
+        std::fs::write(job_remote.join("checkpoint.pt"), b"PYTORCH_WEIGHTS_PAYLOAD").unwrap();
+
+        let tok_file = tmp.join("token.json");
+        std::fs::write(
+            &tok_file,
+            r#"{"token":"valid-token","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let client = crate::colab::ColabClient::new_for_test("http://127.0.0.1:9".into(), tok_file);
+        let default_ws = tmp.join("default_ws_unused");
+        std::fs::create_dir_all(&default_ws).unwrap();
+        let app = AppState::new_with(client, default_ws.clone());
+
+        let h_rerun = Arc::new(RelayHandle::new("dl-vm"));
+        *h_rerun.workspace_dir.l() = Some(ws_dir.clone());
+        h_rerun.status.l().config = RelayConfig {
+            gpu_type: "CPU".into(),
+            high_mem: false,
+            gdrive_dir: "gdrive:colab_relay/dl-vm".into(),
+            max_session_hours: 12.0,
+            backup_interval_minutes: 15.0,
+            total_epochs: 10,
+            reset_done_flag: false,
+        };
+        relay_inner(app, h_rerun.clone(), CancellationToken::new())
+            .await
+            .expect("rerun recovery download should succeed without touching colab new");
+
+        let s3 = h_rerun.snapshot();
+        assert!(s3.training_completed);
+        assert!(s3.weights_downloaded);
+        assert_eq!(s3.phase, "completed");
+        assert!(s3.download_error.is_none());
+        let expected_ckpt = ws_dir.join("checkpoint_dl-vm.pt");
+        assert_eq!(
+            std::fs::read(&expected_ckpt).unwrap(),
+            b"PYTORCH_WEIGHTS_PAYLOAD"
+        );
+        assert!(!default_ws.join("checkpoint_dl-vm.pt").exists());
+
+        // 4. HuggingFace Trainer fallback: remote has hf_checkpoints/checkpoint-20/trainer_state.json and no checkpoint.pt
+        let hf_remote = remote_drive
+            .join("colab_relay")
+            .join("hf-vm")
+            .join("hf_checkpoints")
+            .join("checkpoint-20");
+        std::fs::create_dir_all(&hf_remote).unwrap();
+        std::fs::write(
+            remote_drive.join("colab_relay").join("hf-vm").join("TRAINING_COMPLETED.flag"),
+            "done\n",
+        )
+        .unwrap();
+        std::fs::write(hf_remote.join("trainer_state.json"), r#"{"global_step":20}"#).unwrap();
+        let hf_ws = tmp.join("hf_ws");
+        std::fs::create_dir_all(&hf_ws).unwrap();
+        let h_hf = Arc::new(RelayHandle::new("hf-vm"));
+        download_and_verify_final_weights(
+            &h_hf,
+            &mock_rclone,
+            &rclone_conf,
+            "gdrive:colab_relay/hf-vm",
+            &hf_ws,
+            "hf-vm",
+        )
+        .await;
+        let s_hf = h_hf.snapshot();
+        assert!(s_hf.weights_downloaded);
+        assert_eq!(s_hf.phase, "completed");
+        assert!(s_hf
+            .local_weights_path
+            .as_deref()
+            .unwrap_or("")
+            .contains("checkpoint-20"));
+
+        std::env::remove_var("MOCK_RCLONE_ROOT");
+        std::env::remove_var("MOCK_RCLONE_MODE");
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_RCLONE_BIN.l() = None;
+        *cli::TEST_RCLONE_CONF.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

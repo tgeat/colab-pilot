@@ -48,7 +48,7 @@ const DEFAULT_GDRIVE_DIR: &str = "gdrive:colab_relay";
 
 // ───────────────────────────── 数据结构 ─────────────────────────────
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct EnvStatus {
     pub colab_bin: String,
     pub colab_ok: bool,
@@ -57,12 +57,14 @@ pub struct EnvStatus {
     pub rclone_conf: String,
     pub rclone_conf_ok: bool,
     pub token_ok: bool,
+    #[serde(default)]
+    pub adc_ok: bool,
     pub workspace: String,
     pub sessions_path: String,
     pub history_dir: String,
 }
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct GdriveFile {
     pub name: String,
     pub size: i64,
@@ -70,7 +72,7 @@ pub struct GdriveFile {
     pub is_dir: bool,
 }
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct GdriveStatus {
     pub dir: String,
     pub ok: bool,
@@ -82,7 +84,7 @@ pub struct GdriveStatus {
     pub files: Vec<GdriveFile>,
 }
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct VmView {
     pub name: String,
     pub workspace: WorkspaceInfo,
@@ -109,7 +111,53 @@ pub struct VmView {
     pub deploy_error: Option<String>,
 }
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct LlmBlueGreenState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_slot: Option<String>,
+    #[serde(default)]
+    pub standby_slot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standby_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blue_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub green_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gdrive_model_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_mem: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_switchover_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_tps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<f64>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Overview {
     pub timestamp: i64,
     pub auth_ok: bool,
@@ -120,10 +168,16 @@ pub struct Overview {
     pub env: EnvStatus,
     pub vms: Vec<VmView>,
     pub recent_sessions: Vec<RecentSessionView>,
-    pub llm_bluegreen: Option<Value>,
+    pub llm_bluegreen: Option<LlmBlueGreenState>,
+    #[serde(default)]
+    pub last_ok_timestamp: Option<u64>,
+    #[serde(default)]
+    pub is_stale: bool,
+    #[serde(default)]
+    pub stale_reason: Option<String>,
 }
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct TerminateReceipt {
     pub name: String,
     pub endpoint: Option<String>,
@@ -132,6 +186,15 @@ pub struct TerminateReceipt {
     pub steps: Vec<String>,
     pub ccu: Option<Ccu>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StopRelayResult {
+    pub supervisor_stopped: bool,
+    pub destroy_vm: bool,
+    pub kernel_interrupted: bool,
+    pub kernel_interrupt_error: Option<String>,
+    pub terminate_receipt: Option<TerminateReceipt>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Default, Debug)]
@@ -226,7 +289,7 @@ pub struct AppState {
     pub workspace: PathBuf,
     overview: tokio::sync::RwLock<Overview>,
     telemetry: Mutex<HashMap<String, TelemetryEntry>>,
-    last_assignments: Mutex<Option<(Vec<Assignment>, Instant)>>,
+    last_assignments: Mutex<Option<(Vec<Assignment>, Instant, u64)>>,
     last_ccu: Mutex<Option<Ccu>>,
     relays: Mutex<HashMap<String, Arc<RelayHandle>>>,
     creating_vms: Mutex<HashMap<String, CreatingVmMeta>>,
@@ -237,6 +300,8 @@ pub struct AppState {
     probe_cooldown: Mutex<HashMap<String, Instant>>,
     gdrive: tokio::sync::Mutex<GdriveCache>,
     refresh_lock: tokio::sync::Mutex<()>,
+    force_close_confirmed: std::sync::atomic::AtomicBool,
+    pending_close_vms: Mutex<std::collections::HashSet<String>>,
 }
 
 pub(crate) fn legacy_orphan_name(endpoint: &str) -> String {
@@ -293,6 +358,8 @@ impl AppState {
             probe_cooldown: Mutex::new(HashMap::new()),
             gdrive: tokio::sync::Mutex::new(GdriveCache::default()),
             refresh_lock: tokio::sync::Mutex::new(()),
+            force_close_confirmed: std::sync::atomic::AtomicBool::new(false),
+            pending_close_vms: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -385,7 +452,8 @@ impl AppState {
             rclone_bin: rclone.display().to_string(),
             rclone_conf_ok: std::fs::metadata(&conf).map(|m| m.len() > 30).unwrap_or(false),
             rclone_conf: conf.display().to_string(),
-            token_ok: ColabClient::is_authorized(),
+            token_ok: self.client.is_client_authorized(),
+            adc_ok: cli::is_adc_configured(),
             workspace: self.workspace.display().to_string(),
             sessions_path: cli::sessions_path().display().to_string(),
             history_dir: cli::history_dir().display().to_string(),
@@ -400,16 +468,15 @@ async fn fetch_gdrive_status(dir: &str) -> GdriveStatus {
         dir: dir.into(),
         ..Default::default()
     };
-    let out = cli::run_simple(
-        &cli::rclone_bin(),
-        &[
-            s(&["lsjson", "--retries=5", "--low-level-retries=20", "--"]),
-            vec![dir.to_string()],
-        ]
-        .concat(),
-        Duration::from_secs(90),
-    )
-    .await;
+    let conf = cli::rclone_conf_path();
+    let mut args = Vec::new();
+    if conf.exists() {
+        args.push("--config".into());
+        args.push(conf.to_string_lossy().to_string());
+    }
+    args.extend(s(&["lsjson", "--retries=5", "--low-level-retries=20", "--"]));
+    args.push(dir.to_string());
+    let out = cli::run_simple(&cli::rclone_bin(), &args, Duration::from_secs(90)).await;
     match out {
         Ok(o) if o.code == 0 => {
             let trimmed = o.stdout.trim();
@@ -432,7 +499,7 @@ async fn fetch_gdrive_status(dir: &str) -> GdriveStatus {
                             st.checkpoint_size = f.size;
                             st.checkpoint_mtime = Some(f.mod_time.clone());
                         }
-                        if f.name == "training_done.flag" {
+                        if relay::is_done_flag_filename(&f.name) {
                             st.has_done_flag = true;
                         }
                         st.files.push(f);
@@ -466,51 +533,76 @@ async fn fetch_gdrive_status(dir: &str) -> GdriveStatus {
 
 // ───────────────────────────── 静默遥测探针部署（自动感知新实例） ─────────────────────────────
 
-const PROBE_BOOTSTRAP: &str = r#"
-import os, subprocess, sys, time
-pid_file = "/content/.colab_pilot_daemon.pid"
-alive = False
-if os.path.exists(pid_file):
-    try:
-        os.kill(int(open(pid_file).read().strip()), 0)
-        alive = True
-    except Exception:
-        alive = False
-if not alive:
-    subprocess.Popen([sys.executable, "/content/.colab_pilot_daemon.py"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    time.sleep(1.0)
-print("PROBE_OK", "reused" if alive else "started")
-"#;
+fn build_probe_bootstrap_code(deploy_nonce: &str) -> String {
+    let nonce_lit = serde_json::to_string(deploy_nonce).unwrap_or_else(|_| "\"probe\"".into());
+    format!(
+        r#"
+import subprocess, sys
+res = subprocess.run(
+    [sys.executable, "/content/.colab_pilot_daemon.py", "--bootstrap", "--nonce", {nonce_lit}],
+    capture_output=True,
+    text=True,
+    timeout=20,
+)
+if res.stdout:
+    print(res.stdout.strip(), flush=True)
+if res.returncode != 0:
+    raise RuntimeError(f"telemetry probe bootstrap failed (rc={{res.returncode}}): {{(res.stderr or res.stdout or '').strip()}}")
+"#
+    )
+}
 
 /// 使用 colab-cli 虚拟环境直接通过 /colab/tty（或 ColabRuntime）静默启动遥测守护进程，
-/// 不改写 ~/.config/colab-cli/sessions.json 与 history/*.jsonl，也不中断正在运行的训练任务。
-const SILENT_PROBE_LAUNCHER_PY: &str = r#"
-import json, sys, time, urllib.request
+/// 注入本次部署专属 `deploy_nonce` 并严格核验 `/proc/<pid>` 存活守护进程与新鲜遥测样本，绝不因残留旧文件误报成功。
+pub(crate) const SILENT_PROBE_LAUNCHER_PY: &str = r#"
+import base64, json, shlex, sys, time, urllib.request
 from urllib.parse import quote, urlparse
 
 url = sys.argv[1]
 token = sys.argv[2]
 existing_kid = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3].strip() else None
+deploy_nonce = sys.argv[4].strip() if len(sys.argv) > 4 and sys.argv[4].strip() else f"nonce-{int(time.time() * 1000)}"
 safe_tok = quote(token, safe="")
 
-def check_probe_alive():
-    for rel in ("content/.colab_pilot_telemetry.json", "content/.colab_pilot_daemon.pid"):
-        chk_url = f"{url.rstrip('/')}/api/contents/{rel}?authuser=0&colab-runtime-proxy-token={safe_tok}&content=0"
-        req = urllib.request.Request(
-            chk_url,
-            headers={
-                "X-Colab-Runtime-Proxy-Token": token,
-                "X-Colab-Client-Agent": "colab-cli",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as r:
-                if 200 <= r.status < 300:
-                    return True
-        except Exception:
-            pass
-    return False
+def fetch_contents_json(rel_path):
+    chk_url = f"{url.rstrip('/')}/api/contents/{rel_path}?authuser=0&colab-runtime-proxy-token={safe_tok}&content=1"
+    req = urllib.request.Request(
+        chk_url,
+        headers={
+            "X-Colab-Runtime-Proxy-Token": token,
+            "X-Colab-Client-Agent": "colab-cli",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        if not (200 <= r.status < 300):
+            return None
+        outer = json.loads(r.read().decode("utf-8", "replace"))
+    content = outer.get("content")
+    fmt = outer.get("format") or "text"
+    if isinstance(content, str):
+        raw_txt = base64.b64decode(content).decode("utf-8", "replace") if fmt == "base64" else content
+        return json.loads(raw_txt)
+    if isinstance(content, dict):
+        return content
+    return None
+
+def check_probe_fresh_for_nonce():
+    try:
+        ack = fetch_contents_json("content/.colab_pilot_probe_ack.json")
+        tel = fetch_contents_json("content/.colab_pilot_telemetry.json")
+        if not isinstance(ack, dict) or not isinstance(tel, dict):
+            return False
+        if not ack.get("ok") or ack.get("nonce") != deploy_nonce:
+            return False
+        if tel.get("probe_nonce") != deploy_nonce:
+            return False
+        ack_pid = int(ack.get("pid") or 0)
+        tel_pid = int(tel.get("daemon_pid") or 0)
+        launch_ts = float(ack.get("launch_ts") or 0.0)
+        tel_ts = float(tel.get("timestamp") or 0.0)
+        return ack_pid > 0 and ack_pid == tel_pid and tel_ts >= launch_ts
+    except Exception:
+        return False
 
 started = False
 try:
@@ -528,12 +620,13 @@ try:
     )
     ws.send(json.dumps({"cols": 120, "rows": 30}))
     time.sleep(0.25)
-    ws.send(json.dumps({"data": "nohup python3 /content/.colab_pilot_daemon.py >/dev/null 2>&1 </dev/null &\n"}))
-    for _ in range(8):
+    q_nonce = shlex.quote(deploy_nonce)
+    ws.send(json.dumps({"data": f"python3 /content/.colab_pilot_daemon.py --bootstrap --nonce {q_nonce} >/dev/null 2>&1 </dev/null &\n"}))
+    for _ in range(12):
         time.sleep(0.5)
-        if check_probe_alive():
+        if check_probe_fresh_for_nonce():
             started = True
-            print("PROBE_OK via_tty", flush=True)
+            print(f"PROBE_OK via_tty nonce={deploy_nonce}", flush=True)
             break
     ws.close()
 except Exception:
@@ -545,22 +638,27 @@ if not started:
     try:
         if not existing_kid and getattr(rt, "kernel_id", None):
             print(f"KERNEL_ID:{rt.kernel_id}", flush=True)
-        rt.execute_code('''
-import os, subprocess, sys, time
-pid_file = "/content/.colab_pilot_daemon.pid"
-alive = False
-if os.path.exists(pid_file):
-    try:
-        os.kill(int(open(pid_file).read().strip()), 0)
-        alive = True
-    except Exception:
-        alive = False
-if not alive:
-    subprocess.Popen([sys.executable, "/content/.colab_pilot_daemon.py"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    time.sleep(0.8)
-''', timeout=35)
-        print("PROBE_OK via_kernel", flush=True)
+        out_chunks = []
+        def _hook(msg):
+            if isinstance(msg, dict):
+                if msg.get("output_type") == "stream" and msg.get("text"):
+                    out_chunks.append(str(msg["text"]))
+                elif msg.get("output_type") == "error":
+                    out_chunks.append("ERROR:" + str(msg.get("evalue") or msg.get("ename") or "kernel_error"))
+        boot_code = (
+            "import subprocess, sys\n"
+            f"res = subprocess.run([sys.executable, '/content/.colab_pilot_daemon.py', '--bootstrap', '--nonce', {json.dumps(deploy_nonce)}], capture_output=True, text=True, timeout=20)\n"
+            "print(res.stdout.strip(), flush=True)\n"
+            "if res.returncode != 0:\n"
+            "    raise RuntimeError(res.stderr.strip() or res.stdout.strip() or 'bootstrap failed')\n"
+        )
+        rt.execute_code(boot_code, output_hook=_hook, timeout=35)
+        joined_out = "\n".join(out_chunks)
+        if (f"PROBE_OK started" in joined_out and f"nonce={deploy_nonce}" in joined_out) or check_probe_fresh_for_nonce():
+            print(f"PROBE_OK via_kernel nonce={deploy_nonce}", flush=True)
+        else:
+            print(f"PROBE_FAIL via_kernel: {joined_out.strip()}", flush=True)
+            sys.exit(1)
     finally:
         rt.stop()
 "#;
@@ -584,6 +682,7 @@ pub async fn deploy_probe_for_assignment(app: &Arc<AppState>, a: &Assignment) ->
         .unwrap_or("")
         .to_string();
 
+    let deploy_nonce = format!("probe-{}", uuid::Uuid::new_v4().simple());
     let py = cli::colab_python_bin();
     let args = vec![
         "-u".to_string(),
@@ -592,6 +691,7 @@ pub async fn deploy_probe_for_assignment(app: &Arc<AppState>, a: &Assignment) ->
         a.runtime_proxy_info.url.clone(),
         a.runtime_proxy_info.token.clone(),
         existing_kid,
+        deploy_nonce.clone(),
     ];
     let out = cli::run_simple(&py, &args, Duration::from_secs(65)).await?;
     for line in out.stdout.lines() {
@@ -599,7 +699,10 @@ pub async fn deploy_probe_for_assignment(app: &Arc<AppState>, a: &Assignment) ->
             cli::update_session_kernel_id(&a.endpoint, kid);
         }
     }
-    if out.output.contains("PROBE_OK") {
+    if out.code == 0
+        && out.output.contains("PROBE_OK")
+        && out.output.contains(&format!("nonce={deploy_nonce}"))
+    {
         Ok(())
     } else {
         let cleaned = cli::strip_colab_cli_banners(&out.output);
@@ -625,17 +728,22 @@ pub async fn deploy_probe_inner(app: &Arc<AppState>, name: &str) -> anyhow::Resu
     if !cli::read_sessions().contains_key(name) || name.starts_with("orphan-") {
         return Err(silent_err);
     }
+    let deploy_nonce = format!("probe-{}", uuid::Uuid::new_v4().simple());
+    let exec_args = cli::colab_args_for_session(name, &s(&["exec", "-s", name, "--timeout", "60"]));
     let out = cli::run_streaming(
         &cli::colab_bin(),
-        &s(&["exec", "-s", name, "--timeout", "60"]),
-        Some(PROBE_BOOTSTRAP.to_string()),
+        &exec_args,
+        Some(build_probe_bootstrap_code(&deploy_nonce)),
         Duration::from_secs(150),
         None,
         None,
         |_| {},
     )
     .await?;
-    if out.output.contains("PROBE_OK") {
+    if out.code == 0
+        && out.output.contains("PROBE_OK")
+        && out.output.contains(&format!("nonce={deploy_nonce}"))
+    {
         Ok(())
     } else {
         let cleaned = cli::strip_colab_cli_banners(&out.output);
@@ -1068,10 +1176,15 @@ fn build_vm_ssh_info(vm_name: &str, a: &Assignment, local_port: Option<u16>) -> 
     let ssh_d = cli::ssh_dir();
     let has_default_ssh_key =
         ssh_d.join("id_ed25519.pub").exists() || ssh_d.join("id_ecdsa.pub").exists();
-    let colab_ssh_command = if has_default_ssh_key {
-        format!("colab ssh -s {vm_name}")
+    let auth_prefix = if matches!(cli::get_session_auth_mode(vm_name).as_deref(), Some("adc")) {
+        "colab --auth adc"
     } else {
-        format!("colab ssh -i \"{priv_path_str}\" -s {vm_name}")
+        "colab"
+    };
+    let colab_ssh_command = if has_default_ssh_key {
+        format!("{auth_prefix} ssh -s {vm_name}")
+    } else {
+        format!("{auth_prefix} ssh -i \"{priv_path_str}\" -s {vm_name}")
     };
     let ssh_port_command = if port > 0 {
         format!(
@@ -1120,45 +1233,197 @@ fn local_metrics_client() -> Option<&'static reqwest::Client> {
         .as_ref()
 }
 
-/// 严格判定指定 VM 是否属于当前蓝绿集群固定槽位（`{session_prefix}-blue` -> 18081，`{session_prefix}-green` -> 18082），
-/// 杜绝其他同名后缀实例（如 `other-blue`）与本地蓝绿网关串流或混入指标（H-4）。
-pub(crate) fn bluegreen_tunnel_port_for_vm(vm_name: &str, bg: Option<&Value>) -> Option<u16> {
-    let bg = bg?;
-    let prefix = bg
-        .get("session_prefix")
-        .and_then(|x| x.as_str())
-        .map(|s| s.trim())
+pub(crate) fn parse_llm_bluegreen_state(raw: Option<Value>) -> Option<LlmBlueGreenState> {
+    let val = raw?;
+    if !val.is_object() {
+        return None;
+    }
+    serde_json::from_value::<LlmBlueGreenState>(val).ok()
+}
+
+pub(crate) fn bg_session_prefix(bg: &LlmBlueGreenState) -> &str {
+    bg.session_prefix
+        .as_deref()
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("llm");
-    if vm_name == format!("{prefix}-blue") {
-        Some(18081)
-    } else if vm_name == format!("{prefix}-green") {
-        Some(18082)
+        .unwrap_or("llm")
+}
+
+/// 从 `LlmBlueGreenState` 中提取指定槽位（`"blue"` / `"green"`）显式记录的真实会话名（不回退 `${prefix}-${slot}`）
+pub(crate) fn bg_explicit_slot_session(bg: &LlmBlueGreenState, slot: &str) -> Option<String> {
+    let slot_low = slot.trim().to_ascii_lowercase();
+    if let Some(ref slots_val) = bg.slots {
+        if let Some(slot_entry) = slots_val.get(&slot_low).or_else(|| slots_val.get(slot)) {
+            if let Some(s) = slot_entry.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                return Some(s.to_string());
+            }
+            if let Some(s) = slot_entry
+                .get("session_name")
+                .or_else(|| slot_entry.get("vm_name"))
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(s.to_string());
+            }
+        }
+    }
+    let direct = if slot_low == "blue" {
+        bg.blue_session.as_deref()
+    } else if slot_low == "green" {
+        bg.green_session.as_deref()
     } else {
         None
+    };
+    if let Some(s) = direct.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(s.to_string());
+    }
+    if bg
+        .active_slot
+        .as_deref()
+        .map(|s| s.trim().eq_ignore_ascii_case(&slot_low))
+        .unwrap_or(false)
+    {
+        if let Some(s) = bg.active_session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(s.to_string());
+        }
+    }
+    if bg
+        .standby_slot
+        .as_deref()
+        .map(|s| s.trim().eq_ignore_ascii_case(&slot_low))
+        .unwrap_or(false)
+    {
+        if let Some(s) = bg.standby_session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+/// 解析指定槽位的目标会话名：优先使用蓝绿状态中记录的真实会话名，无记录时才回退 `${prefix}-${slot}`
+pub(crate) fn bg_slot_session_name(bg: &LlmBlueGreenState, slot: &str) -> String {
+    let slot_low = slot.trim().to_ascii_lowercase();
+    bg_explicit_slot_session(bg, &slot_low)
+        .unwrap_or_else(|| format!("{}-{slot_low}", bg_session_prefix(bg)))
+}
+
+/// 匹配指定实例所属的蓝绿槽位：
+/// 1. 优先匹配 `LlmBlueGreenState` 中记录的真实会话名（`slots[slot].session_name` / `blue_session` / `green_session` / `active_session` / `standby_session`）；
+/// 2. 其次检查 `telemetry.llm.slot`（不与已登记的其他真实槽位会话冲突时）；
+/// 3. 最后回退 `${prefix}-${slot}`。
+pub(crate) fn match_bluegreen_slot_for_vm(
+    vm_name: &str,
+    bg: Option<&LlmBlueGreenState>,
+    llm_tel: Option<&Value>,
+) -> Option<&'static str> {
+    if let Some(b) = bg {
+        let exp_blue = bg_explicit_slot_session(b, "blue");
+        let exp_green = bg_explicit_slot_session(b, "green");
+        if exp_blue.as_deref() == Some(vm_name) {
+            return Some("blue");
+        }
+        if exp_green.as_deref() == Some(vm_name) {
+            return Some("green");
+        }
+        if b.active_session.as_deref().map(str::trim) == Some(vm_name) {
+            return if b
+                .active_slot
+                .as_deref()
+                .map(|s| s.trim().eq_ignore_ascii_case("green"))
+                .unwrap_or(false)
+            {
+                Some("green")
+            } else {
+                Some("blue")
+            };
+        }
+        if b.standby_session.as_deref().map(str::trim) == Some(vm_name) {
+            return if b
+                .standby_slot
+                .as_deref()
+                .map(|s| s.trim().eq_ignore_ascii_case("green"))
+                .unwrap_or(false)
+            {
+                Some("green")
+            } else {
+                Some("blue")
+            };
+        }
+        if let Some(tel_slot) = llm_tel
+            .and_then(|l| l.get("slot"))
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+        {
+            let pfx = bg_session_prefix(b);
+            let same_cluster = pfx == "llm" || vm_name == pfx || vm_name.starts_with(&format!("{pfx}-"));
+            if tel_slot == "blue" && exp_blue.is_none() && same_cluster {
+                return Some("blue");
+            }
+            if tel_slot == "green" && exp_green.is_none() && same_cluster {
+                return Some("green");
+            }
+        }
+        let pfx = bg_session_prefix(b);
+        if exp_blue.is_none() && vm_name == format!("{pfx}-blue") {
+            return Some("blue");
+        }
+        if exp_green.is_none() && vm_name == format!("{pfx}-green") {
+            return Some("green");
+        }
+        return None;
+    }
+
+    if let Some(tel_slot) = llm_tel
+        .and_then(|l| l.get("slot"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+    {
+        if tel_slot == "blue" {
+            return Some("blue");
+        }
+        if tel_slot == "green" {
+            return Some("green");
+        }
+    }
+    None
+}
+
+/// 严格判定指定 VM 是否属于当前蓝绿集群固定槽位（blue -> 18081，green -> 18082）：
+/// 优先匹配状态中记录的真实会话名，其次匹配遥测槽位，最后回退 `{session_prefix}-{slot}`，
+/// 杜绝其他无关同名后缀实例（如 `other-blue`）与本地蓝绿网关串流或混入指标（H-4 + #48）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn bluegreen_tunnel_port_for_vm(
+    vm_name: &str,
+    bg: Option<&LlmBlueGreenState>,
+) -> Option<u16> {
+    let b = bg?;
+    match match_bluegreen_slot_for_vm(vm_name, Some(b), None) {
+        Some("blue") => Some(18081),
+        Some("green") => Some(18082),
+        _ => None,
     }
 }
 
 /// 过滤陈旧的 `llm_bluegreen_state.json`：
-/// - 若处于 `switching` / `initializing` / `warming_up` / `deploying` 且更新时间在 30 分钟内，保留展示；
+/// - 若处于 `switching` / `initializing` / `warming_up` / `deploying` / `warming_*` 且更新时间在 30 分钟内，保留展示；
 /// - 若处于 `failed` 且关联的 `failed_session` 在线/创建中，或错误发生在最近 10 分钟内，保留展示以便界面显示错误诊断；
-/// - 其余状态（如 `serving`）仅当蓝绿槽位（`{prefix}-blue` / `{prefix}-green`）或 `active_session` 确实在线/创建中/部署中时才保留，
-///   杜绝数天前残留的 `serving` 文件虚报在线或误导对话路由。
+/// - 其余状态（如 `serving`）检查状态中记录的全部真实会话名（`slots[slot].session_name` / `blue_session` / `green_session` / `active_session` / `standby_session`）及回退 `${prefix}-${slot}` 是否在线/创建中/部署中。
 pub(crate) fn filter_live_bluegreen_state(
-    bg: Option<Value>,
+    bg: Option<LlmBlueGreenState>,
     online_names: &[String],
     busy: &HashMap<String, String>,
     creating_names: &[String],
     now_ts: f64,
-) -> Option<Value> {
+) -> Option<LlmBlueGreenState> {
     let bg = bg?;
     let phase = bg
-        .get("phase")
-        .and_then(|x| x.as_str())
+        .phase
+        .as_deref()
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    let updated_at = bg.get("updated_at").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let updated_at = bg.updated_at.unwrap_or(0.0);
     let age_secs = if updated_at > 0.0 {
         (now_ts - updated_at).max(0.0)
     } else {
@@ -1166,25 +1431,28 @@ pub(crate) fn filter_live_bluegreen_state(
     };
 
     let is_live_vm = |cand: &str| -> bool {
-        !cand.is_empty()
-            && (online_names.iter().any(|n| n == cand)
-                || creating_names.iter().any(|n| n == cand)
+        let c = cand.trim();
+        !c.is_empty()
+            && (online_names.iter().any(|n| n == c)
+                || creating_names.iter().any(|n| n == c)
                 || busy
-                    .get(cand)
+                    .get(c)
                     .map(|b| b == "creating" || b == "deploying_llm")
                     .unwrap_or(false))
     };
 
-    if matches!(
+    if (matches!(
         phase.as_str(),
         "switching" | "initializing" | "warming_up" | "deploying"
-    ) && age_secs <= 1800.0
+    ) || phase.starts_with("warming_"))
+        && age_secs <= 1800.0
     {
         return Some(bg);
     }
 
     if phase == "failed" {
         let failed_sess = bg
+            .extra
             .get("failed_session")
             .and_then(|x| x.as_str())
             .unwrap_or("")
@@ -1195,21 +1463,16 @@ pub(crate) fn filter_live_bluegreen_state(
         return None;
     }
 
-    let prefix = bg
-        .get("session_prefix")
-        .and_then(|x| x.as_str())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("llm");
-    let blue_name = format!("{prefix}-blue");
-    let green_name = format!("{prefix}-green");
-    let active_sess = bg
-        .get("active_session")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .trim();
+    let blue_cand = bg_slot_session_name(&bg, "blue");
+    let green_cand = bg_slot_session_name(&bg, "green");
+    let active_sess = bg.active_session.as_deref().unwrap_or("");
+    let standby_sess = bg.standby_session.as_deref().unwrap_or("");
 
-    if is_live_vm(&blue_name) || is_live_vm(&green_name) || is_live_vm(active_sess) {
+    if is_live_vm(&blue_cand)
+        || is_live_vm(&green_cand)
+        || is_live_vm(active_sess)
+        || is_live_vm(standby_sess)
+    {
         Some(bg)
     } else {
         None
@@ -1220,7 +1483,7 @@ async fn fetch_telemetry(
     app: &AppState,
     a: &Assignment,
     vm_name: Option<&str>,
-    bg: Option<&Value>,
+    bg: Option<&LlmBlueGreenState>,
 ) -> TelemetryEntry {
     match app
         .client
@@ -1229,10 +1492,15 @@ async fn fetch_telemetry(
     {
         Ok(Some(text)) => match serde_json::from_str::<Value>(&text) {
             Ok(mut v) => {
-                // 匹配蓝绿槽位固定端口或独立 LLM 实例在 llm_api_keys.json 中登记的专属本地端口，合并实时指标
+                let llm_tel = v.get("llm").filter(|x| x.is_object());
+                // 匹配蓝绿槽位固定端口（优先真实会话名）或独立 LLM 实例在 llm_api_keys.json 中登记的专属本地端口，合并实时指标
                 let local_port = vm_name.and_then(|n| {
-                    bluegreen_tunnel_port_for_vm(n, bg)
-                        .or_else(|| cli::lookup_vm_api_key_meta(n).and_then(|(_, p)| p))
+                    bg.and_then(|b| match match_bluegreen_slot_for_vm(n, Some(b), llm_tel) {
+                        Some("blue") => Some(18081),
+                        Some("green") => Some(18082),
+                        _ => None,
+                    })
+                    .or_else(|| cli::lookup_vm_api_key_meta(n).and_then(|(_, p)| p))
                 });
                 if let Some(port) = local_port {
                     if let Some(client) = local_metrics_client() {
@@ -1366,50 +1634,76 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
 
     // 本地会话表与蓝绿状态读取涉及磁盘 I/O，放入阻塞线程池执行
     let (sessions, bg_snapshot) = tokio::task::spawn_blocking(|| {
-        (cli::read_sessions(), cli::read_llm_bluegreen_state())
+        (
+            cli::read_sessions(),
+            parse_llm_bluegreen_state(cli::read_llm_bluegreen_state()),
+        )
     })
     .await
     .unwrap_or_default();
     let mut assignments: Vec<Assignment> = vec![];
 
     if !env.token_ok {
-        ov.error = Some("未检测到 Colab 登录凭证，请在终端运行 `colab auth login` 或 `colab status` 完成 Google 授权".into());
+        ov.last_ok_timestamp = app
+            .last_assignments
+            .l()
+            .as_ref()
+            .map(|(_, _, ok_ts)| *ok_ts);
+        ov.error = Some("未检测到 Colab 登录凭证，请在终端运行 `colab auth` 或 `colab status` 完成 Google 授权".into());
     } else {
         // 高频遥测优化：8 秒内直接复用已缓存的计费实例列表与 CU 信息，省去跨洋 /tun/m/ 串行等待，直奔实例遥测快照
         let cached_fresh = if !force_gdrive {
             app.last_assignments
                 .l()
                 .as_ref()
-                .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(8))
-                .map(|(l, _)| l.clone())
+                .filter(|(_, ts, _)| ts.elapsed() < Duration::from_secs(8))
+                .map(|(l, _, ok_ts)| (l.clone(), *ok_ts))
         } else {
             None
         };
 
-        if let Some(cached_list) = cached_fresh {
+        if let Some((cached_list, prev_ok_ts)) = cached_fresh {
             ov.auth_ok = true;
             assignments = cached_list;
             ov.ccu = app.last_ccu.l().clone();
+            ov.last_ok_timestamp = Some(prev_ok_ts);
+            ov.is_stale = false;
+            ov.stale_reason = None;
         } else {
             let (ccu, list) = tokio::join!(app.client.ccu_info(), app.client.list_assignments());
             match list {
                 Ok(l) => {
+                    let now_unix = chrono::Utc::now().timestamp().max(0) as u64;
+                    ov.timestamp = now_unix as i64;
+                    ov.last_ok_timestamp = Some(now_unix);
+                    ov.is_stale = false;
+                    ov.stale_reason = None;
                     ov.auth_ok = true;
-                    *app.last_assignments.l() = Some((l.clone(), Instant::now()));
+                    *app.last_assignments.l() = Some((l.clone(), Instant::now(), now_unix));
                     assignments = l;
                 }
                 Err(e) => {
+                    let err_msg = format!("{e:#}");
                     let fallback = app
                         .last_assignments
                         .l()
                         .as_ref()
-                        .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(60))
-                        .map(|(l, _)| l.clone());
-                    if let Some(cached) = fallback {
+                        .filter(|(_, ts, _)| ts.elapsed() < Duration::from_secs(60))
+                        .map(|(l, _, ok_ts)| (l.clone(), *ok_ts));
+                    if let Some((cached, prev_ok_ts)) = fallback {
                         ov.auth_ok = true;
                         assignments = cached;
+                        ov.timestamp = prev_ok_ts as i64;
+                        ov.last_ok_timestamp = Some(prev_ok_ts);
+                        ov.is_stale = true;
+                        ov.stale_reason = Some(err_msg);
                     } else {
-                        ov.error = Some(format!("{e:#}"));
+                        ov.last_ok_timestamp = app
+                            .last_assignments
+                            .l()
+                            .as_ref()
+                            .map(|(_, _, ok_ts)| *ok_ts);
+                        ov.error = Some(err_msg);
                     }
                 }
             }
@@ -1586,7 +1880,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
 
     let mut seen: Vec<String> = drafts.iter().map(|d| d.name.clone()).collect();
 
-    // 接力换棒间隙（旧实例已销毁、新实例未分配）与正在创建中的虚拟机也保留卡片
+    // 接力换棒间隙、已完成/已失败离线接力记录（#73）与正在创建中的虚拟机均保留卡片
     let relay_names: Vec<(String, Arc<RelayHandle>)> = app
         .relays
         .l()
@@ -1595,7 +1889,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
         .collect();
     let gaps: Vec<(String, Arc<RelayHandle>)> = relay_names
         .into_iter()
-        .filter(|(n, h)| !seen.contains(n) && h.is_running())
+        .filter(|(n, _h)| !seen.contains(n))
         .collect();
     seen.extend(gaps.iter().map(|(n, _)| n.clone()));
 
@@ -1654,7 +1948,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
                 cli::sync_sessions_with_assignments(&sync_items, !creating_names_bg.is_empty());
                 cli::sync_ssh_config_hosts(&ssh_entries);
             }
-            let bg_raw = cli::read_llm_bluegreen_state();
+            let bg_raw = parse_llm_bluegreen_state(cli::read_llm_bluegreen_state());
             let live_bg = filter_live_bluegreen_state(
                 bg_raw,
                 &online_names_bg,
@@ -1686,12 +1980,17 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
                         .as_ref()
                         .map(|t| t["threads"]["llm_process"].is_object())
                         .unwrap_or(false);
-                    let bg_port = bluegreen_tunnel_port_for_vm(name, live_bg.as_ref());
+                    let matched_bg_slot =
+                        match_bluegreen_slot_for_vm(name, live_bg.as_ref(), llm_tel);
+                    let bg_port = match matched_bg_slot {
+                        Some("blue") => Some(18081),
+                        Some("green") => Some(18082),
+                        _ => None,
+                    };
                     let is_bg_active_session = live_bg
                         .as_ref()
-                        .and_then(|v| v.get("active_session"))
-                        .and_then(|x| x.as_str())
-                        .map(|s| s == name)
+                        .and_then(|v| v.active_session.as_deref())
+                        .map(|s| s.trim() == name)
                         .unwrap_or(false);
                     let is_deploying_llm = busy_bg
                         .get(name)
@@ -1707,16 +2006,24 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
                         || is_deploying_llm
                         || has_reg_key
                     {
-                        let slot = llm_tel
-                            .and_then(|l| l.get("slot"))
-                            .and_then(|x| x.as_str())
+                        let slot = matched_bg_slot
                             .map(|s| s.to_string())
-                            .or_else(|| match bg_port {
-                                Some(18081) => Some("blue".into()),
-                                Some(18082) => Some("green".into()),
-                                _ => None,
+                            .or_else(|| {
+                                llm_tel
+                                    .and_then(|l| l.get("slot"))
+                                    .and_then(|x| x.as_str())
+                                    .map(|s| s.to_string())
                             })
                             .unwrap_or_else(|| "standalone".into());
+                        let slot_meta_model = matched_bg_slot.and_then(|sl| {
+                            live_bg
+                                .as_ref()
+                                .and_then(|b| b.slots.as_ref())
+                                .and_then(|sv| sv.get(sl))
+                                .and_then(|e| e.get("model_name"))
+                                .and_then(|x| x.as_str())
+                                .filter(|s| !s.trim().is_empty())
+                        });
                         let engine = llm_tel
                             .and_then(|l| l.get("engine"))
                             .and_then(|x| x.as_str())
@@ -1724,19 +2031,20 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
                                 live_bg
                                     .as_ref()
                                     .filter(|_| bg_port.is_some() || is_bg_active_session)
-                                    .and_then(|b| b.get("engine"))
-                                    .and_then(|x| x.as_str())
+                                    .and_then(|b| b.engine.as_deref())
                             })
                             .unwrap_or("vllm");
-                        let model_name = llm_tel
-                            .and_then(|l| l.get("model_name"))
-                            .and_then(|x| x.as_str())
+                        let model_name = slot_meta_model
+                            .or_else(|| {
+                                llm_tel
+                                    .and_then(|l| l.get("model_name"))
+                                    .and_then(|x| x.as_str())
+                            })
                             .or_else(|| {
                                 live_bg
                                     .as_ref()
                                     .filter(|_| bg_port.is_some() || is_bg_active_session)
-                                    .and_then(|b| b.get("model_name"))
-                                    .and_then(|x| x.as_str())
+                                    .and_then(|b| b.model_name.as_deref())
                             })
                             .unwrap_or("default");
                         let remote_port = llm_tel
@@ -1864,16 +2172,43 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
 
     let mut gap_extra = gap_extra.into_iter();
     for (name, h) in gaps {
-        let (cli_events, workspace) = gap_extra.next().unwrap_or_else(|| fallback_extra(&name));
+        let (cli_events, mut workspace) = gap_extra.next().unwrap_or_else(|| fallback_extra(&name));
+        if let Some(ref bound_ws) = *h.workspace_dir.l() {
+            if workspace.path.is_none() {
+                workspace.path = Some(bound_ws.display().to_string());
+            }
+            if workspace.name.is_empty() || workspace.name == name {
+                if let Some(dn) = bound_ws
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    workspace.name = dn.to_string();
+                }
+            }
+        }
         let snap = h.snapshot();
         let cfg = snap.config.clone();
+        let acc_upper = cfg.gpu_type.trim().to_uppercase();
+        let variant = if matches!(acc_upper.as_str(), "V5E1" | "V6E1") {
+            "TPU".to_string()
+        } else if acc_upper.is_empty() || acc_upper == "CPU" || acc_upper == "NONE" {
+            "DEFAULT".to_string()
+        } else {
+            "GPU".to_string()
+        };
         let cur_busy = app.busy.l().get(&name).cloned();
         ov.vms.push(VmView {
             name: name.clone(),
             workspace,
-            accelerator: cfg.gpu_type.clone(),
-            variant: "GPU".into(),
+            accelerator: if acc_upper.is_empty() || acc_upper == "NONE" {
+                "CPU".into()
+            } else {
+                acc_upper
+            },
+            variant,
             high_ram: cfg.high_mem,
+            on_server: false,
             managed: true,
             cli_events,
             relay: Some(snap),
@@ -2017,24 +2352,20 @@ fn cleanup_llm_bluegreen_after_terminate(
     steps: &mut Vec<String>,
 ) {
     let state_path = cli::llm_bluegreen_state_path();
-    let Some(mut bg) = cli::read_llm_bluegreen_state() else {
+    let Some(mut bg_raw) = cli::read_llm_bluegreen_state() else {
         return;
     };
-    let prefix = bg
-        .get("session_prefix")
-        .and_then(|x| x.as_str())
-        .unwrap_or("llm")
-        .to_string();
-    let active_session = bg
-        .get("active_session")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let blue_name = format!("{prefix}-blue");
-    let green_name = format!("{prefix}-green");
+    let Some(bg_typed) = parse_llm_bluegreen_state(Some(bg_raw.clone())) else {
+        return;
+    };
+    let active_session = bg_typed.active_session.as_deref().unwrap_or("").trim().to_string();
+    let standby_session = bg_typed.standby_session.as_deref().unwrap_or("").trim().to_string();
+    let blue_name = bg_slot_session_name(&bg_typed, "blue");
+    let green_name = bg_slot_session_name(&bg_typed, "green");
     let relevant = terminated_name == blue_name
         || terminated_name == green_name
-        || terminated_name == active_session
+        || (!active_session.is_empty() && terminated_name == active_session)
+        || (!standby_session.is_empty() && terminated_name == standby_session)
         || terminated_name.starts_with("llm-")
         || terminated_name.starts_with("orphan-")
         || remaining_endpoints.is_empty();
@@ -2043,19 +2374,31 @@ fn cleanup_llm_bluegreen_after_terminate(
     }
 
     let sessions = cli::read_sessions();
-    let slot_still_on_server = |slot_vm: &str| -> bool {
+    let slot_still_on_server = |slot_key: &str, slot_vm: &str| -> bool {
         if slot_vm.is_empty() || slot_vm == terminated_name {
             return false;
         }
-        sessions
+        let ep_opt = sessions
             .get(slot_vm)
             .and_then(session_endpoint)
+            .or_else(|| {
+                bg_typed
+                    .slots
+                    .as_ref()
+                    .and_then(|sv| sv.get(slot_key))
+                    .and_then(|e| e.get("endpoint"))
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            });
+        ep_opt
             .map(|ep| remaining_endpoints.contains(&ep))
             .unwrap_or(false)
     };
 
-    let blue_alive = slot_still_on_server(&blue_name);
-    let green_alive = slot_still_on_server(&green_name);
+    let blue_alive = slot_still_on_server("blue", &blue_name);
+    let green_alive = slot_still_on_server("green", &green_name);
 
     if !blue_alive && !green_alive {
         let _ = std::fs::remove_file(&state_path);
@@ -2071,14 +2414,33 @@ fn cleanup_llm_bluegreen_after_terminate(
         steps.push("已同步清理本机 LLM 蓝绿状态与本地网关隧道进程".into());
     } else {
         let surviving_slot = if blue_alive { "blue" } else { "green" };
-        let surviving_sess = format!("{prefix}-{surviving_slot}");
-        if let Some(obj) = bg.as_object_mut() {
+        let surviving_sess = if blue_alive {
+            blue_name.clone()
+        } else {
+            green_name.clone()
+        };
+        let terminated_slot = if surviving_slot == "blue" {
+            "green"
+        } else {
+            "blue"
+        };
+        if let Some(obj) = bg_raw.as_object_mut() {
             obj.insert("active_slot".into(), Value::String(surviving_slot.into()));
-            obj.insert("active_session".into(), Value::String(surviving_sess));
+            obj.insert("active_session".into(), Value::String(surviving_sess.clone()));
             obj.insert("standby_slot".into(), Value::Null);
+            obj.insert("standby_session".into(), Value::Null);
+            if terminated_slot == "blue" && obj.contains_key("blue_session") {
+                obj.insert("blue_session".into(), Value::Null);
+            }
+            if terminated_slot == "green" && obj.contains_key("green_session") {
+                obj.insert("green_session".into(), Value::Null);
+            }
+            if let Some(slots_obj) = obj.get_mut("slots").and_then(|s| s.as_object_mut()) {
+                slots_obj.remove(terminated_slot);
+            }
             obj.insert("phase".into(), Value::String("serving".into()));
         }
-        if let Ok(raw) = serde_json::to_string_pretty(&bg) {
+        if let Ok(raw) = serde_json::to_string_pretty(&bg_raw) {
             let tmp = state_path.with_extension("json.tmp");
             if std::fs::write(&tmp, &raw).is_ok() {
                 let _ = std::fs::rename(&tmp, &state_path);
@@ -2087,8 +2449,9 @@ fn cleanup_llm_bluegreen_after_terminate(
             }
         }
         steps.push(format!(
-            "已更新蓝绿状态：当前由剩余在线槽位 [{}] 继续提供服务",
-            surviving_slot.to_uppercase()
+            "已更新蓝绿状态：当前由剩余在线槽位 [{} · {}] 继续提供服务",
+            surviving_slot.to_uppercase(),
+            surviving_sess
         ));
     }
 }
@@ -2115,6 +2478,18 @@ fn cleanup_local_vm_artifacts(app: &AppState, name: &str) {
     }
     if name.starts_with("orphan-") {
         cli::remove_llm_api_key_entry(name);
+    }
+}
+
+fn push_unique_endpoint(
+    targets: &mut Vec<String>,
+    other_session_endpoints: &std::collections::HashSet<String>,
+    cand: Option<String>,
+) {
+    if let Some(ep) = cand.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        if !other_session_endpoints.contains(&ep) && !targets.contains(&ep) {
+            targets.push(ep);
+        }
     }
 }
 
@@ -2167,47 +2542,90 @@ pub async fn hard_terminate(
         .collect();
 
     let mut initial_assignments = app.client.list_assignments().await;
-    let mut endpoint = endpoint_hint
-        .filter(|e| !e.is_empty())
-        .or_else(|| sessions.get(name).and_then(session_endpoint));
-    if endpoint.is_none() {
-        if let Ok(ref list) = initial_assignments {
-            endpoint = list
-                .iter()
-                .find(|a| matches_orphan_name(&a.endpoint, name))
-                .map(|a| a.endpoint.clone());
-        }
+
+    // Issue #39：同时收集该会话当前绑定的真实端点（sessions.json / SSH 桥接 / 总览快照）以及界面传入的 endpoint_hint，
+    // 防止接力换棒后界面传入旧端点 A 而忽略服务端仍在运行的当前端点 B！
+    let mut target_endpoints: Vec<String> = Vec::new();
+    let current_session_ep = sessions.get(name).and_then(session_endpoint);
+    push_unique_endpoint(&mut target_endpoints, &other_session_endpoints, current_session_ep.clone());
+    push_unique_endpoint(&mut target_endpoints, &other_session_endpoints, endpoint_hint.clone());
+    let bridge_ep = app
+        .ssh_bridges
+        .l()
+        .get(name)
+        .map(|b| b.target.l().endpoint.clone());
+    push_unique_endpoint(&mut target_endpoints, &other_session_endpoints, bridge_ep);
+    let ov_ep = app
+        .overview
+        .read()
+        .await
+        .vms
+        .iter()
+        .find(|v| v.name == name)
+        .and_then(|v| v.endpoint.clone());
+    push_unique_endpoint(&mut target_endpoints, &other_session_endpoints, ov_ep);
+
+    if let Ok(ref list) = initial_assignments {
+        let orphan_ep = list
+            .iter()
+            .find(|a| matches_orphan_name(&a.endpoint, name))
+            .map(|a| a.endpoint.clone());
+        push_unique_endpoint(&mut target_endpoints, &other_session_endpoints, orphan_ep);
     }
 
     // 若刚中止了 provisioning 阶段的 colab new，服务端分配可能晚几百毫秒才出现在 /tun/m/assignments
-    if endpoint.is_none() && (stopped_during_provisioning || stopped_local_relay) {
-        let max_probes = if stopped_during_provisioning { 3 } else { 1 };
+    if (target_endpoints.is_empty() || stopped_during_provisioning || stopped_local_relay)
+        && (stopped_during_provisioning || stopped_local_relay)
+    {
+        let max_probes = if stopped_during_provisioning && target_endpoints.is_empty() {
+            3
+        } else {
+            1
+        };
         for probe in 0..max_probes {
             if let Ok(ref list) = initial_assignments {
                 let newly_leaked: Vec<String> = list
                     .iter()
                     .map(|a| a.endpoint.clone())
-                    .filter(|e| !other_session_endpoints.contains(e) && !pre_prov_endpoints.contains(e))
+                    .filter(|e| {
+                        !other_session_endpoints.contains(e)
+                            && !pre_prov_endpoints.contains(e)
+                            && !target_endpoints.contains(e)
+                    })
                     .collect();
                 if newly_leaked.len() == 1 {
                     let leaked_ep = newly_leaked[0].clone();
                     r.steps.push(format!(
                         "捕获到取消分配期间新诞生的残留实例 {leaked_ep}，正在自动释放"
                     ));
-                    endpoint = Some(leaked_ep);
+                    push_unique_endpoint(
+                        &mut target_endpoints,
+                        &other_session_endpoints,
+                        Some(leaked_ep),
+                    );
                     break;
                 }
             }
             if probe + 1 < max_probes {
                 tokio::time::sleep(Duration::from_millis(if cfg!(test) { 15 } else { 700 })).await;
                 initial_assignments = app.client.list_assignments().await;
+                let refreshed_sess_ep = cli::read_sessions().get(name).and_then(session_endpoint);
+                push_unique_endpoint(
+                    &mut target_endpoints,
+                    &other_session_endpoints,
+                    refreshed_sess_ep,
+                );
                 if let Ok(ref list) = initial_assignments {
                     if let Some(ep_found) = list
                         .iter()
                         .find(|a| matches_orphan_name(&a.endpoint, name))
                         .map(|a| a.endpoint.clone())
                     {
-                        endpoint = Some(ep_found);
+                        push_unique_endpoint(
+                            &mut target_endpoints,
+                            &other_session_endpoints,
+                            Some(ep_found),
+                        );
                         break;
                     }
                 }
@@ -2215,9 +2633,9 @@ pub async fn hard_terminate(
         }
     }
 
-    r.endpoint = endpoint.clone();
+    r.endpoint = target_endpoints.first().cloned();
 
-    let Some(ep) = endpoint else {
+    if target_endpoints.is_empty() {
         match initial_assignments {
             Ok(list) => {
                 r.remaining_endpoints = list.iter().map(|a| a.endpoint.clone()).collect();
@@ -2240,9 +2658,10 @@ pub async fn hard_terminate(
                             .push("服务端计费列表中已不存在该实例（无需重复释放）".into());
                     }
                     if managed && cli::colab_bin().exists() {
+                        let sess_args = cli::colab_args_for_session(name, &s(&["sessions"]));
                         let _ = cli::run_simple(
                             &cli::colab_bin(),
-                            &s(&["sessions"]),
+                            &sess_args,
                             Duration::from_secs(60),
                         )
                         .await;
@@ -2279,12 +2698,13 @@ pub async fn hard_terminate(
             r.ccu = Some(c);
         }
         return r;
-    };
+    }
 
     if managed && !name.starts_with("orphan-") && cli::colab_bin().exists() {
+        let stop_args = cli::colab_args_for_session(name, &s(&["stop", "-s", name]));
         match cli::run_simple(
             &cli::colab_bin(),
-            &s(&["stop", "-s", name]),
+            &stop_args,
             Duration::from_secs(120),
         )
         .await
@@ -2292,29 +2712,44 @@ pub async fn hard_terminate(
             Ok(o) => {
                 let cleaned = cli::strip_colab_cli_banners(&o.output);
                 let last = cli::last_meaningful_cli_line(&cleaned, "已执行");
-                r.steps.push(format!("colab stop -s {name}：{last}"));
+                r.steps.push(format!("colab stop -s {name} (exit={})：{last}", o.code));
             }
             Err(e) => r.steps.push(format!("colab stop 执行失败：{e}")),
         }
     }
 
     for attempt in 1..=6 {
+        // 每轮复查本地 sessions.json，防止并发换棒写入了新的当前端点而漏释放
+        let latest_sess_ep = cli::read_sessions().get(name).and_then(session_endpoint);
+        push_unique_endpoint(&mut target_endpoints, &other_session_endpoints, latest_sess_ep);
+
         match app.client.list_assignments().await {
             Ok(list) => {
                 r.remaining_endpoints = list.iter().map(|a| a.endpoint.clone()).collect();
-                if !r.remaining_endpoints.contains(&ep) {
+                let still_active: Vec<String> = target_endpoints
+                    .iter()
+                    .filter(|ep| r.remaining_endpoints.contains(*ep))
+                    .cloned()
+                    .collect();
+                if still_active.is_empty() {
                     r.verified_unassigned = true;
                     r.steps.push(format!(
-                        "服务端核验通过：/tun/m/assignments 中已不存在 {ep}（剩余计费实例 {} 台）",
+                        "服务端核验通过：/tun/m/assignments 中已不存在 {}（剩余计费实例 {} 台）",
+                        target_endpoints.join(", "),
                         r.remaining_endpoints.len()
                     ));
                     break;
                 }
-                match app.client.unassign(&ep).await {
-                    Ok(_) => r
-                        .steps
-                        .push(format!("第 {attempt} 次直接调用 /tun/m/unassign/{ep} 成功")),
-                    Err(e) => r.steps.push(format!("第 {attempt} 次 unassign 返回：{e}")),
+                r.endpoint = still_active.first().cloned().or(r.endpoint);
+                for active_ep in &still_active {
+                    match app.client.unassign(active_ep).await {
+                        Ok(_) => r.steps.push(format!(
+                            "第 {attempt} 次直接调用 /tun/m/unassign/{active_ep} 成功"
+                        )),
+                        Err(e) => r
+                            .steps
+                            .push(format!("第 {attempt} 次 unassign({active_ep}) 返回：{e}")),
+                    }
                 }
             }
             Err(e) => r.steps.push(format!("第 {attempt} 次核验请求失败：{e}")),
@@ -2323,33 +2758,60 @@ pub async fn hard_terminate(
     }
 
     if !r.verified_unassigned {
+        let latest_sess_ep = cli::read_sessions().get(name).and_then(session_endpoint);
+        push_unique_endpoint(&mut target_endpoints, &other_session_endpoints, latest_sess_ep);
         if let Ok(list) = app.client.list_assignments().await {
             r.remaining_endpoints = list.iter().map(|a| a.endpoint.clone()).collect();
-            if !r.remaining_endpoints.contains(&ep) {
+            let still_active: Vec<String> = target_endpoints
+                .iter()
+                .filter(|ep| r.remaining_endpoints.contains(*ep))
+                .cloned()
+                .collect();
+            if still_active.is_empty() {
                 r.verified_unassigned = true;
                 r.steps.push(format!(
-                    "最终核验通过：/tun/m/assignments 中已不存在 {ep}（剩余计费实例 {} 台）",
+                    "最终核验通过：/tun/m/assignments 中已不存在 {}（剩余计费实例 {} 台）",
+                    target_endpoints.join(", "),
                     r.remaining_endpoints.len()
                 ));
+            } else {
+                r.endpoint = still_active.first().cloned().or(r.endpoint);
             }
         }
     }
 
     if r.verified_unassigned {
-        app.telemetry.l().remove(&ep);
-        if let Some((list, _)) = app.last_assignments.l().as_mut() {
-            list.retain(|a| a.endpoint != ep);
+        {
+            let mut tel_map = app.telemetry.l();
+            for ep in &target_endpoints {
+                tel_map.remove(ep);
+            }
+        }
+        if let Some((list, _, _)) = app.last_assignments.l().as_mut() {
+            list.retain(|a| !target_endpoints.contains(&a.endpoint));
         }
         if cli::read_sessions().contains_key(name) && cli::colab_bin().exists() {
-            let _ =
-                cli::run_simple(&cli::colab_bin(), &s(&["sessions"]), Duration::from_secs(60)).await;
+            let sess_args = cli::colab_args_for_session(name, &s(&["sessions"]));
+            let _ = cli::run_simple(&cli::colab_bin(), &sess_args, Duration::from_secs(60)).await;
             r.steps.push("已同步清理 colab-cli 本地会话表".into());
         }
         cleanup_local_vm_artifacts(app, name);
         cleanup_llm_bluegreen_after_terminate(name, &r.remaining_endpoints, &mut r.steps);
     } else {
-        r.error =
-            Some("服务端计费列表中仍存在该实例，未执行本地移除（避免假性删除），请重试".into());
+        let active_str: Vec<String> = target_endpoints
+            .iter()
+            .filter(|ep| r.remaining_endpoints.contains(*ep))
+            .cloned()
+            .collect();
+        if !active_str.is_empty() {
+            r.error = Some(format!(
+                "服务端计费列表中仍存在该会话的活跃端点（{}），未通过停费核验，请重试",
+                active_str.join(", ")
+            ));
+        } else {
+            r.error =
+                Some("服务端计费列表中仍存在该实例或核验请求失败，未执行本地移除（避免假性删除），请重试".into());
+        }
     }
 
     if let Ok(c) = app.client.ccu_info().await {
@@ -2454,11 +2916,57 @@ pub(crate) fn normalize_llm_engine(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "vllm" => "vllm".into(),
         "ollama" => "ollama".into(),
-        "llamacpp" | "llama_cpp" | "llama.cpp" | "gguf" => "llama.cpp".into(),
+        "llamacpp" | "llama_cpp" | "llama.cpp" | "gguf" | "llamacpp-cuda" | "llama.cpp-cuda"
+        | "llamacpp-cpu" | "llama_cpp_cpu" | "llama.cpp-cpu" => "llama.cpp".into(),
         "transformers" | "hf" => "transformers".into(),
         "builtin" => "builtin".into(),
         other => other.into(),
     }
+}
+
+pub(crate) fn is_nvidia_cuda_accelerator(acc: &str) -> bool {
+    matches!(
+        acc.trim().to_ascii_uppercase().as_str(),
+        "T4" | "L4" | "G4" | "A100" | "H100" | "V100" | "P100"
+    )
+}
+
+pub(crate) fn engine_requires_nvidia_cuda(engine_raw: &str) -> bool {
+    let low = engine_raw.trim().to_ascii_lowercase();
+    let norm = normalize_llm_engine(&low);
+    match norm.as_str() {
+        "vllm" | "transformers" => true,
+        "llama.cpp" => !low.contains("cpu"),
+        _ => low.contains("cuda"),
+    }
+}
+
+pub(crate) fn validate_llm_hardware_compatibility(
+    accelerator: &str,
+    engine_raw: &str,
+) -> Result<(), String> {
+    let acc_norm = {
+        let u = accelerator.trim().to_ascii_uppercase();
+        if u.is_empty() || u == "NONE" {
+            "CPU".to_string()
+        } else {
+            u
+        }
+    };
+    let low_engine = engine_raw.trim().to_ascii_lowercase();
+    let norm_engine = normalize_llm_engine(&low_engine);
+    // 显式 CPU 模式版 llama.cpp 仅允许运行在 CPU 或 NVIDIA 实例上，不能误发往 TPU
+    if norm_engine == "llama.cpp" && low_engine.contains("cpu") && matches!(acc_norm.as_str(), "V5E1" | "V6E1" | "TPU") {
+        return Err(format!(
+            "硬件与推理引擎不兼容：当前选择的加速器为 `{acc_norm}`（TPU），不支持 `llama.cpp` 预设。请改选 CPU 或 NVIDIA GPU（如 T4 / L4 / G4 / A100）"
+        ));
+    }
+    if engine_requires_nvidia_cuda(engine_raw) && !is_nvidia_cuda_accelerator(&acc_norm) {
+        return Err(format!(
+            "硬件与推理引擎不兼容：当前选择的加速器为 `{acc_norm}`（非 NVIDIA CUDA GPU），无法运行依赖 CUDA 的 `{norm_engine}` 预设。请改选 NVIDIA GPU（如 T4 / L4 / G4 / A100），或切换为支持非 CUDA 环境的推理引擎（如 ollama / builtin）"
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_llm_slot(slot_opt: Option<&str>, vm_name: &str) -> String {
@@ -2782,9 +3290,10 @@ print("ENV_INIT_OK", flush=True)
         payload_literal = serde_json::to_string(&payload_json)?
     );
 
+    let exec_args = cli::colab_args_for_session(vm_name, &s(&["exec", "-s", vm_name, "--timeout", "600"]));
     let out = cli::run_streaming(
         &cli::colab_bin(),
-        &s(&["exec", "-s", vm_name, "--timeout", "600"]),
+        &exec_args,
         Some(remote_py),
         Duration::from_secs(630),
         None,
@@ -2811,7 +3320,7 @@ fn spawn_llm_deployment_task(
     high_mem: bool,
     workspace_dir: PathBuf,
     config: CreateVmLlmConfig,
-) -> LlmApiAccessInfo {
+) -> Result<LlmApiAccessInfo, String> {
     let norm_engine = normalize_llm_engine(&config.engine);
     let slot = normalize_llm_slot(config.slot.as_deref(), &vm_name);
     let model_name = {
@@ -2836,8 +3345,8 @@ fn spawn_llm_deployment_task(
         .map(|s| s.to_string());
 
     let preferred_port = match slot.as_str() {
-        "blue" if vm_name.ends_with("-blue") => 18081,
-        "green" if vm_name.ends_with("-green") => 18082,
+        "blue" => 18081,
+        "green" => 18082,
         _ => 0,
     };
     let api_info = if custom_key.is_some() {
@@ -2850,6 +3359,7 @@ fn spawn_llm_deployment_task(
             8000,
             &model_name,
         )
+        .map_err(|e| format!("持久化写入自定义 API Key 失败：{e:#}"))?
     } else {
         cli::resolve_or_create_llm_api_info(
             &vm_name,
@@ -2937,7 +3447,7 @@ fn spawn_llm_deployment_task(
                 app.set_deploy_error(&vm_name, None);
                 spawn_local_gateway_async(workspace_dir).await;
                 if let Some(a) = app.find_assignment_by_name(&vm_name).await {
-                    let bg = cli::read_llm_bluegreen_state();
+                    let bg = parse_llm_bluegreen_state(cli::read_llm_bluegreen_state());
                     let entry = fetch_telemetry(&app, &a, Some(&vm_name), bg.as_ref()).await;
                     if entry.data.is_some() {
                         app.telemetry.l().insert(a.endpoint.clone(), entry);
@@ -2962,26 +3472,90 @@ fn spawn_llm_deployment_task(
         emit_overview(&handle, &ov);
     });
 
-    api_info
+    Ok(api_info)
 }
 
-#[tauri::command]
-async fn create_vm(
-    handle: AppHandle,
-    state: AppStateRef<'_>,
-    req: CreateVmRequest,
-) -> Result<String, String> {
-    let app = state.inner().clone();
+/// 归一化接力配置（保留 CPU 规格、自动按实例名隔离裸 `gdrive:colab_relay` 目录、校验单棒时长 0.1~23.5h，并拦截运行中目录冲突）
+pub(crate) fn prepare_relay_config_for_vm(
+    app: &AppState,
+    vm_name: &str,
+    cfg: &mut RelayConfig,
+    override_gpu: Option<&str>,
+    override_high_mem: Option<bool>,
+) -> Result<(), String> {
+    let raw_gpu = override_gpu.unwrap_or(&cfg.gpu_type).trim();
+    let gpu_upper = raw_gpu.to_ascii_uppercase();
+    cfg.gpu_type = if gpu_upper.is_empty() || gpu_upper == "NONE" {
+        "CPU".into()
+    } else {
+        gpu_upper
+    };
+    cfg.high_mem = override_high_mem.unwrap_or(cfg.high_mem) && relay::supports_high_mem(&cfg.gpu_type);
+    cfg.gdrive_dir = relay::resolve_isolated_gdrive_dir(&cfg.gdrive_dir, vm_name);
+    relay::validate_relay_config(cfg).map_err(|e| e.to_string())?;
+
+    let target_gd = relay::normalize_gdrive_dir(&cfg.gdrive_dir);
+    let relays_guard = app.relays.l();
+    for (other_name, other_h) in relays_guard.iter() {
+        if other_name != vm_name && other_h.is_running() {
+            let other_gd = relay::normalize_gdrive_dir(&other_h.status.l().config.gdrive_dir);
+            if other_gd == target_gd {
+                return Err(format!(
+                    "云盘接力目录 `{target_gd}` 正被另一运行中的接力任务 [{other_name}] 占用，请修改云盘目录或先停止 [{other_name}]，避免断点与完成标记互相覆盖"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedCreateVm {
+    pub name: String,
+    pub boot_mode: String,
+    pub auth_mode: Option<String>,
+    pub effective_high_mem: bool,
+    pub effective_ws_dir: PathBuf,
+    pub ws_display_name: String,
+    pub desc_clean: Option<String>,
+    pub validated_relay_cfg: Option<RelayConfig>,
+    pub validated_llm_cfg: Option<CreateVmLlmConfig>,
+}
+
+pub(crate) fn validate_and_prepare_create_vm(
+    app: &AppState,
+    req: &CreateVmRequest,
+) -> Result<PreparedCreateVm, String> {
     let name = req
         .name
-        .map(|n| n.trim().to_string())
+        .as_deref()
+        .map(str::trim)
         .filter(|n| !n.is_empty())
+        .map(str::to_string)
         .unwrap_or_else(|| format!("vm-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]));
     if !valid_name(&name) {
         return Err("名称只能包含字母、数字、- 和 _，且不能以 - 开头（不超过 40 个字符）".into());
     }
     if name.starts_with("orphan-") {
         return Err("实例名称不能以保留前缀 `orphan-` 开头".into());
+    }
+
+    let auth_mode = cli::normalize_auth_mode(req.auth_mode.as_deref());
+    let env = app.env_status();
+    if !env.token_ok {
+        if auth_mode.as_deref() == Some("adc") || env.adc_ok {
+            return Err(
+                "检测到本机仅配置了 Google ADC 凭证但缺少有效的 Colab OAuth 登录令牌：仪表盘监控与 `/tun/m/assignments` 停费核验依赖 OAuth 授权，为防止创建出持续计费却无法监控和核验停费的实例，请先在终端执行 `colab auth` 完成 OAuth 授权后再创建实例".into(),
+            );
+        }
+        return Err(
+            "未检测到有效的 Colab OAuth 登录凭证，请先在终端执行 `colab auth`（可通过 `colab status` 核对状态）完成 Google 授权".into(),
+        );
+    }
+    if auth_mode.as_deref() == Some("adc") && !env.adc_ok {
+        return Err(
+            "选择了 ADC 凭证模式，但未检测到 Google Application Default Credentials 文件（application_default_credentials.json），请先配置 ADC 或切换为 OAuth 2.0 模式".into(),
+        );
     }
 
     let boot_mode = req
@@ -3001,7 +3575,7 @@ async fn create_vm(
 
     let effective_high_mem = req.high_mem && relay::supports_high_mem(&req.accelerator);
 
-    // 预先校验附加环境与模式参数，避免分配计费实例后因本地配置错误中断
+    // 预先校验附加环境与模式参数，避免分配计费实例后因本地配置错误中断（#67：通用模式未勾选 rclone 时绝不强制要求 rclone.conf）
     if let Some(ref env_cfg) = req.env_config {
         if let Some(ref raw_pkgs) = env_cfg.pip_packages {
             if !raw_pkgs.trim().is_empty() {
@@ -3014,24 +3588,25 @@ async fn create_vm(
             }
         }
         if (env_cfg.sync_rclone || env_cfg.mount_gdrive) && !cli::rclone_conf_path().exists() {
-            return Err("未检测到本机 rclone.conf，请先完成 Google Drive 授权后再勾选 rclone 同步/挂载".into());
+            return Err(
+                "未检测到本机 rclone.conf，请先完成 Google Drive 授权后再勾选 rclone 同步/挂载"
+                    .into(),
+            );
         }
     }
 
-    let validated_relay_cfg = if boot_mode == "relay" || req.auto_relay {
+    let validated_relay_cfg = if boot_mode == "relay" {
         if !cli::rclone_conf_path().exists() {
             return Err("未检测到 rclone.conf，请先完成 Google Drive 授权后再开启自动接力".into());
         }
-        let mut cfg = req.relay_config.unwrap_or_default();
-        cfg.gpu_type = if req.accelerator.trim().eq_ignore_ascii_case("CPU")
-            || req.accelerator.trim().is_empty()
-        {
-            "T4".into()
-        } else {
-            req.accelerator.trim().to_uppercase()
-        };
-        cfg.high_mem = effective_high_mem;
-        relay::validate_relay_config(&cfg).map_err(|e| e.to_string())?;
+        let mut cfg = req.relay_config.clone().unwrap_or_default();
+        prepare_relay_config_for_vm(
+            app,
+            &name,
+            &mut cfg,
+            Some(&req.accelerator),
+            Some(effective_high_mem),
+        )?;
         Some(cfg)
     } else {
         None
@@ -3042,9 +3617,21 @@ async fn create_vm(
             .llm_config
             .clone()
             .ok_or_else(|| "大模型部署模式缺少模型配置参数".to_string())?;
+        validate_llm_hardware_compatibility(&req.accelerator, &cfg.engine)?;
         let eng = normalize_llm_engine(&cfg.engine);
         if eng != "builtin" && cfg.model_name.trim().is_empty() {
             return Err("请填写要部署的大语言模型名称（如 Qwen/Qwen2.5-7B-Instruct）".into());
+        }
+        if let Some(ref ck) = cfg.custom_api_key {
+            let trimmed = ck.trim();
+            if !trimmed.is_empty() {
+                if trimmed.len() < 8 {
+                    return Err("自定义 API Key 长度至少需要 8 个字符".into());
+                }
+                if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                    return Err("自定义 API Key 不能包含空格或控制字符".into());
+                }
+            }
         }
         if cfg
             .gdrive_model_path
@@ -3087,15 +3674,49 @@ async fn create_vm(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
+    let relay_active = app
+        .relays
+        .l()
+        .get(&name)
+        .map(|h| h.is_running() || h.task_alive.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false);
     if cli::read_sessions().contains_key(&name)
         || app.busy.l().contains_key(&name)
         || app.creating_vms.l().contains_key(&name)
+        || relay_active
     {
         return Err(format!("名称 [{name}] 已被占用"));
     }
     if !cli::colab_bin().exists() {
         return Err("未找到 colab-cli，可执行文件应位于 ~/.local/bin/colab".into());
     }
+
+    Ok(PreparedCreateVm {
+        name,
+        boot_mode,
+        auth_mode,
+        effective_high_mem,
+        effective_ws_dir,
+        ws_display_name,
+        desc_clean,
+        validated_relay_cfg,
+        validated_llm_cfg,
+    })
+}
+
+#[tauri::command]
+async fn create_vm(
+    handle: AppHandle,
+    state: AppStateRef<'_>,
+    req: CreateVmRequest,
+) -> Result<String, String> {
+    let app = state.inner().clone();
+    let prep = validate_and_prepare_create_vm(&app, &req)?;
+    let name = prep.name.clone();
+    let effective_high_mem = prep.effective_high_mem;
+    let effective_ws_dir = prep.effective_ws_dir.clone();
+    let ws_display_name = prep.ws_display_name.clone();
+    let desc_clean = prep.desc_clean.clone();
 
     if !app.try_claim_busy(&name, "creating") {
         return Err(format!("名称 [{name}] 已被占用"));
@@ -3124,7 +3745,7 @@ async fn create_vm(
         &name,
         &req.accelerator,
         effective_high_mem,
-        req.auth_mode.as_deref(),
+        prep.auth_mode.as_deref(),
         None,
         None,
         &|_l: &str| {},
@@ -3140,6 +3761,34 @@ async fn create_vm(
         app.set_busy(&name, None);
         spawn_refresh(&app, &handle);
         return Err(format!("{e:#}"));
+    }
+
+    // 持久化会话工作模式、认证方式与硬件/模式参数（#74 + #43），确保后续命令自动携带 --auth adc 且历史开机准确恢复
+    let norm_acc = {
+        let u = req.accelerator.trim().to_ascii_uppercase();
+        if u.is_empty() || u == "NONE" {
+            "CPU".to_string()
+        } else {
+            u
+        }
+    };
+    let session_profile = cli::SessionProfile {
+        boot_mode: prep.boot_mode.clone(),
+        accelerator: norm_acc,
+        high_mem: effective_high_mem,
+        workspace_path: Some(effective_ws_dir.to_string_lossy().to_string()),
+        auth_mode: prep.auth_mode.clone(),
+        llm_config: prep.validated_llm_cfg.clone(),
+        relay_config: prep.validated_relay_cfg.clone(),
+        updated_at: None,
+    };
+    let _ = cli::save_session_profile(&name, &session_profile);
+
+    if prep.validated_relay_cfg.is_none() {
+        let mut map = app.relays.l();
+        if map.get(&name).map(|h| !h.is_running()).unwrap_or(false) {
+            map.remove(&name);
+        }
     }
 
     app.set_busy(&name, Some("probing"));
@@ -3159,10 +3808,16 @@ async fn create_vm(
     }
     app.set_busy(&name, None);
 
-    if let Some(cfg) = validated_relay_cfg {
-        start_relay_inner(&app, &name, cfg);
-    } else if let Some(llm_cfg) = validated_llm_cfg {
-        spawn_llm_deployment_task(
+    if let Some(cfg) = prep.validated_relay_cfg {
+        start_relay_inner(
+            &app,
+            &name,
+            cfg,
+            effective_ws_dir,
+            prep.auth_mode.clone(),
+        );
+    } else if let Some(llm_cfg) = prep.validated_llm_cfg {
+        if let Err(e) = spawn_llm_deployment_task(
             app.clone(),
             handle.clone(),
             name.clone(),
@@ -3170,7 +3825,9 @@ async fn create_vm(
             effective_high_mem,
             effective_ws_dir,
             llm_cfg,
-        );
+        ) {
+            app.set_deploy_error(&name, Some(e));
+        }
     }
 
     spawn_refresh(&app, &handle);
@@ -3194,6 +3851,7 @@ async fn delete_vm(
     app.release_busy(&name, "deleting");
     if r.verified_unassigned {
         app.relays.l().remove(&name);
+        app.pending_close_vms.l().remove(&name);
     }
     spawn_refresh(&app, &handle);
     Ok(r)
@@ -3222,7 +3880,66 @@ async fn deploy_probe(
     res.map_err(|e| format!("{e:#}"))
 }
 
-fn start_relay_inner(app: &Arc<AppState>, name: &str, cfg: RelayConfig) -> RelayStatus {
+/// 按约定优先级解析命令对应的工作区路径（#42）：
+/// 1. 显式传入的非空 `workspace_path`
+/// 2. 指定 `vm_name` 已绑定的工作区路径（`overview.vms` -> `relays.workspace_dir` -> `creating_vms` -> 会话元数据 `workspaces.json` / `pilot_session_profiles.json` / `sessions.json`）
+/// 3. 默认 `app.workspace`
+pub(crate) async fn resolve_workspace_dir_for_command(
+    app: &AppState,
+    workspace_path: Option<&str>,
+    vm_name: Option<&str>,
+) -> PathBuf {
+    if let Some(explicit) = workspace_path.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(explicit);
+    }
+    if let Some(vm) = vm_name.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(p) = app
+            .overview
+            .read()
+            .await
+            .vms
+            .iter()
+            .find(|v| v.name == vm)
+            .and_then(|v| v.workspace.path.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+        {
+            return p;
+        }
+        if let Some(p) = app
+            .relays
+            .l()
+            .get(vm)
+            .and_then(|h| h.workspace_dir.l().clone())
+        {
+            return p;
+        }
+        if let Some(p) = app
+            .creating_vms
+            .l()
+            .get(vm)
+            .and_then(|m| m.workspace_path.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+        {
+            return p;
+        }
+        if let Some(p) = cli::lookup_bound_workspace_path(vm) {
+            return p;
+        }
+    }
+    app.workspace.clone()
+}
+
+fn start_relay_inner(
+    app: &Arc<AppState>,
+    name: &str,
+    cfg: RelayConfig,
+    ws_dir: PathBuf,
+    auth_mode: Option<String>,
+) -> RelayStatus {
     let h = {
         let mut map = app.relays.l();
         map.entry(name.to_string())
@@ -3237,6 +3954,8 @@ fn start_relay_inner(app: &Arc<AppState>, name: &str, cfg: RelayConfig) -> Relay
         h.log("上一轮接力任务仍在退出中，请稍候");
         return h.snapshot();
     }
+    *h.workspace_dir.l() = Some(ws_dir);
+    *h.auth_mode.l() = auth_mode;
     h.keep_vm_on_stop
         .store(false, std::sync::atomic::Ordering::SeqCst);
     h.stopped_during_provisioning
@@ -3254,6 +3973,11 @@ fn start_relay_inner(app: &Arc<AppState>, name: &str, cfg: RelayConfig) -> Relay
         st.started_at = Some(chrono::Utc::now().timestamp());
         st.phase = "starting".into();
         st.phase_label = "正在初始化接力监工…".into();
+        st.training_completed = false;
+        st.weights_downloaded = false;
+        st.download_error = None;
+        st.local_weights_path = None;
+        st.last_error = None;
     }
     h.log("▶ 接力训练已开启");
     tauri::async_runtime::spawn(relay::run_relay(app.clone(), h.clone()));
@@ -3266,6 +3990,7 @@ async fn start_relay(
     state: AppStateRef<'_>,
     name: String,
     mut config: RelayConfig,
+    workspace_path: Option<String>,
 ) -> Result<RelayStatus, String> {
     let app = state.inner().clone();
     if !valid_name(&name) {
@@ -3274,14 +3999,205 @@ async fn start_relay(
     if app.is_deleting(&name) {
         return Err("该实例正在销毁中，请稍候".into());
     }
-    config.high_mem = config.high_mem && relay::supports_high_mem(&config.gpu_type);
-    relay::validate_relay_config(&config).map_err(|e| e.to_string())?;
+    if let Some(existing) = app.relay(&name) {
+        if !existing.is_running() && existing.task_alive.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("上一轮接力任务仍在退出清理中，请稍候再试".into());
+        }
+    }
+
+    let ws_dir = resolve_workspace_dir_for_command(&app, workspace_path.as_deref(), Some(&name)).await;
+    let ws_meta = std::fs::metadata(&ws_dir)
+        .map_err(|e| format!("无法访问接力工作区目录 `{}`：{e}", ws_dir.display()))?;
+    if !ws_meta.is_dir() {
+        return Err(format!("接力工作区路径不是有效文件夹：`{}`", ws_dir.display()));
+    }
+
+    prepare_relay_config_for_vm(&app, &name, &mut config, None, None)?;
     if !cli::rclone_conf_path().exists() {
         return Err("未检测到 rclone.conf，请先完成 Google Drive 授权".into());
     }
-    let st = start_relay_inner(&app, &name, config);
+
+    if workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        let ws_name = ws_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("default")
+            .to_string();
+        cli::register_workspace_entry(
+            &name,
+            &ws_name,
+            Some(&ws_dir.to_string_lossy()),
+            None,
+        );
+    }
+
+    let auth_mode = cli::get_session_auth_mode(&name);
+    let st = start_relay_inner(&app, &name, config, ws_dir, auth_mode);
     spawn_refresh(&app, &handle);
     Ok(st)
+}
+
+pub(crate) async fn stop_relay_inner<F>(
+    app: &Arc<AppState>,
+    name: &str,
+    destroy_vm: bool,
+    on_progress: F,
+) -> Result<StopRelayResult, String>
+where
+    F: Fn(),
+{
+    if app.is_deleting(name) {
+        return Err("该虚拟机正在销毁中".into());
+    }
+    let busy_tag = if destroy_vm { "deleting" } else { "stopping" };
+    app.set_busy(name, Some(busy_tag));
+    on_progress();
+
+    let relay_handle = app.relay(name);
+    if let Some(ref h) = relay_handle {
+        h.keep_vm_on_stop
+            .store(!destroy_vm, std::sync::atomic::Ordering::SeqCst);
+        h.stop().await;
+        {
+            let mut st = h.status.l();
+            st.running = false;
+            st.phase = "stopped".into();
+            st.phase_label = if destroy_vm {
+                "本机接力监工已停止，正在销毁云端实例…".into()
+            } else {
+                "本机接力监工已停止，正在中断云端 Kernel…".into()
+            };
+        }
+        h.log("⏹ 已关闭本机接力监工");
+    }
+
+    let result = if destroy_vm {
+        if let Some(ref h) = relay_handle {
+            h.log("🧹 正在销毁实例并核验停止计费…");
+        }
+        let r = hard_terminate(app, name, None, false).await;
+        let verified = r.verified_unassigned;
+        if verified {
+            app.pending_close_vms.l().remove(name);
+        }
+        if let Some(ref h) = relay_handle {
+            let mut st = h.status.l();
+            if verified {
+                st.phase = "stopped".into();
+                st.phase_label = "已关闭接力并销毁云端实例（停费核验通过）".into();
+            } else {
+                let err_msg = r.error.clone().unwrap_or_else(|| {
+                    "云端实例停费核验未通过，可能仍在计费".to_string()
+                });
+                st.phase = "stopped".into();
+                st.phase_label = format!("本机接力已停止，但停费核验未通过：{err_msg}");
+                st.last_error = Some(err_msg);
+            }
+            drop(st);
+            h.log(if verified {
+                "✅ 实例已彻底销毁，计费已停止"
+            } else {
+                "⚠️ 本机接力已停止，但云端实例销毁未通过核验，请重试删除"
+            });
+        }
+        let interrupt_err = if verified {
+            None
+        } else {
+            Some(r.error.clone().unwrap_or_else(|| {
+                "云端实例停费核验未通过，原实例及训练进程可能仍在运行并计费".to_string()
+            }))
+        };
+        StopRelayResult {
+            supervisor_stopped: true,
+            destroy_vm: true,
+            kernel_interrupted: verified,
+            kernel_interrupt_error: interrupt_err,
+            terminate_receipt: Some(r),
+        }
+    } else {
+        let (interrupted, interrupt_err) = if name.starts_with("orphan-")
+            || !cli::read_sessions().contains_key(name)
+        {
+            (
+                false,
+                Some(format!(
+                    "未在本地会话表中找到受管会话 [{name}]，无法执行 `colab restart-kernel`，云端原训练进程可能仍在实例中继续运行"
+                )),
+            )
+        } else if !cli::colab_bin().exists() {
+            (
+                false,
+                Some(
+                    "未找到本机 colab CLI 可执行文件，无法重启云端 Kernel，云端原训练进程可能仍在实例中继续运行"
+                        .to_string(),
+                ),
+            )
+        } else {
+            let args = cli::colab_args_for_session(name, &s(&["restart-kernel", "-s", name]));
+            match cli::run_simple(&cli::colab_bin(), &args, Duration::from_secs(90)).await {
+                Ok(o) if !o.timed_out && o.code == 0 => (true, None),
+                Ok(o) if o.timed_out => (
+                    false,
+                    Some(
+                        "执行 `colab restart-kernel` 超时（90s），未能确认中断云端 Kernel，云端原训练进程可能仍在实例中继续运行"
+                            .to_string(),
+                    ),
+                ),
+                Ok(o) => {
+                    let cleaned = cli::strip_colab_cli_banners(&o.output);
+                    let detail = cli::last_meaningful_cli_line(&cleaned, "CLI 返回非零退出码");
+                    (
+                        false,
+                        Some(format!(
+                            "执行 `colab restart-kernel` 失败（exit={}：{detail}），云端原训练进程可能仍在实例中继续运行",
+                            o.code
+                        )),
+                    )
+                }
+                Err(e) => (
+                    false,
+                    Some(format!(
+                        "调用 `colab restart-kernel` 异常（{e:#}），云端原训练进程可能仍在实例中继续运行"
+                    )),
+                ),
+            }
+        };
+
+        if let Some(ref h) = relay_handle {
+            let mut st = h.status.l();
+            st.phase = "stopped".into();
+            if interrupted {
+                st.phase_label = "接力已停止，云端 Kernel 已重启中断（实例保留计费中）".into();
+            } else if let Some(ref err_msg) = interrupt_err {
+                st.phase_label = format!("本机接力已停止，但云端 Kernel 未确认中断：{err_msg}");
+                st.last_error = Some(err_msg.clone());
+            }
+            drop(st);
+            if interrupted {
+                h.log("🔁 已重启远程 Kernel，云端训练进程已中断（实例保留，仍在计费）");
+            } else if let Some(ref err_msg) = interrupt_err {
+                h.log(format!("⚠️ {err_msg}"));
+            }
+        }
+
+        StopRelayResult {
+            supervisor_stopped: true,
+            destroy_vm: false,
+            kernel_interrupted: interrupted,
+            kernel_interrupt_error: interrupt_err,
+            terminate_receipt: None,
+        }
+    };
+
+    app.release_busy(name, busy_tag);
+    on_progress();
+    Ok(result)
 }
 
 #[tauri::command]
@@ -3290,99 +4206,141 @@ async fn stop_relay(
     state: AppStateRef<'_>,
     name: String,
     destroy_vm: bool,
-) -> Result<Option<TerminateReceipt>, String> {
+) -> Result<StopRelayResult, String> {
     let app = state.inner().clone();
-    if app.is_deleting(&name) {
-        return Err("该虚拟机正在销毁中".into());
-    }
-    let busy_tag = if destroy_vm { "deleting" } else { "stopping" };
-    app.set_busy(&name, Some(busy_tag));
-    spawn_refresh(&app, &handle);
-
-    let mut receipt = None;
-    let relay_handle = app.relay(&name);
-    if let Some(ref h) = relay_handle {
-        h.keep_vm_on_stop
-            .store(!destroy_vm, std::sync::atomic::Ordering::SeqCst);
-        h.stop().await;
-        h.log("⏹ 已关闭接力训练");
-    }
-
-    if destroy_vm {
-        if let Some(ref h) = relay_handle {
-            h.log("🧹 正在销毁实例并核验停止计费…");
-        }
-        let r = hard_terminate(&app, &name, None, false).await;
-        if let Some(ref h) = relay_handle {
-            h.log(if r.verified_unassigned {
-                "✅ 实例已彻底销毁，计费已停止"
-            } else {
-                "⚠️ 销毁未通过核验，请重试删除"
-            });
-        }
-        if r.verified_unassigned {
-            app.relays.l().remove(&name);
-        }
-        receipt = Some(r);
-    } else if relay_handle.is_some()
-        && !name.starts_with("orphan-")
-        && cli::read_sessions().contains_key(&name)
-    {
-        let _ = cli::run_simple(
-            &cli::colab_bin(),
-            &s(&["restart-kernel", "-s", &name]),
-            Duration::from_secs(90),
-        )
-        .await;
-        if let Some(ref h) = relay_handle {
-            h.log("🔁 已重启远程 Kernel，云端训练进程已中断（实例保留，仍在计费）");
-        }
-    }
-
-    app.release_busy(&name, busy_tag);
-    spawn_refresh(&app, &handle);
-    Ok(receipt)
+    let app_cb = app.clone();
+    let handle_cb = handle.clone();
+    stop_relay_inner(&app, &name, destroy_vm, move || {
+        spawn_refresh(&app_cb, &handle_cb);
+    })
+    .await
 }
 
-#[derive(Serialize)]
-struct WorkspaceFiles {
-    workspace: String,
-    train_py: String,
-    requirements_txt: String,
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkspaceFiles {
+    pub workspace: String,
+    pub train_py: String,
+    pub requirements_txt: String,
 }
 
-#[tauri::command]
-fn read_workspace_files(state: AppStateRef<'_>) -> WorkspaceFiles {
-    let ws = &state.workspace;
-    WorkspaceFiles {
+fn read_optional_utf8_workspace_file(ws: &Path, fname: &str) -> Result<String, String> {
+    let path = ws.join(fname);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_sym_meta) => {
+            let real_meta = std::fs::metadata(&path)
+                .map_err(|e| format!("无法读取工作区文件 `{fname}`（{}）：{e}", path.display()))?;
+            if !real_meta.is_file() {
+                return Err(format!(
+                    "无法读取工作区文件 `{fname}`（{}）：目标路径不是普通文件",
+                    path.display()
+                ));
+            }
+            let bytes = std::fs::read(&path)
+                .map_err(|e| format!("读取工作区文件 `{fname}`（{}）失败：{e}", path.display()))?;
+            String::from_utf8(bytes).map_err(|e| {
+                format!(
+                    "工作区文件 `{fname}`（{}）不是有效的 UTF-8 文本编码：{e}",
+                    path.display()
+                )
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!(
+            "无法检查工作区文件 `{fname}`（{}）：{e}",
+            path.display()
+        )),
+    }
+}
+
+pub(crate) async fn read_workspace_files_inner(
+    app: &AppState,
+    workspace_path: Option<&str>,
+    vm_name: Option<&str>,
+) -> Result<WorkspaceFiles, String> {
+    let ws = resolve_workspace_dir_for_command(app, workspace_path, vm_name).await;
+    let ws_meta = std::fs::metadata(&ws)
+        .map_err(|e| format!("无法访问工作区目录 `{}`：{e}", ws.display()))?;
+    if !ws_meta.is_dir() {
+        return Err(format!("工作区路径不是有效文件夹：`{}`", ws.display()));
+    }
+    std::fs::read_dir(&ws).map_err(|e| format!("无法读取工作区目录 `{}`：{e}", ws.display()))?;
+
+    let train_py = read_optional_utf8_workspace_file(&ws, "train.py")?;
+    let requirements_txt = read_optional_utf8_workspace_file(&ws, "requirements.txt")?;
+
+    Ok(WorkspaceFiles {
         workspace: ws.display().to_string(),
-        train_py: std::fs::read_to_string(ws.join("train.py")).unwrap_or_default(),
-        requirements_txt: std::fs::read_to_string(ws.join("requirements.txt")).unwrap_or_default(),
-    }
+        train_py,
+        requirements_txt,
+    })
 }
 
 #[tauri::command]
-fn save_workspace_files(
+async fn read_workspace_files(
     state: AppStateRef<'_>,
+    workspace_path: Option<String>,
+    vm_name: Option<String>,
+) -> Result<WorkspaceFiles, String> {
+    read_workspace_files_inner(
+        state.inner(),
+        workspace_path.as_deref(),
+        vm_name.as_deref(),
+    )
+    .await
+}
+
+pub(crate) async fn save_workspace_files_inner(
+    app: &AppState,
     train_py: String,
     requirements_txt: String,
+    workspace_path: Option<&str>,
+    vm_name: Option<&str>,
 ) -> Result<(), String> {
     const MAX_BYTES: usize = 1024 * 1024;
     if train_py.len() > MAX_BYTES || requirements_txt.len() > MAX_BYTES {
         return Err("脚本文本大小超出 1 MiB 限制".into());
     }
-    let ws = &state.workspace;
+    let ws = resolve_workspace_dir_for_command(app, workspace_path, vm_name).await;
+    let ws_meta = std::fs::metadata(&ws)
+        .map_err(|e| format!("无法访问工作区目录 `{}`：{e}", ws.display()))?;
+    if !ws_meta.is_dir() {
+        return Err(format!("工作区路径不是有效文件夹：`{}`", ws.display()));
+    }
+
     for fname in ["train.py", "requirements.txt"] {
         let target = ws.join(fname);
         if let Ok(meta) = std::fs::symlink_metadata(&target) {
             if meta.file_type().is_symlink() {
                 return Err(format!("拒绝写入符号链接文件: {fname}"));
             }
+            if meta.is_dir() {
+                return Err(format!("无法写入 `{fname}`：目标路径是一个文件夹"));
+            }
         }
     }
-    std::fs::write(ws.join("train.py"), train_py).map_err(|e| e.to_string())?;
-    std::fs::write(ws.join("requirements.txt"), requirements_txt).map_err(|e| e.to_string())?;
+    std::fs::write(ws.join("train.py"), train_py)
+        .map_err(|e| format!("写入 `train.py` 失败：{e}"))?;
+    std::fs::write(ws.join("requirements.txt"), requirements_txt)
+        .map_err(|e| format!("写入 `requirements.txt` 失败：{e}"))?;
     Ok(())
+}
+
+#[tauri::command]
+async fn save_workspace_files(
+    state: AppStateRef<'_>,
+    train_py: String,
+    requirements_txt: String,
+    workspace_path: Option<String>,
+    vm_name: Option<String>,
+) -> Result<(), String> {
+    save_workspace_files_inner(
+        state.inner(),
+        train_py,
+        requirements_txt,
+        workspace_path.as_deref(),
+        vm_name.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -3403,6 +4361,7 @@ async fn open_vm_ssh_terminal(state: AppStateRef<'_>, name: String) -> Result<St
     }
 
     let is_orphan = vm_name.starts_with("orphan-") || !cli::read_sessions().contains_key(&vm_name);
+    let auth_mode = cli::get_session_auth_mode(&vm_name).unwrap_or_default();
     let colab_bin = cli::colab_bin();
     let py_bin = cli::colab_python_bin();
     let ssh_key_path = tokio::task::spawn_blocking(|| {
@@ -3438,10 +4397,14 @@ if ($env:COLAB_PILOT_IS_ORPHAN -eq "1" -or -not (Test-Path -LiteralPath $env:COL
     & $env:COLAB_PILOT_PY_BIN -u $env:COLAB_PILOT_TTY_SCRIPT
 } else {
     Write-Host "[Colab Pilot] 正在通过 colab ssh 连接云端实例 ($vm) ..." -ForegroundColor Cyan
+    $authArgs = @()
+    if ($env:COLAB_PILOT_AUTH_MODE -eq "adc") {
+        $authArgs = @("--auth", "adc")
+    }
     if ($env:COLAB_PILOT_HAS_SSH_KEY -eq "1" -and (Test-Path -LiteralPath $env:COLAB_PILOT_SSH_KEY)) {
-        & $env:COLAB_PILOT_BIN ssh -i $env:COLAB_PILOT_SSH_KEY -s $vm
+        & $env:COLAB_PILOT_BIN @authArgs ssh -i $env:COLAB_PILOT_SSH_KEY -s $vm
     } else {
-        & $env:COLAB_PILOT_BIN ssh -s $vm
+        & $env:COLAB_PILOT_BIN @authArgs ssh -s $vm
     }
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
@@ -3469,6 +4432,7 @@ Remove-Item Env:COLAB_PILOT_PROXY_TOKEN -ErrorAction SilentlyContinue
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8")
         .env("COLAB_PILOT_VM_NAME", &vm_name)
+        .env("COLAB_PILOT_AUTH_MODE", &auth_mode)
         .env("COLAB_PILOT_IS_ORPHAN", if is_orphan { "1" } else { "0" })
         .env("COLAB_PILOT_BIN", &colab_bin)
         .env("COLAB_PILOT_PY_BIN", &py_bin)
@@ -3485,7 +4449,7 @@ Remove-Item Env:COLAB_PILOT_PROXY_TOKEN -ErrorAction SilentlyContinue
 
     #[cfg(not(windows))]
     {
-        let shell_cmd = r#"if [ "$COLAB_PILOT_IS_ORPHAN" = "1" ] || [ ! -x "$COLAB_PILOT_BIN" ]; then "$COLAB_PILOT_PY_BIN" -u "$COLAB_PILOT_TTY_SCRIPT"; elif [ "$COLAB_PILOT_HAS_SSH_KEY" = "1" ] && [ -f "$COLAB_PILOT_SSH_KEY" ]; then "$COLAB_PILOT_BIN" ssh -i "$COLAB_PILOT_SSH_KEY" -s "$COLAB_PILOT_VM_NAME" || "$COLAB_PILOT_PY_BIN" -u "$COLAB_PILOT_TTY_SCRIPT"; else "$COLAB_PILOT_BIN" ssh -s "$COLAB_PILOT_VM_NAME" || "$COLAB_PILOT_PY_BIN" -u "$COLAB_PILOT_TTY_SCRIPT"; fi; exec "${SHELL:-bash}""#;
+        let shell_cmd = r#"if [ "$COLAB_PILOT_IS_ORPHAN" = "1" ] || [ ! -x "$COLAB_PILOT_BIN" ]; then "$COLAB_PILOT_PY_BIN" -u "$COLAB_PILOT_TTY_SCRIPT"; elif [ "$COLAB_PILOT_AUTH_MODE" = "adc" ]; then if [ "$COLAB_PILOT_HAS_SSH_KEY" = "1" ] && [ -f "$COLAB_PILOT_SSH_KEY" ]; then "$COLAB_PILOT_BIN" --auth adc ssh -i "$COLAB_PILOT_SSH_KEY" -s "$COLAB_PILOT_VM_NAME" || "$COLAB_PILOT_PY_BIN" -u "$COLAB_PILOT_TTY_SCRIPT"; else "$COLAB_PILOT_BIN" --auth adc ssh -s "$COLAB_PILOT_VM_NAME" || "$COLAB_PILOT_PY_BIN" -u "$COLAB_PILOT_TTY_SCRIPT"; fi; elif [ "$COLAB_PILOT_HAS_SSH_KEY" = "1" ] && [ -f "$COLAB_PILOT_SSH_KEY" ]; then "$COLAB_PILOT_BIN" ssh -i "$COLAB_PILOT_SSH_KEY" -s "$COLAB_PILOT_VM_NAME" || "$COLAB_PILOT_PY_BIN" -u "$COLAB_PILOT_TTY_SCRIPT"; else "$COLAB_PILOT_BIN" ssh -s "$COLAB_PILOT_VM_NAME" || "$COLAB_PILOT_PY_BIN" -u "$COLAB_PILOT_TTY_SCRIPT"; fi; exec "${SHELL:-bash}""#;
         let mut launched = false;
         for (term, flag) in [
             ("x-terminal-emulator", "-e"),
@@ -3498,6 +4462,7 @@ Remove-Item Env:COLAB_PILOT_PROXY_TOKEN -ErrorAction SilentlyContinue
             cmd.args([flag, "sh", "-c", shell_cmd])
                 .env("PYTHONUTF8", "1")
                 .env("COLAB_PILOT_VM_NAME", &vm_name)
+                .env("COLAB_PILOT_AUTH_MODE", &auth_mode)
                 .env("COLAB_PILOT_IS_ORPHAN", if is_orphan { "1" } else { "0" })
                 .env("COLAB_PILOT_BIN", &colab_bin)
                 .env("COLAB_PILOT_PY_BIN", &py_bin)
@@ -3566,11 +4531,23 @@ async fn rotate_llm_api_key(
             cur.model_name.clone(),
         ),
         None => {
-            let slot = normalize_llm_slot(None, &target);
-            let lp = match slot.as_str() {
-                "blue" if target.ends_with("-blue") => 18081,
-                "green" if target.ends_with("-green") => 18082,
-                _ => 0,
+            let bg = parse_llm_bluegreen_state(cli::read_llm_bluegreen_state());
+            let llm_tel = existing_vm
+                .as_ref()
+                .and_then(|v| v.telemetry.as_ref())
+                .and_then(|t| t.get("llm"));
+            let matched_slot = match_bluegreen_slot_for_vm(&target, bg.as_ref(), llm_tel);
+            let slot = matched_slot
+                .map(str::to_string)
+                .unwrap_or_else(|| normalize_llm_slot(None, &target));
+            let lp = match matched_slot {
+                Some("blue") => 18081,
+                Some("green") => 18082,
+                _ => match slot.as_str() {
+                    "blue" if target.ends_with("-blue") => 18081,
+                    "green" if target.ends_with("-green") => 18082,
+                    _ => 0,
+                },
             };
             (slot, "vllm".into(), lp, 8000, "default".into())
         }
@@ -3595,7 +4572,8 @@ async fn rotate_llm_api_key(
         )
     })
     .await
-    .map_err(|e| format!("更新 API Key 失败: {e}"))?;
+    .map_err(|e| format!("更新 API Key 任务异常: {e}"))?
+    .map_err(|e| format!("持久化写入 API Key 失败: {e:#}"))?;
 
     spawn_local_gateway_async(workspace_dir).await;
     spawn_refresh(&app, &handle);
@@ -3620,6 +4598,17 @@ async fn deploy_llm_on_vm(
     if eng != "builtin" && config.model_name.trim().is_empty() {
         return Err("请填写要部署的大语言模型名称（如 Qwen/Qwen2.5-7B-Instruct）".into());
     }
+    if let Some(ref ck) = config.custom_api_key {
+        let trimmed = ck.trim();
+        if !trimmed.is_empty() {
+            if trimmed.len() < 8 {
+                return Err("自定义 API Key 长度至少需要 8 个字符".into());
+            }
+            if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Err("自定义 API Key 不能包含空格或控制字符".into());
+            }
+        }
+    }
 
     let app = state.inner().clone();
     if let Some(cur_busy) = app.busy.l().get(&vm_name).cloned() {
@@ -3636,17 +4625,14 @@ async fn deploy_llm_on_vm(
         .await
         .ok_or_else(|| format!("服务端未找到在线实例 [{vm_name}]，请确认虚拟机仍在运行"))?;
 
-    let ws_dir = app
-        .overview
-        .read()
-        .await
-        .vms
-        .iter()
-        .find(|v| v.name == vm_name)
-        .and_then(|v| v.workspace.path.as_deref())
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(|| app.workspace.clone());
+    validate_llm_hardware_compatibility(&a.hardware_label(), &config.engine)?;
+
+    let ws_dir = resolve_workspace_dir_for_command(&app, None, Some(&vm_name)).await;
+    let ws_dir = if ws_dir.is_dir() {
+        ws_dir
+    } else {
+        app.workspace.clone()
+    };
 
     let info = spawn_llm_deployment_task(
         app,
@@ -3656,7 +4642,7 @@ async fn deploy_llm_on_vm(
         a.is_high_ram(),
         ws_dir,
         config,
-    );
+    )?;
     Ok(info)
 }
 
@@ -3912,48 +4898,72 @@ pub(crate) async fn resolve_llm_target(
     let creating_names: Vec<String> = app.creating_vms.l().keys().cloned().collect();
     let now_ts = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
     let bg = filter_live_bluegreen_state(
-        cli::read_llm_bluegreen_state(),
+        parse_llm_bluegreen_state(cli::read_llm_bluegreen_state()),
         &online_names,
         &busy_snapshot,
         &creating_names,
         now_ts,
     );
 
-    let prefix = bg
-        .as_ref()
-        .and_then(|v| v.get("session_prefix"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("llm");
+    let prefix = bg.as_ref().map(bg_session_prefix).unwrap_or("llm");
     let bg_active_session = bg
         .as_ref()
-        .and_then(|v| v.get("active_session"))
-        .and_then(|x| x.as_str())
+        .and_then(|v| v.active_session.as_deref())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let bg_active_slot = bg
         .as_ref()
-        .and_then(|v| v.get("active_slot"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_lowercase());
-    let bg_model = bg
-        .as_ref()
-        .and_then(|v| v.get("model_name"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string());
+        .and_then(|v| v.active_slot.as_deref())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let bg_explicit_for_active_slot = bg.as_ref().and_then(|b| {
+        bg_active_slot
+            .as_deref()
+            .and_then(|sl| bg_explicit_slot_session(b, sl))
+    });
 
     let wanted = req.target_vm.trim();
     let vm_opt = if wanted.is_empty() || wanted.eq_ignore_ascii_case("auto") {
-        // 1. 优先严格匹配蓝绿状态记录的 active_session 或 `{prefix}-{slot}`
-        let by_bg = bg_active_session
+        // 1. 优先严格匹配蓝绿状态记录的真实会话名（slots[slot].session_name -> blue_session/green_session -> active_session），
+        //    其次匹配遥测中 slot 一致的就绪节点，最后才回退 `{prefix}-{slot}`（#48）
+        let by_bg = bg_explicit_for_active_slot
             .as_ref()
             .and_then(|sess| ov.vms.iter().find(|v| v.on_server && &v.name == sess))
             .or_else(|| {
+                bg_active_session
+                    .as_ref()
+                    .and_then(|sess| ov.vms.iter().find(|v| v.on_server && &v.name == sess))
+            })
+            .or_else(|| {
                 bg_active_slot.as_ref().and_then(|slot| {
-                    let expected = format!("{prefix}-{slot}");
-                    ov.vms.iter().find(|v| v.on_server && v.name == expected)
+                    ov.vms.iter().find(|v| {
+                        v.on_server
+                            && v.telemetry
+                                .as_ref()
+                                .map(|t| {
+                                    t["llm"]["online"].as_bool() == Some(true)
+                                        && t["llm"]["slot"]
+                                            .as_str()
+                                            .map(|s| s.eq_ignore_ascii_case(slot))
+                                            .unwrap_or(false)
+                                        && !t["llm"]["role"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .eq_ignore_ascii_case("warming")
+                                })
+                                .unwrap_or(false)
+                    })
                 })
+            })
+            .or_else(|| {
+                if bg_explicit_for_active_slot.is_none() && bg_active_session.is_none() {
+                    bg_active_slot.as_ref().and_then(|slot| {
+                        let expected = format!("{prefix}-{slot}");
+                        ov.vms.iter().find(|v| v.on_server && v.name == expected)
+                    })
+                } else {
+                    None
+                }
             });
         // 2. 匹配任意 telemetry.llm.online == true 且 role == active 的实例
         let by_active_llm = ov.vms.iter().find(|v| {
@@ -3969,16 +4979,26 @@ pub(crate) async fn resolve_llm_target(
                     })
                     .unwrap_or(false)
         });
-        // 3. 匹配任意包含 LLM 遥测、LLM 进程或已注册 LLM API 端点的在线实例（绝不劫持普通通用/训练实例！）
-        let by_any_llm = ov.vms.iter().find(|v| {
+        // 3. 匹配任意非 warming 的就绪 LLM 实例，最后回退任意含 LLM 元数据的在线实例（绝不劫持普通通用/训练实例！）
+        let is_llm_vm = |v: &&VmView| -> bool {
             v.on_server
                 && (v.llm_api.is_some()
                     || v.telemetry
                         .as_ref()
                         .map(|t| t["llm"].is_object() || t["threads"]["llm_process"].is_object())
                         .unwrap_or(false))
+        };
+        let by_ready_llm = ov.vms.iter().find(|v| {
+            is_llm_vm(v)
+                && !v
+                    .telemetry
+                    .as_ref()
+                    .and_then(|t| t["llm"]["role"].as_str())
+                    .map(|r| r.eq_ignore_ascii_case("warming"))
+                    .unwrap_or(false)
         });
-        by_bg.or(by_active_llm).or(by_any_llm)
+        let by_any_llm = ov.vms.iter().find(is_llm_vm);
+        by_bg.or(by_active_llm).or(by_ready_llm).or(by_any_llm)
     } else {
         ov.vms.iter().find(|v| v.on_server && v.name == wanted)
     };
@@ -3998,8 +5018,14 @@ pub(crate) async fn resolve_llm_target(
     };
 
     let llm_tel = vm.telemetry.as_ref().and_then(|t| t.get("llm"));
+    let matched_bg_slot = match_bluegreen_slot_for_vm(&vm.name, bg.as_ref(), llm_tel);
     let key_meta = cli::lookup_vm_api_key_meta(&vm.name);
-    let local_tunnel_port = bluegreen_tunnel_port_for_vm(&vm.name, bg.as_ref())
+    let local_tunnel_port = matched_bg_slot
+        .and_then(|sl| match sl {
+            "blue" => Some(18081),
+            "green" => Some(18082),
+            _ => None,
+        })
         .or_else(|| vm.llm_api.as_ref().map(|x| x.local_port).filter(|&p| p > 0))
         .or_else(|| key_meta.as_ref().and_then(|(_, p)| *p));
     let api_key = vm
@@ -4009,16 +5035,38 @@ pub(crate) async fn resolve_llm_target(
         .filter(|s| !s.is_empty())
         .or_else(|| key_meta.map(|(k, _)| k));
 
-    let slot = llm_tel
-        .and_then(|l| l.get("slot"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_lowercase())
+    let slot = matched_bg_slot
+        .map(str::to_string)
+        .or_else(|| {
+            llm_tel
+                .and_then(|l| l.get("slot"))
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_lowercase())
+        })
         .or_else(|| vm.llm_api.as_ref().map(|x| x.slot.clone()))
         .or_else(|| match local_tunnel_port {
             Some(18081) => Some("blue".into()),
             Some(18082) => Some("green".into()),
             _ => None,
         });
+
+    let bg_slot_model = matched_bg_slot.and_then(|sl| {
+        bg.as_ref()
+            .and_then(|b| b.slots.as_ref())
+            .and_then(|sv| sv.get(sl))
+            .and_then(|e| e.get("model_name"))
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
+    let bg_model = bg_slot_model.or_else(|| {
+        bg.as_ref()
+            .and_then(|v| v.model_name.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
 
     let model = req
         .model
@@ -4656,7 +5704,7 @@ async fn stream_llm_chat(
     // 对话正常完成后立即拉取一次该实例的最新遥测快照（同步云端边车实测 tok/s、TTFT 与曲线）并广播给仪表盘
     if !chat_cancel.is_cancelled() {
         if let Ok(ref mut ok_resp) = res {
-            let bg = cli::read_llm_bluegreen_state();
+            let bg = parse_llm_bluegreen_state(cli::read_llm_bluegreen_state());
             let entry =
                 fetch_telemetry(&app, &a, Some(&target.vm_name), bg.as_ref()).await;
             if let Some(ref tel_val) = entry.data {
@@ -5418,6 +6466,163 @@ fn shutdown_child_processes(app: &AppState) {
     }
 }
 
+pub(crate) fn active_relay_vm_names(app: &AppState) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = app
+        .relays
+        .l()
+        .iter()
+        .filter(|(_, h)| h.is_running())
+        .map(|(k, _)| k.clone())
+        .collect();
+    for pending in app.pending_close_vms.l().iter() {
+        set.insert(pending.clone());
+    }
+    set.into_iter().collect()
+}
+
+pub(crate) fn should_intercept_window_close(app: &AppState) -> Option<Vec<String>> {
+    if app
+        .force_close_confirmed
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return None;
+    }
+    let active = active_relay_vm_names(app);
+    if active.is_empty() {
+        None
+    } else {
+        Some(active)
+    }
+}
+
+pub(crate) async fn confirm_app_close_inner(
+    app: &Arc<AppState>,
+    mode: &str,
+) -> Result<(Vec<TerminateReceipt>, bool), String> {
+    let m = mode.trim().to_ascii_lowercase();
+    if m == "keep_vms" || m == "force_exit" {
+        let handles: Vec<Arc<RelayHandle>> = app.relays.l().values().cloned().collect();
+        for h in handles {
+            if h.is_running() || h.task_alive.load(std::sync::atomic::Ordering::SeqCst) {
+                h.keep_vm_on_stop
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                h.stop().await;
+                {
+                    let mut st = h.status.l();
+                    st.running = false;
+                    st.phase = "stopped".into();
+                    st.phase_label = "软件退出：已停止本机接力监工（云端实例保留运行中）".into();
+                }
+                h.log("⏹ 软件退出：已停止本机接力监工，保留云端实例继续运行");
+            }
+        }
+        app.pending_close_vms.l().clear();
+        app.force_close_confirmed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok((Vec::new(), true))
+    } else if m == "shutdown_vms" {
+        let targets = active_relay_vm_names(app);
+        if targets.is_empty() {
+            app.pending_close_vms.l().clear();
+            app.force_close_confirmed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Ok((Vec::new(), true));
+        }
+        let mut receipts = Vec::with_capacity(targets.len());
+        for vm_name in targets {
+            app.set_busy(&vm_name, Some("deleting"));
+            if let Some(h) = app.relay(&vm_name) {
+                h.keep_vm_on_stop
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                h.stop().await;
+                h.log("🧹 退出前正在销毁云端实例并核验停止计费…");
+            }
+            let r = hard_terminate(app, &vm_name, None, false).await;
+            app.release_busy(&vm_name, "deleting");
+            if r.verified_unassigned {
+                app.relays.l().remove(&vm_name);
+            }
+            receipts.push(r);
+        }
+
+        let unverified: Vec<String> = receipts
+            .iter()
+            .filter(|r| !r.verified_unassigned)
+            .map(|r| r.name.clone())
+            .collect();
+        {
+            let mut pending = app.pending_close_vms.l();
+            pending.clear();
+            for n in &unverified {
+                pending.insert(n.clone());
+            }
+        }
+        if unverified.is_empty() {
+            app.force_close_confirmed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok((receipts, true))
+        } else {
+            Ok((receipts, false))
+        }
+    } else {
+        Err(format!(
+            "不支持的窗口关闭确认模式 `{mode}`（仅支持 keep_vms 或 shutdown_vms）"
+        ))
+    }
+}
+
+#[tauri::command]
+async fn confirm_app_close(
+    handle: AppHandle,
+    state: AppStateRef<'_>,
+    mode: String,
+) -> Result<Vec<TerminateReceipt>, String> {
+    let app = state.inner().clone();
+    let (receipts, should_exit) = confirm_app_close_inner(&app, &mode).await?;
+    if should_exit {
+        shutdown_child_processes(&app);
+        if let Some(w) = handle.get_webview_window("main") {
+            let _ = w.close();
+        }
+        handle.exit(0);
+    } else {
+        let ov = refresh_overview(&app, true).await;
+        emit_overview(&handle, &ov);
+    }
+    Ok(receipts)
+}
+
+pub(crate) fn dismiss_relay_status_inner(app: &AppState, name: &str) -> Result<(), String> {
+    let target = name.trim();
+    if target.is_empty() {
+        return Err("实例名称不能为空".into());
+    }
+    let mut map = app.relays.l();
+    if let Some(h) = map.get(target) {
+        if h.is_running() || h.task_alive.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(format!(
+                "接力任务 [{target}] 仍在运行中，请先停止接力后再清除记录"
+            ));
+        }
+        map.remove(target);
+    }
+    app.pending_close_vms.l().remove(target);
+    Ok(())
+}
+
+#[tauri::command]
+async fn dismiss_relay_status(
+    handle: AppHandle,
+    state: AppStateRef<'_>,
+    name: String,
+) -> Result<(), String> {
+    let app = state.inner().clone();
+    dismiss_relay_status_inner(&app, &name)?;
+    let ov = refresh_overview(&app, false).await;
+    emit_overview(&handle, &ov);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     install_panic_hook();
@@ -5477,7 +6682,7 @@ pub fn run() {
                     let res = tauri::async_runtime::spawn(async move {
                         let ov = refresh_overview(&st, false).await;
                         emit_overview(&h, &ov);
-                        ov.error.is_some()
+                        ov.error.is_some() || ov.is_stale
                     })
                     .await;
                     delay_ms = match res {
@@ -5510,7 +6715,9 @@ pub fn run() {
             cancel_llm_chat,
             open_vm_ssh_terminal,
             rotate_llm_api_key,
-            deploy_llm_on_vm
+            deploy_llm_on_vm,
+            confirm_app_close,
+            dismiss_relay_status
         ])
         .build(tauri::generate_context!());
     match built {
@@ -5526,12 +6733,23 @@ pub fn run() {
                                 record_window_state(&w, &tr, false);
                             }
                         }
-                        tauri::WindowEvent::CloseRequested { .. } => {
+                        tauri::WindowEvent::CloseRequested { api, .. } => {
                             if let (Some(w), Some(tr)) = (
                                 handle.get_webview_window("main"),
                                 win_tracker_slot.l().clone(),
                             ) {
                                 record_window_state(&w, &tr, true);
+                            }
+                            if let Some(st) = handle.try_state::<Arc<AppState>>() {
+                                if let Some(active_names) =
+                                    should_intercept_window_close(st.inner())
+                                {
+                                    api.prevent_close();
+                                    let _ = handle.emit(
+                                        "close-requested-with-relay",
+                                        serde_json::json!({ "active_vms": active_names }),
+                                    );
+                                }
                             }
                         }
                         // 主窗口被销毁时立即刷盘、结束所有本机派生子进程树并退出进程，绝不残留僵尸进程
@@ -5578,7 +6796,8 @@ mod tests {
 
     #[test]
     fn test_bluegreen_tunnel_port_for_vm_strict_prefix_isolation() {
-        let bg = serde_json::json!({ "session_prefix": "qwen" });
+        let bg = parse_llm_bluegreen_state(Some(serde_json::json!({ "session_prefix": "qwen" })))
+            .unwrap();
         assert_eq!(bluegreen_tunnel_port_for_vm("qwen-blue", Some(&bg)), Some(18081));
         assert_eq!(bluegreen_tunnel_port_for_vm("qwen-green", Some(&bg)), Some(18082));
         assert_eq!(bluegreen_tunnel_port_for_vm("llm-blue", Some(&bg)), None);
@@ -5672,6 +6891,7 @@ print("SYNTAX_AND_WS_OK")
         std::fs::create_dir_all(&ws_dir).unwrap();
         *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
         *cli::TEST_COLAB_BIN.l() = Some(tmp.join("nonexistent_colab"));
+        *cli::TEST_RCLONE_CONF.l() = Some(tmp.join("nonexistent_rclone.conf"));
 
         // 写入一份数天前残留的陈旧 serving 状态（对应 llm-blue 早已下线）
         std::fs::write(
@@ -5703,7 +6923,7 @@ print("SYNTAX_AND_WS_OK")
 
         // 1. 陈旧蓝绿状态必须被过滤为 None
         let filtered = filter_live_bluegreen_state(
-            cli::read_llm_bluegreen_state(),
+            parse_llm_bluegreen_state(cli::read_llm_bluegreen_state()),
             &["general-dev".to_string()],
             &HashMap::new(),
             &[],
@@ -5768,6 +6988,7 @@ print("SYNTAX_AND_WS_OK")
 
         *cli::TEST_CONFIG_DIR.l() = None;
         *cli::TEST_COLAB_BIN.l() = None;
+        *cli::TEST_RCLONE_CONF.l() = None;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -6028,6 +7249,1029 @@ print("SYNTAX_AND_WS_OK")
 
         shutdown_child_processes(&app);
         *cli::TEST_CONFIG_DIR.l() = None;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_39_hard_terminate_handover_stale_endpoint_hint_verifies_current_endpoint() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_issue39_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(tmp.join("nonexistent_colab_bin"));
+
+        // Session `relay-job` handed over from `m-s-oldA` to `m-s-newB`, while UI passes stale hint `m-s-oldA`
+        std::fs::write(
+            cfg_dir.join("sessions.json"),
+            serde_json::json!({
+                "relay-job": { "endpoint": "m-s-newB" },
+                "other-vm": { "endpoint": "m-s-other9" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let allow_unassign_b = Arc::new(AtomicBool::new(false));
+        let b_alive = Arc::new(AtomicBool::new(true));
+        let unassign_b_attempts = Arc::new(AtomicUsize::new(0));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let allow_srv = allow_unassign_b.clone();
+        let b_alive_srv = b_alive.clone();
+        let attempts_srv = unassign_b_attempts.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let allow = allow_srv.clone();
+                let alive = b_alive_srv.clone();
+                let att = attempts_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first = req.lines().next().unwrap_or("");
+                    let (status, body) = if first.starts_with("GET /tun/m/assignments") {
+                        let mut items = vec![serde_json::json!({
+                            "endpoint": "m-s-other9",
+                            "accelerator": "T4",
+                            "runtimeProxyInfo": { "token": "ptok", "url": "http://127.0.0.1" }
+                        })];
+                        if alive.load(Ordering::SeqCst) {
+                            items.push(serde_json::json!({
+                                "endpoint": "m-s-newB",
+                                "accelerator": "L4",
+                                "runtimeProxyInfo": { "token": "ptok", "url": "http://127.0.0.1" }
+                            }));
+                        }
+                        (
+                            "200 OK",
+                            format!(")]}}'\n{}", serde_json::json!({ "assignments": items })),
+                        )
+                    } else if first.starts_with("GET /tun/m/unassign/") {
+                        ("200 OK", r#"{"token":"xsrf-tok"}"#.to_string())
+                    } else if first.starts_with("POST /tun/m/unassign/m-s-newB") {
+                        att.fetch_add(1, Ordering::SeqCst);
+                        if allow.load(Ordering::SeqCst) {
+                            alive.store(false, Ordering::SeqCst);
+                            ("200 OK", "{}".to_string())
+                        } else {
+                            ("500 Internal Server Error", r#"{"error":"busy"}"#.to_string())
+                        }
+                    } else {
+                        ("200 OK", "{}".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tok_file = tmp.join("token.json");
+        std::fs::write(
+            &tok_file,
+            r#"{"token":"valid-token","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_file);
+        let app = AppState::new_with(client, ws_dir);
+
+        // 1. Stale endpoint `m-s-oldA` is already absent from server, while current `m-s-newB` refuses unassign:
+        //    hard_terminate MUST try unassigning `m-s-newB` AND return verified_unassigned == false!
+        let r_fail = hard_terminate(&app, "relay-job", Some("m-s-oldA".into()), false).await;
+        assert!(
+            unassign_b_attempts.load(Ordering::SeqCst) >= 1,
+            "must attempt to unassign current bound endpoint m-s-newB"
+        );
+        assert!(
+            !r_fail.verified_unassigned,
+            "must NOT falsely claim verified_unassigned while current endpoint m-s-newB is still active"
+        );
+        assert!(r_fail.remaining_endpoints.contains(&"m-s-newB".to_string()));
+
+        // 2. Once server accepts unassign on `m-s-newB`, retry with stale `m-s-oldA` hint unassigns `m-s-newB` cleanly
+        std::fs::write(
+            cfg_dir.join("sessions.json"),
+            serde_json::json!({
+                "relay-job": { "endpoint": "m-s-newB" },
+                "other-vm": { "endpoint": "m-s-other9" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        allow_unassign_b.store(true, Ordering::SeqCst);
+        let r_ok = hard_terminate(&app, "relay-job", Some("m-s-oldA".into()), false).await;
+        assert!(r_ok.verified_unassigned);
+        assert!(!b_alive.load(Ordering::SeqCst));
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_40_and_41_stop_relay_result_destroy_and_keep_vm_kernel_interrupt() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let py = cli::colab_python_bin();
+        if !py.exists() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("pilot_stop_relay_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let args_log = tmp.join("colab_args.txt");
+        let mock_colab_py = tmp.join("mock_colab.py");
+        std::fs::write(
+            &mock_colab_py,
+            r#"import json, os, sys
+from pathlib import Path
+Path(os.environ["MOCK_COLAB_LOG"]).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+rc = int(os.environ.get("MOCK_COLAB_RC", "0"))
+if rc != 0:
+    sys.stderr.write("Error: kernel restart rejected by runtime\n")
+sys.exit(rc)
+"#,
+        )
+        .unwrap();
+
+        #[cfg(windows)]
+        let mock_colab = {
+            let p = tmp.join("mock_colab.cmd");
+            std::fs::write(
+                &p,
+                format!("@echo off\r\n\"{}\" \"{}\" %*\r\n", py.display(), mock_colab_py.display()),
+            )
+            .unwrap();
+            p
+        };
+        #[cfg(not(windows))]
+        let mock_colab = {
+            use std::os::unix::fs::PermissionsExt;
+            let p = tmp.join("mock_colab.sh");
+            std::fs::write(
+                &p,
+                format!("#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n", py.display(), mock_colab_py.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+
+        std::env::set_var("MOCK_COLAB_LOG", &args_log);
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(mock_colab);
+
+        let tok_file = tmp.join("token.json");
+        std::fs::write(
+            &tok_file,
+            r#"{"token":"valid-token","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        // Unreachable server so destroy_vm=true fails unassign verification (#40)
+        let client = ColabClient::new_for_test("http://127.0.0.1:9".into(), tok_file);
+        let app = AppState::new_with(client, ws_dir);
+
+        // 1. #41: destroy_vm = false when session is missing -> kernel_interrupted == false with reason
+        let res_missing = stop_relay_inner(&app, "missing-sess", false, || {})
+            .await
+            .unwrap();
+        assert!(res_missing.supervisor_stopped);
+        assert!(!res_missing.destroy_vm);
+        assert!(!res_missing.kernel_interrupted);
+        assert!(res_missing
+            .kernel_interrupt_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("可能仍在实例中继续运行"));
+
+        // Register `adc-train` session + ADC profile
+        std::fs::write(
+            cfg_dir.join("sessions.json"),
+            serde_json::json!({ "adc-train": { "endpoint": "m-s-adc01" } }).to_string(),
+        )
+        .unwrap();
+        cli::save_session_profile(
+            "adc-train",
+            &cli::SessionProfile {
+                boot_mode: "relay".into(),
+                accelerator: "T4".into(),
+                high_mem: true,
+                workspace_path: None,
+                auth_mode: Some("adc".into()),
+                llm_config: None,
+                relay_config: None,
+                updated_at: None,
+            },
+        )
+        .unwrap();
+
+        // 2. #41: destroy_vm = false when `colab restart-kernel` returns non-zero -> kernel_interrupted == false
+        std::env::set_var("MOCK_COLAB_RC", "2");
+        let res_rc2 = stop_relay_inner(&app, "adc-train", false, || {})
+            .await
+            .unwrap();
+        assert!(!res_rc2.kernel_interrupted);
+        assert!(res_rc2
+            .kernel_interrupt_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("exit=2"));
+
+        // 3. #41 + #43: destroy_vm = false when `colab restart-kernel` returns 0 -> kernel_interrupted == true & passes `--auth adc`
+        std::env::set_var("MOCK_COLAB_RC", "0");
+        let res_ok = stop_relay_inner(&app, "adc-train", false, || {})
+            .await
+            .unwrap();
+        assert!(res_ok.kernel_interrupted);
+        assert!(res_ok.kernel_interrupt_error.is_none());
+        let logged_argv: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(&args_log).unwrap()).unwrap();
+        assert_eq!(
+            logged_argv,
+            vec!["--auth", "adc", "restart-kernel", "-s", "adc-train"]
+        );
+
+        // 4. #40: destroy_vm = true when server unassign verification fails -> kernel_interrupted == false & receipt.verified_unassigned == false
+        std::env::set_var("MOCK_COLAB_RC", "1");
+        let h = Arc::new(RelayHandle::new("adc-train"));
+        h.log("round 1 log preserved");
+        app.relays.l().insert("adc-train".into(), h);
+        let res_destroy_unverified = stop_relay_inner(&app, "adc-train", true, || {})
+            .await
+            .unwrap();
+        assert!(res_destroy_unverified.destroy_vm);
+        assert!(!res_destroy_unverified.kernel_interrupted);
+        assert!(
+            !res_destroy_unverified
+                .terminate_receipt
+                .as_ref()
+                .unwrap()
+                .verified_unassigned
+        );
+        assert!(app.relays.l().contains_key("adc-train"), "offline relay logs must be retained");
+
+        std::env::remove_var("MOCK_COLAB_LOG");
+        std::env::remove_var("MOCK_COLAB_RC");
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_42_and_58_workspace_binding_priority_and_strict_read_errors() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_ws_bind_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let ws_default = tmp.join("ws_default");
+        let ws_bound = tmp.join("ws_bound");
+        let ws_explicit = tmp.join("ws_explicit");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_default).unwrap();
+        std::fs::create_dir_all(&ws_bound).unwrap();
+        std::fs::create_dir_all(&ws_explicit).unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir);
+
+        std::fs::write(ws_default.join("train.py"), "# default\n").unwrap();
+        std::fs::write(ws_bound.join("train.py"), "# bound\n").unwrap();
+        std::fs::write(ws_explicit.join("train.py"), "# explicit\n").unwrap();
+
+        cli::register_workspace_entry(
+            "vm-custom",
+            "ws_bound",
+            Some(&ws_bound.to_string_lossy()),
+            None,
+        );
+
+        let tok_file = tmp.join("token.json");
+        std::fs::write(&tok_file, "{}").unwrap();
+        let client = ColabClient::new_for_test("http://127.0.0.1:9".into(), tok_file);
+        let app = AppState::new_with(client, ws_default.clone());
+
+        // 1. Priority: explicit workspace_path > vm_name bound workspace > default app.workspace
+        let f_default = read_workspace_files_inner(&app, None, None).await.unwrap();
+        assert_eq!(f_default.train_py, "# default\n");
+        assert_eq!(f_default.requirements_txt, "");
+
+        let f_bound = read_workspace_files_inner(&app, None, Some("vm-custom"))
+            .await
+            .unwrap();
+        assert_eq!(f_bound.train_py, "# bound\n");
+        assert_eq!(PathBuf::from(&f_bound.workspace), ws_bound);
+
+        let f_explicit = read_workspace_files_inner(
+            &app,
+            Some(&ws_explicit.to_string_lossy()),
+            Some("vm-custom"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(f_explicit.train_py, "# explicit\n");
+
+        save_workspace_files_inner(
+            &app,
+            "print('saved_to_bound')\n".into(),
+            "torch>=2.4\n".into(),
+            None,
+            Some("vm-custom"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws_bound.join("train.py")).unwrap(),
+            "print('saved_to_bound')\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws_default.join("train.py")).unwrap(),
+            "# default\n",
+            "saving bound VM workspace must NOT overwrite default workspace"
+        );
+
+        // 2. #58: Missing workspace dir must return Err, never empty strings
+        let missing_err = read_workspace_files_inner(
+            &app,
+            Some(&tmp.join("does_not_exist").to_string_lossy()),
+            None,
+        )
+        .await
+        .expect_err("missing workspace directory must return Err");
+        assert!(missing_err.contains("无法访问工作区目录"));
+
+        // 3. #58: Invalid UTF-8 in train.py or requirements.txt must return Err naming the file
+        std::fs::write(ws_bound.join("train.py"), [0xffu8, 0xfe, 0xd5, 0x00]).unwrap();
+        let utf8_err = read_workspace_files_inner(&app, None, Some("vm-custom"))
+            .await
+            .expect_err("invalid UTF-8 train.py must return Err instead of empty string");
+        assert!(utf8_err.contains("train.py") && utf8_err.contains("UTF-8"));
+
+        std::fs::write(ws_bound.join("train.py"), "# valid\n").unwrap();
+        std::fs::remove_file(ws_bound.join("requirements.txt")).ok();
+        std::fs::create_dir_all(ws_bound.join("requirements.txt")).unwrap();
+        let dir_err = read_workspace_files_inner(&app, None, Some("vm-custom"))
+            .await
+            .expect_err("directory in place of requirements.txt must return Err");
+        assert!(dir_err.contains("requirements.txt"));
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_43_44_52_54_67_68_75_create_vm_validations_and_no_auth_login_prompt() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_create_val_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let fake_colab = tmp.join("fake_colab");
+        std::fs::write(&fake_colab, "stub").unwrap();
+        let fake_adc = tmp.join("adc.json");
+        std::fs::write(&fake_adc, r#"{"type":"authorized_user"}"#).unwrap();
+        let missing_rclone_conf = tmp.join("missing_rclone.conf");
+
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(fake_colab);
+        *cli::TEST_ADC_PATH.l() = Some(fake_adc);
+        *cli::TEST_RCLONE_CONF.l() = Some(missing_rclone_conf.clone());
+
+        // 1. #43 & #75: ADC present (`adc_ok == true`) without Colab OAuth token (`!token_ok`) must block create_vm
+        let missing_tok = tmp.join("no_token.json");
+        let unauth_client = ColabClient::new_for_test("http://127.0.0.1:9".into(), missing_tok);
+        let unauth_app = AppState::new_with(unauth_client, ws_dir.clone());
+        let env_unauth = unauth_app.env_status();
+        assert!(!env_unauth.token_ok);
+        assert!(env_unauth.adc_ok);
+
+        let adc_only_req = CreateVmRequest {
+            name: Some("adc-only-vm".into()),
+            accelerator: "T4".into(),
+            auth_mode: Some("adc".into()),
+            boot_mode: Some("general".into()),
+            ..Default::default()
+        };
+        let adc_err = validate_and_prepare_create_vm(&unauth_app, &adc_only_req)
+            .expect_err("ADC-only without OAuth token must be rejected before VM allocation");
+        assert!(adc_err.contains("colab auth") && !adc_err.contains("colab auth login"));
+
+        let ov_unauth = refresh_overview(&unauth_app, false).await;
+        let ov_err = ov_unauth.error.unwrap_or_default();
+        assert!(ov_err.contains("colab auth") && !ov_err.contains("colab auth login"));
+
+        // Now authorize OAuth token (still NO rclone.conf on disk!)
+        let valid_tok = tmp.join("valid_token.json");
+        std::fs::write(
+            &valid_tok,
+            r#"{"token":"valid-token","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let auth_client = ColabClient::new_for_test("http://127.0.0.1:9".into(), valid_tok);
+        let app = AppState::new_with(auth_client, ws_dir.clone());
+
+        // 2. #67: General mode without sync_rclone/mount_gdrive succeeds WITHOUT rclone.conf!
+        let gen_ok = validate_and_prepare_create_vm(
+            &app,
+            &CreateVmRequest {
+                name: Some("gen-no-drive".into()),
+                accelerator: "T4".into(),
+                boot_mode: Some("general".into()),
+                auto_relay: true, // stale auto_relay flag must be ignored when boot_mode == "general"
+                env_config: Some(CreateVmEnvConfig {
+                    sync_rclone: false,
+                    mount_gdrive: false,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("general VM without rclone options must not require rclone.conf");
+        assert_eq!(gen_ok.boot_mode, "general");
+        assert!(gen_ok.validated_relay_cfg.is_none());
+
+        // Enabling sync_rclone without rclone.conf rejects cleanly
+        assert!(validate_and_prepare_create_vm(
+            &app,
+            &CreateVmRequest {
+                name: Some("gen-need-drive".into()),
+                accelerator: "T4".into(),
+                boot_mode: Some("general".into()),
+                env_config: Some(CreateVmEnvConfig {
+                    sync_rclone: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .is_err());
+
+        // 3. #68: CUDA LLM presets (vllm / llama.cpp / transformers) rejected on CPU & TPU before VM allocation
+        for bad_hw in ["CPU", "V5E1", "V6E1"] {
+            for cuda_eng in ["vllm", "llama.cpp", "transformers"] {
+                let res = validate_and_prepare_create_vm(
+                    &app,
+                    &CreateVmRequest {
+                        name: Some("llm-bad".into()),
+                        accelerator: bad_hw.into(),
+                        boot_mode: Some("llm".into()),
+                        llm_config: Some(CreateVmLlmConfig {
+                            engine: cuda_eng.into(),
+                            model_name: "Qwen/Qwen2.5-7B-Instruct".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                );
+                assert!(
+                    res.is_err(),
+                    "CUDA engine {cuda_eng} on non-NVIDIA {bad_hw} must be rejected"
+                );
+            }
+        }
+        // NVIDIA GPU + vllm AND CPU + ollama succeed
+        assert!(validate_and_prepare_create_vm(
+            &app,
+            &CreateVmRequest {
+                name: Some("llm-g4-ok".into()),
+                accelerator: "G4".into(),
+                boot_mode: Some("llm".into()),
+                llm_config: Some(CreateVmLlmConfig {
+                    engine: "vllm".into(),
+                    model_name: "Qwen/Qwen2.5-7B-Instruct".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .is_ok());
+        assert!(validate_and_prepare_create_vm(
+            &app,
+            &CreateVmRequest {
+                name: Some("llm-cpu-ollama".into()),
+                accelerator: "CPU".into(),
+                boot_mode: Some("llm".into()),
+                llm_config: Some(CreateVmLlmConfig {
+                    engine: "ollama".into(),
+                    model_name: "qwen2.5:3b".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .is_ok());
+
+        // 4. #44, #52, #54: Create rclone.conf and test CPU relay preservation, bare gdrive_dir isolation, 23.5h cap & conflict rejection
+        std::fs::write(&missing_rclone_conf, "[gdrive]\ntype = drive\n").unwrap();
+        let cpu_relay_prep = validate_and_prepare_create_vm(
+            &app,
+            &CreateVmRequest {
+                name: Some("cpu-relay-1".into()),
+                accelerator: "CPU".into(),
+                high_mem: true,
+                boot_mode: Some("relay".into()),
+                relay_config: Some(RelayConfig {
+                    gpu_type: "T4".into(),
+                    high_mem: true,
+                    gdrive_dir: "gdrive:colab_relay".into(),
+                    max_session_hours: 23.5,
+                    backup_interval_minutes: 20.0,
+                    total_epochs: 50,
+                    reset_done_flag: false,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("CPU relay with 23.5h must pass validation");
+        let rcfg = cpu_relay_prep.validated_relay_cfg.unwrap();
+        assert_eq!(rcfg.gpu_type, "CPU", "Issue #52: CPU must never be rewritten to T4");
+        assert_eq!(
+            rcfg.gdrive_dir, "gdrive:colab_relay/cpu-relay-1",
+            "Issue #44: bare gdrive:colab_relay must isolate by VM name"
+        );
+
+        // Reject >23.5h in create_vm (#54)
+        assert!(validate_and_prepare_create_vm(
+            &app,
+            &CreateVmRequest {
+                name: Some("relay-30h".into()),
+                accelerator: "T4".into(),
+                boot_mode: Some("relay".into()),
+                relay_config: Some(RelayConfig {
+                    max_session_hours: 30.0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .is_err());
+
+        // Simulate `cpu-relay-1` actively running on `gdrive:colab_relay/shared_exp` and verify another VM is blocked from using it (#44)
+        let running_h = Arc::new(RelayHandle::new("cpu-relay-1"));
+        running_h.status.l().running = true;
+        running_h.status.l().config.gdrive_dir = "gdrive:colab_relay/shared_exp/".into();
+        app.relays.l().insert("cpu-relay-1".into(), running_h);
+
+        let conflict_err = validate_and_prepare_create_vm(
+            &app,
+            &CreateVmRequest {
+                name: Some("cpu-relay-2".into()),
+                accelerator: "CPU".into(),
+                boot_mode: Some("relay".into()),
+                relay_config: Some(RelayConfig {
+                    gdrive_dir: "gdrive:colab_relay/shared_exp".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .expect_err("duplicate active gdrive_dir must be rejected");
+        assert!(conflict_err.contains("cpu-relay-1"));
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        *cli::TEST_ADC_PATH.l() = None;
+        *cli::TEST_RCLONE_CONF.l() = None;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_48_bluegreen_custom_session_names_routing_and_cleanup() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_bg48_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+
+        let bg_json = serde_json::json!({
+            "session_prefix": "prod",
+            "active_slot": "blue",
+            "standby_slot": "green",
+            "active_session": "custom-node-alpha",
+            "standby_session": "vm-auto99",
+            "blue_session": "custom-node-alpha",
+            "green_session": "vm-auto99",
+            "slots": {
+                "blue": { "session_name": "custom-node-alpha", "role": "active", "model_name": "Qwen/Qwen2.5-32B-Instruct", "endpoint": "m-s-alpha01" },
+                "green": { "session_name": "vm-auto99", "role": "warming", "model_name": "Qwen/Qwen2.5-72B-Instruct", "endpoint": "m-s-auto99" }
+            },
+            "phase": "serving",
+            "model_name": "Qwen/Qwen2.5-32B-Instruct",
+            "updated_at": 1794736000.0
+        });
+        std::fs::write(cfg_dir.join("llm_bluegreen_state.json"), bg_json.to_string()).unwrap();
+
+        let bg_parsed = parse_llm_bluegreen_state(cli::read_llm_bluegreen_state()).unwrap();
+        assert_eq!(
+            bluegreen_tunnel_port_for_vm("custom-node-alpha", Some(&bg_parsed)),
+            Some(18081)
+        );
+        assert_eq!(
+            bluegreen_tunnel_port_for_vm("vm-auto99", Some(&bg_parsed)),
+            Some(18082)
+        );
+        // Fallback `${prefix}-blue` must NOT hijack port 18081 when `blue` explicitly binds `custom-node-alpha`
+        assert_eq!(
+            bluegreen_tunnel_port_for_vm("prod-blue", Some(&bg_parsed)),
+            None
+        );
+
+        let tok_file = tmp.join("token.json");
+        std::fs::write(
+            &tok_file,
+            r#"{"token":"valid-token","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let client = ColabClient::new_for_test("http://127.0.0.1:9".into(), tok_file);
+        let app = AppState::new_with(client, ws_dir);
+        {
+            let mut ov = app.overview.write().await;
+            ov.vms = vec![
+                VmView {
+                    name: "vm-auto99".into(),
+                    on_server: true,
+                    managed: true,
+                    accelerator: "A100".into(),
+                    telemetry: Some(serde_json::json!({
+                        "llm": { "online": false, "role": "warming", "slot": "green" }
+                    })),
+                    ..Default::default()
+                },
+                VmView {
+                    name: "custom-node-alpha".into(),
+                    on_server: true,
+                    managed: true,
+                    accelerator: "A100".into(),
+                    telemetry: Some(serde_json::json!({
+                        "llm": { "online": true, "role": "active", "slot": "blue", "port": 8000 }
+                    })),
+                    ..Default::default()
+                },
+            ];
+        }
+
+        let resolved = resolve_llm_target(
+            &app,
+            &LlmChatRequest {
+                request_id: "r48".into(),
+                target_vm: "auto".into(),
+                model: None,
+                messages: vec![],
+                max_tokens: None,
+                temperature: None,
+            },
+        )
+        .await
+        .expect("auto target should resolve custom-named active bluegreen VM");
+        assert_eq!(resolved.vm_name, "custom-node-alpha");
+        assert_eq!(resolved.slot.as_deref(), Some("blue"));
+        assert_eq!(resolved.local_tunnel_port, Some(18081));
+        assert_eq!(resolved.model, "Qwen/Qwen2.5-32B-Instruct");
+
+        // Terminating custom-node-alpha while `vm-auto99` (`m-s-auto99`) remains online promotes `green` (`vm-auto99`)
+        let mut steps = Vec::new();
+        cleanup_llm_bluegreen_after_terminate(
+            "custom-node-alpha",
+            &["m-s-auto99".to_string()],
+            &mut steps,
+        );
+        let after_one = parse_llm_bluegreen_state(cli::read_llm_bluegreen_state())
+            .expect("state should remain and promote surviving green session");
+        assert_eq!(after_one.active_slot.as_deref(), Some("green"));
+        assert_eq!(after_one.active_session.as_deref(), Some("vm-auto99"));
+
+        // Terminating the last remaining session removes state file
+        cleanup_llm_bluegreen_after_terminate("vm-auto99", &[], &mut steps);
+        assert!(cli::read_llm_bluegreen_state().is_none());
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_55_deploy_probe_rejects_stale_telemetry_json() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let py = cli::colab_python_bin();
+        if !py.exists() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("pilot_probe55_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        // Mock colab exec that pretends exit 0 ("PROBE_OK") without updating remote telemetry JSON
+        let mock_colab_py = tmp.join("mock_colab_probe.py");
+        std::fs::write(
+            &mock_colab_py,
+            "import sys; sys.stdin.read(); print('PROBE_OK'); sys.exit(0)\n",
+        )
+        .unwrap();
+        #[cfg(windows)]
+        let mock_colab = {
+            let p = tmp.join("mock_colab_probe.cmd");
+            std::fs::write(
+                &p,
+                format!("@echo off\r\n\"{}\" \"{}\" %*\r\n", py.display(), mock_colab_py.display()),
+            )
+            .unwrap();
+            p
+        };
+        #[cfg(not(windows))]
+        let mock_colab = {
+            use std::os::unix::fs::PermissionsExt;
+            let p = tmp.join("mock_colab_probe.sh");
+            std::fs::write(
+                &p,
+                format!("#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n", py.display(), mock_colab_py.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(mock_colab);
+        std::fs::write(
+            cfg_dir.join("sessions.json"),
+            serde_json::json!({ "probe-vm": { "endpoint": "m-s-probe55" } }).to_string(),
+        )
+        .unwrap();
+
+        // Mock proxy Contents server returning a STALE `.colab_pilot_telemetry.json` from an old PID / wrong nonce
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first = req.lines().next().unwrap_or("");
+                    let body = if first.starts_with("GET /api/contents/content/.colab_pilot_telemetry.json") {
+                        serde_json::json!({
+                            "type": "file",
+                            "format": "text",
+                            "content": serde_json::json!({
+                                "timestamp": 1700000000.0,
+                                "probe_nonce": "stale_old_nonce",
+                                "daemon_pid": 99999
+                            }).to_string()
+                        })
+                        .to_string()
+                    } else {
+                        r#"{"type":"file"}"#.to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tok_file = tmp.join("token.json");
+        std::fs::write(
+            &tok_file,
+            r#"{"token":"valid-token","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_file);
+        let app = AppState::new_with(client, ws_dir);
+        let a: Assignment = serde_json::from_value(serde_json::json!({
+            "endpoint": "m-s-probe55",
+            "accelerator": "T4",
+            "runtimeProxyInfo": {
+                "url": format!("http://{addr}"),
+                "token": "ptok",
+                "tokenExpiresInSeconds": 3600
+            }
+        }))
+        .unwrap();
+
+        let err = deploy_probe_for_assignment(&app, &a)
+            .await
+            .expect_err("stale telemetry JSON with mismatched nonce/timestamp MUST fail probe verification");
+        assert!(
+            err.to_string().contains("未能产出匹配本次部署") || err.to_string().contains("探针"),
+            "unexpected error: {err:#}"
+        );
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_57_72_73_overview_stale_cache_offline_relay_retention_and_window_close_guard() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_ov_close_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(tmp.join("nonexistent_colab"));
+        *cli::TEST_RCLONE_CONF.l() = Some(tmp.join("nonexistent_rclone.conf"));
+
+        let fail_assignments = Arc::new(AtomicBool::new(false));
+        let vm_on_server = Arc::new(AtomicBool::new(true));
+        let allow_unassign = Arc::new(AtomicBool::new(false));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fail_srv = fail_assignments.clone();
+        let on_srv = vm_on_server.clone();
+        let unassign_srv = allow_unassign.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let f = fail_srv.clone();
+                let o = on_srv.clone();
+                let u = unassign_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first = req.lines().next().unwrap_or("");
+                    let (status, body) = if first.starts_with("GET /tun/m/assignments") {
+                        if f.load(Ordering::SeqCst) {
+                            ("502 Bad Gateway", r#"{"error":"upstream timeout"}"#.to_string())
+                        } else {
+                            let mut items = Vec::new();
+                            if o.load(Ordering::SeqCst) {
+                                items.push(serde_json::json!({
+                                    "endpoint": "m-s-active01",
+                                    "accelerator": "T4",
+                                    "runtimeProxyInfo": { "token": "ptok", "url": "http://127.0.0.1:9" }
+                                }));
+                            }
+                            (
+                                "200 OK",
+                                format!(")]}}'\n{}", serde_json::json!({ "assignments": items })),
+                            )
+                        }
+                    } else if first.starts_with("GET /tun/m/unassign/") {
+                        ("200 OK", r#"{"token":"xsrf-tok"}"#.to_string())
+                    } else if first.starts_with("POST /tun/m/unassign/m-s-active01") {
+                        if u.load(Ordering::SeqCst) {
+                            o.store(false, Ordering::SeqCst);
+                            ("200 OK", "{}".to_string())
+                        } else {
+                            ("500 Internal Server Error", r#"{"error":"unassign failed"}"#.to_string())
+                        }
+                    } else {
+                        ("200 OK", r#"{"currentBalance":88.0}"#.to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        std::fs::write(
+            cfg_dir.join("sessions.json"),
+            serde_json::json!({ "active-relay": { "endpoint": "m-s-active01" } }).to_string(),
+        )
+        .unwrap();
+        let tok_file = tmp.join("token.json");
+        std::fs::write(
+            &tok_file,
+            r#"{"token":"valid-token","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_file);
+        let app = AppState::new_with(client, ws_dir);
+
+        // Add an offline finished/failed relay (#73) AND a running relay (#72)
+        let finished_h = Arc::new(RelayHandle::new("finished-offline-relay"));
+        finished_h.status.l().running = false;
+        finished_h.status.l().phase = "error".into();
+        finished_h.status.l().last_error = Some("OOM on epoch 4".into());
+        finished_h.log("❌ OOM traceback line");
+        app.relays
+            .l()
+            .insert("finished-offline-relay".into(), finished_h);
+
+        let active_h = Arc::new(RelayHandle::new("active-relay"));
+        active_h.status.l().running = true;
+        active_h.status.l().phase = "training".into();
+        app.relays.l().insert("active-relay".into(), active_h);
+
+        // 1. First refresh succeeds; offline finished relay MUST be retained in ov.vms (#73)
+        let ov1 = refresh_overview(&app, true).await;
+        assert!(!ov1.is_stale);
+        assert!(ov1.stale_reason.is_none());
+        let ok_ts = ov1.last_ok_timestamp.expect("last_ok_timestamp set on success");
+        assert_eq!(ov1.timestamp, ok_ts as i64);
+        let offline_card = ov1
+            .vms
+            .iter()
+            .find(|v| v.name == "finished-offline-relay")
+            .expect("offline finished/failed relay card must remain visible (#73)");
+        assert!(!offline_card.on_server);
+        assert_eq!(
+            offline_card
+                .relay
+                .as_ref()
+                .and_then(|r| r.last_error.as_deref()),
+            Some("OOM on epoch 4")
+        );
+
+        // Force cached snapshot timestamp back to a distinct known past value (`1700001234`) within 60s window (#57)
+        {
+            let mut guard = app.last_assignments.l();
+            if let Some((list, inst, _)) = guard.clone() {
+                *guard = Some((list, inst, 1700001234));
+            }
+        }
+        fail_assignments.store(true, Ordering::SeqCst);
+        let ov_stale = refresh_overview(&app, true).await;
+        assert!(ov_stale.is_stale, "60s fallback on error must set is_stale=true");
+        assert!(ov_stale.stale_reason.is_some());
+        assert_eq!(ov_stale.last_ok_timestamp, Some(1700001234));
+        assert_eq!(
+            ov_stale.timestamp, 1700001234,
+            "Overview.timestamp must preserve previous snapshot timestamp on stale fallback"
+        );
+        fail_assignments.store(false, Ordering::SeqCst);
+
+        // 2. #73: dismiss_relay_status refuses running relay, removes finished offline relay
+        assert!(dismiss_relay_status_inner(&app, "active-relay").is_err());
+        dismiss_relay_status_inner(&app, "finished-offline-relay")
+            .expect("dismissing finished relay should succeed");
+        assert!(!app.relays.l().contains_key("finished-offline-relay"));
+
+        // 3. #72: Window close interception & confirm_app_close_inner("shutdown_vms") unverified -> retry verified
+        assert_eq!(
+            should_intercept_window_close(&app),
+            Some(vec!["active-relay".to_string()])
+        );
+        let (receipts_unverified, should_exit_1) = confirm_app_close_inner(&app, "shutdown_vms")
+            .await
+            .unwrap();
+        assert!(
+            !should_exit_1,
+            "must NOT exit app when shutdown_vms fails unassign verification"
+        );
+        assert!(!receipts_unverified[0].verified_unassigned);
+        assert_eq!(
+            should_intercept_window_close(&app),
+            Some(vec!["active-relay".to_string()]),
+            "unverified pending close VM must still intercept window close and allow retry"
+        );
+
+        // Retry shutdown_vms once server allows unassign -> verified & exits!
+        std::fs::write(
+            cfg_dir.join("sessions.json"),
+            serde_json::json!({ "active-relay": { "endpoint": "m-s-active01" } }).to_string(),
+        )
+        .unwrap();
+        allow_unassign.store(true, Ordering::SeqCst);
+        let (receipts_ok, should_exit_2) = confirm_app_close_inner(&app, "shutdown_vms")
+            .await
+            .unwrap();
+        assert!(should_exit_2);
+        assert!(receipts_ok[0].verified_unassigned);
+        assert!(should_intercept_window_close(&app).is_none());
+
+        shutdown_child_processes(&app);
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        *cli::TEST_RCLONE_CONF.l() = None;
+        srv.abort();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

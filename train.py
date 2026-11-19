@@ -22,7 +22,12 @@ if "--smoke-pass" in sys.argv:
         SMOKE_PASS = int(sys.argv[idx + 1])
 
 _DEFAULT_ROOT = "/content" if os.path.isdir("/content") and not SMOKE_TEST else os.getcwd()
-GDRIVE_DIR = os.environ.get("GDRIVE_DIR", "gdrive:colab_relay").rstrip("/")
+_INITIAL_GDRIVE_DIR = (
+    os.environ.get("RELAY_GDRIVE_DIR")
+    or os.environ.get("GDRIVE_DIR")
+    or "gdrive:colab_relay"
+).strip().rstrip("/")
+GDRIVE_DIR = _INITIAL_GDRIVE_DIR
 GDRIVE_DATASET_DIR = os.environ.get("GDRIVE_DATASET_DIR", "").strip()
 RCLONE_CONF = os.environ.get(
     "RCLONE_CONFIG",
@@ -62,11 +67,34 @@ def _sanitize_json(obj):
     return obj
 
 
+def _effective_gdrive_dir():
+    if GDRIVE_DIR != _INITIAL_GDRIVE_DIR:
+        return GDRIVE_DIR.strip().rstrip("/")
+    env_gd = os.environ.get("RELAY_GDRIVE_DIR") or os.environ.get("GDRIVE_DIR")
+    if env_gd and env_gd.strip():
+        return env_gd.strip().rstrip("/")
+    return GDRIVE_DIR.strip().rstrip("/")
+
+
+def _session_isolation_prefix():
+    raw_sess = (
+        os.environ.get("RELAY_SESSION")
+        or os.environ.get("SESSION_PREFIX")
+        or os.environ.get("COLAB_SESSION")
+        or os.environ.get("SESSION")
+        or ""
+    ).strip()
+    clean_sess = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in raw_sess).strip("-.")
+    if clean_sess:
+        return f"{clean_sess}.{os.getpid()}"
+    return f"pid{os.getpid()}"
+
+
 def _atomic_write_json(filepath, payload):
     parent = os.path.dirname(os.path.abspath(filepath))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp = f"{filepath}.{os.getpid()}.tmp"
+    tmp = f"{filepath}.{_session_isolation_prefix()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(_sanitize_json(payload), f, ensure_ascii=False, indent=2, allow_nan=False)
     os.replace(tmp, filepath)
@@ -75,12 +103,13 @@ def _atomic_write_json(filepath, payload):
 def write_training_state(**kwargs):
     """写入实时训练进度，供本机可视化面板通过 Contents API 无阻塞读取"""
     try:
+        gd = _effective_gdrive_dir()
         data = {
             "mode": "dl_relay",
             "framework": "pytorch",
             "model_name": MODEL_NAME,
-            "round": RELAY_ROUND,
-            "gdrive_dir": GDRIVE_DIR,
+            "round": int(os.environ.get("RELAY_ROUND", RELAY_ROUND)),
+            "gdrive_dir": gd,
             "dataset_dir": GDRIVE_DATASET_DIR or "/content/dataset",
             "results_dir": RESULTS_DIR,
         }
@@ -99,8 +128,9 @@ def write_training_state(**kwargs):
 
 def _rclone_base_cmd():
     cmd = ["rclone"]
-    if RCLONE_CONF and os.path.exists(RCLONE_CONF):
-        cmd.extend(["--config", RCLONE_CONF])
+    conf_path = os.environ.get("RCLONE_CONFIG") or os.environ.get("RCLONE_CONF") or RCLONE_CONF
+    if conf_path and os.path.exists(conf_path):
+        cmd.extend(["--config", conf_path])
     cmd.extend(["--retries", "5", "--low-level-retries", "20"])
     return cmd
 
@@ -109,41 +139,74 @@ def _resolve_remote_path(remote_spec):
     spec = remote_spec.strip()
     if ":" in spec:
         return spec.rstrip("/")
-    return f"{GDRIVE_DIR}/{spec.lstrip('/')}"
+    return f"{_effective_gdrive_dir()}/{spec.lstrip('/')}"
 
 
-def _remote_file_exists(remote_dir, filename):
+def _list_remote_entries(remote_dir):
     if SMOKE_TEST and os.environ.get("SMOKE_SKIP_RCLONE", "1") == "1":
-        return False
+        return set()
     res = subprocess.run(
-        _rclone_base_cmd() + ["lsf", "--files-only", "--", remote_dir],
+        _rclone_base_cmd() + ["lsf", "--", remote_dir],
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
     if res.returncode == 0:
-        names = {ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()}
-        return filename in names
+        return {ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()}
     err_txt = ((res.stderr or "") + "\n" + (res.stdout or "")).lower()
     if "directory not found" in err_txt or "object not found" in err_txt or "file not found" in err_txt:
-        return False
+        return set()
     raise RuntimeError(f"rclone 查询远端目录失败 ({remote_dir}): {(res.stderr or '').strip()[:240]}")
 
 
+def _remote_file_exists(remote_dir, filename):
+    entries = _list_remote_entries(remote_dir)
+    return filename in entries or f"{filename}/" in entries
+
+
 def rclone_pull_checkpoint(local_ckpt):
-    """安全拉取历史断点（严格区分首次无断点与网络错误，杜绝第 2+ 棒静默归零覆写）"""
+    """
+    安全拉取历史断点：
+    - 若云盘存在有效断点：拉取并校验本地非空，拉取失败立即抛错保护；
+    - 若云盘不存在主断点，但存在历史备份或训练结果产物（处于续训状态）且 RELAY_ROUND>1 未重置：报错拒绝归零覆写；
+    - 若云盘经查询确认尚无任何断点及训练产物（全新非续训状态）：即便 RELAY_ROUND>1（如前序分配失败重试导致），
+      输出清晰诊断提示后允许按实际无断点状态从头启动。
+    """
     if SMOKE_TEST and os.environ.get("SMOKE_SKIP_RCLONE", "1") == "1":
-        return
+        return False
+    gd = _effective_gdrive_dir()
     ckpt_name = os.path.basename(local_ckpt)
+    stem, ext = os.path.splitext(ckpt_name)
+    prev_name = f"{stem}_prev{ext or '.pt'}"
+    effective_round = int(os.environ.get("RELAY_ROUND", RELAY_ROUND))
     reset_flag = os.environ.get("RESET_DONE_FLAG", "0") == "1"
-    exists = _remote_file_exists(GDRIVE_DIR, ckpt_name)
-    if RELAY_ROUND > 1 and not reset_flag and not exists:
-        raise RuntimeError(
-            f"第 {RELAY_ROUND} 棒接力异常：Google Drive ({GDRIVE_DIR}) 中未找到 {ckpt_name}，拒绝从第 0 轮重跑覆写！"
-        )
+
+    entries = _list_remote_entries(gd)
+    exists = ckpt_name in entries
+    has_prior_state = (
+        prev_name in entries
+        or "results/" in entries
+        or "results" in entries
+        or "training_done.flag" in entries
+        or "TRAINING_COMPLETED.flag" in entries
+    )
+
     if not exists:
-        return
+        if os.path.exists(local_ckpt) and os.path.getsize(local_ckpt) > 0:
+            return True
+        if effective_round > 1 and not reset_flag:
+            if has_prior_state:
+                raise RuntimeError(
+                    f"第 {effective_round} 棒接力异常：Google Drive ({gd}) 存在历史训练产物但未找到 {ckpt_name}，拒绝从第 0 轮重跑覆写！"
+                )
+            print(
+                f"⚠️ [接力诊断] 当前 RELAY_ROUND={effective_round}，但已确认云盘目录 ({gd}) 尚无任何历史断点或训练产物"
+                f"（非续训状态，可能由前序实例分配失败重试导致），将按实际无断点状态从第 0 轮启动。",
+                flush=True,
+            )
+        return False
+
     parent = os.path.dirname(os.path.abspath(local_ckpt))
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -152,12 +215,13 @@ def rclone_pull_checkpoint(local_ckpt):
         "--multi-thread-streams",
         "16",
         "--",
-        f"{GDRIVE_DIR}/{ckpt_name}",
+        f"{gd}/{ckpt_name}",
         local_ckpt,
     ]
     subprocess.run(cmd, check=True)
     if not os.path.exists(local_ckpt) or os.path.getsize(local_ckpt) == 0:
-        raise RuntimeError(f"从 Google Drive 拉取 {ckpt_name} 后本地文件为空或缺失")
+        raise RuntimeError(f"从 Google Drive ({gd}) 拉取 {ckpt_name} 后本地文件为空或缺失")
+    return True
 
 
 def rclone_pull(remote_spec, local_dir="/content", required=True):
@@ -180,26 +244,29 @@ def rclone_pull(remote_spec, local_dir="/content", required=True):
 
 
 def rclone_push(local_path, remote_sub=""):
-    """将 Colab 本地文件或目录 16 线程上传回 Google Drive（对断点文件执行临时上传+旧版轮转+原子替换）"""
+    """将 Colab 本地文件或目录 16 线程上传回 Google Drive（对断点文件执行进程/会话隔离临时上传+旧版轮转+原子替换）"""
     if SMOKE_TEST and os.environ.get("SMOKE_SKIP_RCLONE", "1") == "1":
         return
-    if os.path.isfile(local_path) and not remote_sub and local_path == LOCAL_CKPT:
+    gd = _effective_gdrive_dir()
+    iso_prefix = _session_isolation_prefix()
+    local_ckpt_target = os.environ.get("CHECKPOINT_PATH") or os.environ.get("LOCAL_CKPT") or LOCAL_CKPT
+    if os.path.isfile(local_path) and not remote_sub and os.path.abspath(local_path) == os.path.abspath(local_ckpt_target):
         ckpt_name = os.path.basename(local_path)
         stem, ext = os.path.splitext(ckpt_name)
-        remote_ckpt = f"{GDRIVE_DIR}/{ckpt_name}"
-        remote_tmp = f"{GDRIVE_DIR}/.{ckpt_name}.uploading"
-        remote_prev = f"{GDRIVE_DIR}/{stem}_prev{ext or '.pt'}"
+        remote_ckpt = f"{gd}/{ckpt_name}"
+        remote_tmp = f"{gd}/.{iso_prefix}.{ckpt_name}.uploading"
+        remote_prev = f"{gd}/{stem}_prev{ext or '.pt'}"
         subprocess.run(
             _rclone_base_cmd()
             + ["copyto", "--multi-thread-streams", "16", "--drive-chunk-size", "128M", "--", local_path, remote_tmp],
             check=True,
         )
-        if _remote_file_exists(GDRIVE_DIR, ckpt_name):
+        if _remote_file_exists(gd, ckpt_name):
             subprocess.run(_rclone_base_cmd() + ["copyto", "--", remote_ckpt, remote_prev], check=False)
         subprocess.run(_rclone_base_cmd() + ["moveto", "--", remote_tmp, remote_ckpt], check=True)
         return
 
-    target = f"{GDRIVE_DIR}/{remote_sub}".rstrip("/")
+    target = f"{gd}/{remote_sub}".rstrip("/")
     cmd = _rclone_base_cmd() + [
         "copy",
         "--multi-thread-streams",
@@ -214,11 +281,11 @@ def rclone_push(local_path, remote_sub=""):
 
 
 def save_checkpoint_safely(state, filepath):
-    """原子化保存：先写临时文件再替换，防止保存中途断电损坏权重文件"""
+    """原子化保存：先写带进程/会话隔离前缀的临时文件再替换，防止保存中途断电或并发写入损坏权重文件"""
     parent = os.path.dirname(os.path.abspath(filepath))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp_path = f"{filepath}.{os.getpid()}.tmp"
+    tmp_path = f"{filepath}.{_session_isolation_prefix()}.tmp"
     torch.save(state, tmp_path)
     os.replace(tmp_path, filepath)
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -268,6 +335,7 @@ def main():
     last_backup_time = time.time()
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
+    gd = _effective_gdrive_dir()
     if os.environ.get("RESET_DONE_FLAG") == "1":
         if os.path.exists(DONE_FLAG):
             try:
@@ -276,7 +344,7 @@ def main():
                 pass
         if not (SMOKE_TEST and os.environ.get("SMOKE_SKIP_RCLONE", "1") == "1"):
             subprocess.run(
-                _rclone_base_cmd() + ["deletefile", "--", f"{GDRIVE_DIR}/{os.path.basename(DONE_FLAG)}"],
+                _rclone_base_cmd() + ["deletefile", "--", f"{gd}/{os.path.basename(DONE_FLAG)}"],
                 capture_output=True,
                 check=False,
             )
@@ -284,7 +352,7 @@ def main():
     write_training_state(
         status="pulling_checkpoint",
         pid=os.getpid(),
-        gdrive_dir=GDRIVE_DIR,
+        gdrive_dir=gd,
         dataset_status="smoke_local" if SMOKE_TEST else "ready",
         sync_status="pulling",
         total_epochs=TOTAL_EPOCHS,
@@ -309,8 +377,10 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     start_epoch = 0
 
-    # 3. 恢复历史断点状态
+    # 3. 恢复历史断点状态（以实际是否存在有效断点文件为准）
     if os.path.exists(LOCAL_CKPT):
+        if os.path.getsize(LOCAL_CKPT) == 0:
+            raise RuntimeError(f"本地断点文件为空或已损坏: {LOCAL_CKPT}")
         print(f"📦 发现历史断点 {LOCAL_CKPT}，正在恢复状态...", flush=True)
         ckpt = load_checkpoint_safely(LOCAL_CKPT, map_location=device)
         saved_epoch = ckpt.get("epoch", -1) + 1
@@ -400,7 +470,7 @@ def main():
             or (epoch == TOTAL_EPOCHS - 1)
         ):
             print(
-                f"[Epoch {epoch + 1}] ☁️ 正在通过 rclone (16线程) 将最新权重与结果备份至 Google Drive ({GDRIVE_DIR})...",
+                f"[Epoch {epoch + 1}] ☁️ 正在通过 rclone (16线程) 将最新权重与结果备份至 Google Drive ({gd})...",
                 flush=True,
             )
             write_training_state(status="syncing_gdrive", sync_status="backing_up", current_epoch=epoch + 1)
@@ -443,7 +513,7 @@ def main():
             return
 
     # 5. 全部轮次完成，生成完成标记并上传至网盘
-    tmp_done = f"{DONE_FLAG}.{os.getpid()}.tmp"
+    tmp_done = f"{DONE_FLAG}.{_session_isolation_prefix()}.tmp"
     with open(tmp_done, "w", encoding="utf-8") as f:
         f.write("COMPLETED")
     os.replace(tmp_done, DONE_FLAG)

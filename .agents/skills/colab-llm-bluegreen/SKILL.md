@@ -31,9 +31,10 @@ This skill standardizes Large Language Model (LLM) deployment on Google Colab ac
    - The backend engine (`vLLM`, `Ollama`, `llama-server`, `transformers`) binds to internal port `127.0.0.1:8001`.
    - [`llm_metrics_sidecar.py`](./scripts/llm_metrics_sidecar.py) binds to `0.0.0.0:8000`, proxies `/v1/chat/completions` (counting both `delta.content` and `delta.reasoning_content`), and writes `/content/.colab_pilot_llm_state.json` every 1.5s.
    - [`llm_local_gateway.py`](./scripts/llm_local_gateway.py) runs on `127.0.0.1:18080` (plus `18081`/`18082`) using **pure-Python in-process bridging** (`ColabRuntime` WebSocket + Contents API) without spawning any external `ssh.exe` or `colab.exe` subprocesses—completely eliminating flashing console windows on Windows.
-4. **Make-Before-Break Parallel Hot Switchover (`<prefix>-blue` ↔ `<prefix>-green`)**:
-   - While `llm-blue` serves traffic, `llm-green` is provisioned in parallel, pulls weights, and runs the **Cloud Warmup Smoke Test**.
-   - Only after `llm-green` passes the warmup check (`SLOT_READY`), traffic is atomically switched (`llm-green` → `ACTIVE`, `llm-blue` → `DRAINING`) and `llm-blue` is terminated (`colab stop -s llm-blue`).
+4. **Make-Before-Break Parallel Hot Switchover (`<prefix>-blue` ↔ `<prefix>-green` or Custom Session Names)**:
+   - While the active slot serves traffic, the standby slot is provisioned in parallel, pulls weights, and runs the **Cloud Warmup Smoke Test** (`llm_bluegreen_state.json` tracks real slot session names in `slots`, `blue_session`, `green_session`, `active_session`, and `standby_session`).
+   - Only after the new slot passes the warmup check (`SLOT_READY`), traffic is atomically switched (`new` → `ACTIVE`, `old` → `DRAINING`), in-flight streaming SSE requests on the old slot are polled until zero (`--drain-timeout 60`), and only then is `colab stop` executed and verified on the old slot.
+   - CUDA-dependent presets (`vllm`, `transformers`, and default CUDA `llama.cpp`) are validated against `--gpu` before provisioning so `CPU` / `TPU` mismatches are rejected upfront without wasting Compute Units.
 5. **Colab Pro+ 60-Minute Idle Kernel Reaper Protection (Triple Keep-Alive)**:
    - Because `llama-server` and `llm_metrics_sidecar.py` run as detached OS processes (`start_new_session=True`), the Jupyter Kernel returns to `execution_state: "idle"` after `deploy` completes. Even on **Colab Pro+**, Google Colab's idle reaper reclaims VMs if the Jupyter Kernel remains `idle` with `0` connections for ~60 minutes, and `runtimeProxyInfo.token` expires after 3600 seconds.
    - [`llm_local_gateway.py`](./scripts/llm_local_gateway.py) runs a background `_keepalive_worker` immediately at startup and every **90 seconds** thereafter (plus on-demand refresh on HTTP `401`/`403`) that:
@@ -114,7 +115,8 @@ python -u ".agents/skills/colab-llm-bluegreen/scripts/llm_bluegreen_manager.py" 
    python -u ".agents/skills/colab-llm-bluegreen/scripts/llm_bluegreen_manager.py" switchover `
      --session-prefix llm `
      --workspace . `
-     --gpu G4
+     --gpu G4 `
+     --drain-timeout 60
    ```
    - Optional: pass `--hold-overlap-seconds 15` to observe both `llm-blue` and `llm-green` online simultaneously in **Colab Pilot** before the old slot is terminated.
 3. **Stop All Slots & Release Billing**:

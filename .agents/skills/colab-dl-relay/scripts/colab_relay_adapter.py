@@ -82,11 +82,23 @@ def _default_rclone_conf() -> str:
     return os.path.expanduser("~/.config/rclone/rclone.conf")
 
 
+def _session_isolation_tag() -> str:
+    raw = (
+        os.environ.get("RELAY_SESSION")
+        or os.environ.get("SESSION_PREFIX")
+        or os.environ.get("COLAB_SESSION")
+        or os.environ.get("SESSION")
+        or ""
+    ).strip()
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-.")
+    return f"{clean}.{os.getpid()}" if clean else f"pid{os.getpid()}"
+
+
 def _atomic_write_text(path: str, content: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
+    tmp = f"{path}.{_session_isolation_tag()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)
     os.replace(tmp, path)
@@ -105,6 +117,7 @@ class ColabRelayContext:
         local_dataset_dir: Optional[str] = None,
         results_dir: Optional[str] = None,
         checkpoint_path: Optional[str] = None,
+        hf_checkpoints_dir: Optional[str] = None,
         done_flag_path: Optional[str] = None,
         max_session_seconds: Optional[float] = None,
         backup_interval_seconds: Optional[float] = None,
@@ -119,8 +132,12 @@ class ColabRelayContext:
             if total_epochs is not None
             else int(os.environ.get("TOTAL_EPOCHS", "100"))
         )
-        raw_gd = gdrive_dir if gdrive_dir is not None else os.environ.get("GDRIVE_DIR", "gdrive:colab_relay")
-        self.gdrive_dir = raw_gd.rstrip("/")
+        raw_gd = (
+            gdrive_dir
+            if gdrive_dir is not None
+            else (os.environ.get("RELAY_GDRIVE_DIR") or os.environ.get("GDRIVE_DIR") or "gdrive:colab_relay")
+        )
+        self.gdrive_dir = raw_gd.strip().rstrip("/")
         raw_ds = gdrive_dataset_dir if gdrive_dataset_dir is not None else os.environ.get("GDRIVE_DATASET_DIR")
         self.gdrive_dataset_dir = raw_ds.rstrip("/") if raw_ds else None
         self.local_dataset_dir = (
@@ -136,6 +153,12 @@ class ColabRelayContext:
             if checkpoint_path is not None
             else os.environ.get("CHECKPOINT_PATH", "checkpoint.pt")
         )
+        self.hf_checkpoints_dir = (
+            hf_checkpoints_dir
+            if hf_checkpoints_dir is not None
+            else os.environ.get("HF_CHECKPOINTS_DIR", "./hf_checkpoints")
+        )
+        self.hf_resume_checkpoint: Optional[str] = None
         self.done_flag_path = (
             done_flag_path
             if done_flag_path is not None
@@ -208,15 +231,15 @@ class ColabRelayContext:
 
     def _rclone_remote_file_exists(self, remote_dir: str, filename: str, timeout: int = 90) -> Optional[bool]:
         """
-        检查远端目录是否存在指定文件：
-        - 返回 True：远端明确存在该文件
+        检查远端目录是否存在指定文件或子目录：
+        - 返回 True：远端明确存在该文件或同名子目录
         - 返回 False：远端目录不存在或文件不存在（首次训练正常状态）
         - 返回 None：rclone 发生网络/鉴权/限流错误（严禁当作“无断点”从头覆写！）
         """
         if self.smoke_test and os.environ.get("SMOKE_SKIP_RCLONE", "1") == "1":
             return False
         try:
-            cmd = self._rclone_base() + ["lsf", "--files-only", "--", remote_dir]
+            cmd = self._rclone_base() + ["lsf", "--", remote_dir]
             res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         except Exception as e:
             print(f"[Relay] 查询远端断点状态异常: {e}", flush=True)
@@ -224,7 +247,8 @@ class ColabRelayContext:
 
         if res.returncode == 0:
             names = {ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()}
-            return filename in names
+            norm = filename.strip("/")
+            return norm in names or f"{norm}/" in names
 
         err_lower = ((res.stderr or "") + "\n" + (res.stdout or "")).lower()
         if "directory not found" in err_lower or "object not found" in err_lower or "file not found" in err_lower:
@@ -232,8 +256,102 @@ class ColabRelayContext:
         print(f"[Relay] rclone lsf 失败 (code={res.returncode}): {(res.stderr or '').strip()[:240]}", flush=True)
         return None
 
+    def _rclone_list_remote_hf_trainer_states(self, timeout: int = 120) -> Optional[List[str]]:
+        """列出远端 `hf_checkpoints/checkpoint-*/trainer_state.json`（按 step 降序）。网络/鉴权失败返回 None。"""
+        if self.smoke_test and os.environ.get("SMOKE_SKIP_RCLONE", "1") == "1":
+            return []
+        remote_hf = f"{self.gdrive_dir}/hf_checkpoints"
+        try:
+            cmd = self._rclone_base() + ["lsf", "-R", "--files-only", "--", remote_hf]
+            res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        except Exception as e:
+            print(f"[Relay] 查询远端 HuggingFace 断点目录异常: {e}", flush=True)
+            return None
+
+        if res.returncode == 0:
+            matched: List[Tuple[int, str]] = []
+            for ln in (res.stdout or "").splitlines():
+                rel = ln.strip().replace("\\", "/")
+                m = re.match(r"^(?:.*/)?checkpoint-(\d+)/trainer_state\.json$", rel)
+                if m:
+                    matched.append((int(m.group(1)), rel))
+            matched.sort(key=lambda item: item[0], reverse=True)
+            return [rel for _, rel in matched]
+
+        err_lower = ((res.stderr or "") + "\n" + (res.stdout or "")).lower()
+        if "directory not found" in err_lower or "object not found" in err_lower or "file not found" in err_lower:
+            return []
+        print(f"[Relay] rclone lsf hf_checkpoints 失败 (code={res.returncode}): {(res.stderr or '').strip()[:240]}", flush=True)
+        return None
+
+    @staticmethod
+    def _inspect_hf_checkpoint_dir(ckpt_dir: str) -> Optional[int]:
+        """校验 `checkpoint-<step>` 目录包含合法的 `trainer_state.json`，返回有效 step；无效则返回 None。"""
+        base = os.path.basename(os.path.normpath(ckpt_dir))
+        m = re.match(r"^checkpoint-(\d+)$", base)
+        if not m or not os.path.isdir(ckpt_dir):
+            return None
+        dir_step = int(m.group(1))
+        ts_path = os.path.join(ckpt_dir, "trainer_state.json")
+        if not os.path.isfile(ts_path) or os.path.getsize(ts_path) <= 0:
+            return None
+        try:
+            with open(ts_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+            state_step = int(data.get("global_step", dir_step))
+            return max(dir_step, state_step)
+        except Exception:
+            return None
+
+    def find_latest_hf_checkpoint(self, base_dir: Optional[str] = None) -> Optional[str]:
+        """在指定目录（默认 `self.hf_checkpoints_dir`）中按最新 step 选择最新有效 `checkpoint-*` 目录。"""
+        roots: List[str] = []
+        if base_dir:
+            roots.append(base_dir)
+        if self.hf_checkpoints_dir and (
+            not roots or os.path.abspath(self.hf_checkpoints_dir) != os.path.abspath(roots[0])
+        ):
+            roots.append(self.hf_checkpoints_dir)
+
+        candidates: List[Tuple[int, str]] = []
+        for root in roots:
+            if not root or not os.path.isdir(root):
+                continue
+            direct_step = self._inspect_hf_checkpoint_dir(root)
+            if direct_step is not None:
+                candidates.append((direct_step, os.path.abspath(root)))
+            for name in os.listdir(root):
+                sub = os.path.join(root, name)
+                step = self._inspect_hf_checkpoint_dir(sub)
+                if step is not None:
+                    candidates.append((step, os.path.abspath(sub)))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        best_path = candidates[0][1]
+        self.hf_resume_checkpoint = best_path
+        return best_path
+
+    def resolve_hf_resume_checkpoint(self, output_dir: Optional[str] = None) -> Optional[str]:
+        """
+        为 HuggingFace `Trainer.train(resume_from_checkpoint=...)` 返回最新有效 `checkpoint-*` 路径：
+        - 第 1 棒且无历史断点时返回 `None`；
+        - 第 2+ 棒（未设置 RESET_DONE_FLAG）若既无有效 `checkpoint-*` 也无 `checkpoint.pt`，立即抛错保护。
+        """
+        best = self.find_latest_hf_checkpoint(output_dir)
+        if best is None and self.round_num > 1 and os.environ.get("RESET_DONE_FLAG", "0") != "1":
+            if not os.path.exists(self.checkpoint_path):
+                raise RuntimeError(
+                    f"第 {self.round_num} 棒 HuggingFace 续训失败：未在 {output_dir or self.hf_checkpoints_dir} "
+                    f"中找到有效的 `checkpoint-*/trainer_state.json`，拒绝从 Step 0 重跑覆写！"
+                )
+        return best
+
     def prepare_cloud_workspace(self, reset_done_flag: bool = False) -> None:
-        """开机第一阶段：从 Google Drive 拉取数据集与最新断点（C-3 强校验防覆写）"""
+        """开机第一阶段：从 Google Drive 拉取数据集与最新断点（统一支持 PyTorch `checkpoint.pt` 与 HF `hf_checkpoints`）"""
         reset_all = reset_done_flag or os.environ.get("RESET_DONE_FLAG", "0") == "1"
         if reset_all:
             if os.path.exists(self.done_flag_path):
@@ -242,6 +360,7 @@ class ColabRelayContext:
 
         if self.smoke_test:
             self.dataset_status = "smoke_local"
+            self.find_latest_hf_checkpoint(self.hf_checkpoints_dir)
             self.report_state(status="smoke_init", current_epoch=0)
             return
 
@@ -265,7 +384,7 @@ class ColabRelayContext:
         else:
             self.dataset_status = "ready"
 
-        # 2. 拉取最新断点与历史 results（严格区分“首次无断点”与“网络/限流失败”）
+        # 2. 拉取最新断点（同时识别 `checkpoint.pt` 与 HuggingFace `hf_checkpoints/checkpoint-*/trainer_state.json`）
         self.sync_status = "pulling_checkpoint"
         self.report_state(status="pulling_checkpoint", current_epoch=0)
         ckpt_name = os.path.basename(self.checkpoint_path)
@@ -278,11 +397,45 @@ class ColabRelayContext:
                 f"无法查询 Google Drive ({self.gdrive_dir}) 中的断点状态，拒绝盲目从 Epoch 1 重跑覆盖网盘权重"
             )
 
-        if self.round_num > 1 and not reset_all and not remote_exists:
+        hf_dir_exists = self._rclone_remote_file_exists(self.gdrive_dir, "hf_checkpoints")
+        if hf_dir_exists is None:
+            self.sync_status = "pull_failed"
+            self.report_state(status="checkpoint_pull_failed", current_epoch=0)
+            raise RuntimeError(
+                f"无法查询 Google Drive ({self.gdrive_dir}/hf_checkpoints) 中的断点状态，拒绝盲目重跑覆盖网盘权重"
+            )
+
+        remote_hf_ready = False
+        if hf_dir_exists:
+            remote_hf_states = self._rclone_list_remote_hf_trainer_states()
+            if remote_hf_states is None:
+                self.sync_status = "pull_failed"
+                self.report_state(status="checkpoint_pull_failed", current_epoch=0)
+                raise RuntimeError(
+                    f"查询 Google Drive ({self.gdrive_dir}/hf_checkpoints) 断点详情失败，已中止启动保护历史权重"
+                )
+            if remote_hf_states:
+                os.makedirs(self.hf_checkpoints_dir, exist_ok=True)
+                pulled_hf = self._run_rclone(
+                    ["copy", "--transfers=8", "--", f"{self.gdrive_dir}/hf_checkpoints", self.hf_checkpoints_dir],
+                    timeout=600,
+                )
+                latest_hf = self.find_latest_hf_checkpoint(self.hf_checkpoints_dir) if pulled_hf else None
+                if not pulled_hf or not latest_hf:
+                    self.sync_status = "pull_failed"
+                    self.report_state(status="checkpoint_pull_failed", current_epoch=0)
+                    raise RuntimeError(
+                        f"Google Drive 存在 HuggingFace 断点 ({self.gdrive_dir}/hf_checkpoints) 但拉取或解析 trainer_state.json 失败"
+                    )
+                remote_hf_ready = True
+                print(f"[Relay] 已同步 HuggingFace 历史断点，最新有效恢复目录: {latest_hf}", flush=True)
+
+        if self.round_num > 1 and not reset_all and not remote_exists and not remote_hf_ready:
             self.sync_status = "pull_failed"
             self.report_state(status="checkpoint_missing", current_epoch=0)
             raise RuntimeError(
-                f"第 {self.round_num} 棒接力异常：Google Drive ({self.gdrive_dir}) 中不存在 {ckpt_name}，已中止启动防止从头重训"
+                f"第 {self.round_num} 棒接力异常：Google Drive ({self.gdrive_dir}) 中既不存在 {ckpt_name}，"
+                f"也不存在有效的 hf_checkpoints/checkpoint-*/trainer_state.json，已中止启动防止从头重训"
             )
 
         if remote_exists:
@@ -302,10 +455,10 @@ class ColabRelayContext:
 
     def backup_to_gdrive(self, epoch: Optional[int] = None, include_results: bool = True) -> bool:
         """
-        将当前 checkpoint.pt 与 results/ 备份到 Google Drive（C-3 事务级保护）：
-        1. 先上传到远端 `.tmp` 临时对象，网络中断绝不破坏线上正式 `checkpoint.pt`；
+        将当前 checkpoint.pt 与 results/ 备份到 Google Drive（C-3 事务级保护 + 会话/进程隔离临时文件名）：
+        1. 先上传到远端带隔离前缀的 `.uploading` 临时对象，网络中断或并发上传绝不破坏线上正式 `checkpoint.pt`；
         2. 将线上已有 `checkpoint.pt` 服务端轮转为 `checkpoint_prev.pt`；
-        3. 将 `.tmp` 原子改名为正式 `checkpoint.pt`。
+        3. 将临时对象原子改名为正式 `checkpoint.pt`。
         """
         self.sync_status = "backing_up"
         ok = True
@@ -313,8 +466,9 @@ class ColabRelayContext:
             ckpt_name = os.path.basename(self.checkpoint_path)
             stem, ext = os.path.splitext(ckpt_name)
             prev_name = f"{stem}_prev{ext or '.pt'}"
+            iso_tag = _session_isolation_tag()
             remote_ckpt = f"{self.gdrive_dir}/{ckpt_name}"
-            remote_tmp = f"{self.gdrive_dir}/.{ckpt_name}.uploading"
+            remote_tmp = f"{self.gdrive_dir}/.{iso_tag}.{ckpt_name}.uploading"
             remote_prev = f"{self.gdrive_dir}/{prev_name}"
 
             up_ok = self._run_rclone(["copyto", "--", self.checkpoint_path, remote_tmp], timeout=300)
@@ -723,6 +877,15 @@ def make_hf_trainer_callback(relay_ctx: ColabRelayContext):
                 current_step=state.global_step,
                 total_steps=state.max_steps,
             )
+            if relay_ctx.smoke_test and relay_ctx.smoke_pass == 1 and epoch >= 1:
+                self._handover_pending = True
+                control.should_save = True
+                control.should_training_stop = True
+                return control
+            if relay_ctx.smoke_test and relay_ctx.smoke_pass == 2 and epoch >= 2:
+                control.should_save = True
+                control.should_training_stop = True
+                return control
             if (time.time() - relay_ctx.start_time) >= relay_ctx.max_session_seconds:
                 self._handover_pending = True
                 control.should_save = True
@@ -732,9 +895,11 @@ def make_hf_trainer_callback(relay_ctx: ColabRelayContext):
         def on_save(self, args, state, control, **kwargs):
             epoch = int(round(state.epoch or 0))
             loss = self._latest_loss(state)
-            out_dir = getattr(args, "output_dir", None)
+            out_dir = getattr(args, "output_dir", None) or relay_ctx.hf_checkpoints_dir
             sync_ok = True
             if out_dir and os.path.isdir(out_dir):
+                relay_ctx.hf_checkpoints_dir = out_dir
+                relay_ctx.find_latest_hf_checkpoint(out_dir)
                 sync_ok = relay_ctx._run_rclone(
                     ["copy", "--", out_dir, f"{relay_ctx.gdrive_dir}/hf_checkpoints"],
                     timeout=600,
@@ -769,6 +934,15 @@ def make_hf_trainer_callback(relay_ctx: ColabRelayContext):
 
         def on_train_end(self, args, state, control, **kwargs):
             if not self._handover_pending:
+                out_dir = getattr(args, "output_dir", None) or relay_ctx.hf_checkpoints_dir
+                if out_dir and os.path.isdir(out_dir):
+                    relay_ctx.hf_checkpoints_dir = out_dir
+                    relay_ctx.find_latest_hf_checkpoint(out_dir)
+                    if not relay_ctx._run_rclone(
+                        ["copy", "--", out_dir, f"{relay_ctx.gdrive_dir}/hf_checkpoints"],
+                        timeout=600,
+                    ):
+                        raise RuntimeError("HuggingFace 最终检查点同步至 Google Drive 失败")
                 relay_ctx.finish_training(final_epoch=int(round(state.epoch or relay_ctx.total_epochs)))
 
     return _HFRelayCallback()

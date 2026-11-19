@@ -43,6 +43,8 @@ META_PREFIX = "__PILOT_META__:"
 _METRICS_CACHE: Dict[Tuple[str, str], Tuple[Dict[str, Any], float]] = {}
 _METRICS_LOCK = threading.Lock()
 _ACTIVE_STREAMS = 0
+_ACTIVE_BY_SESSION: Dict[str, int] = {}
+_ACTIVE_BY_SLOT: Dict[str, int] = {}
 _ACTIVE_LOCK = threading.Lock()
 
 # 保活线程刷新得到的代理令牌仅保存在内存中（endpoint -> (url, token)），
@@ -190,6 +192,46 @@ def _apply_token_override(sess: Dict[str, Any], session_name: str) -> Dict[str, 
     return out
 
 
+def get_active_gateway_counts(
+    session_name: Optional[str] = None,
+    slot: Optional[str] = None,
+) -> Dict[str, Any]:
+    with _ACTIVE_LOCK:
+        by_sess = {k: v for k, v in _ACTIVE_BY_SESSION.items() if v > 0}
+        by_slot = {k: v for k, v in _ACTIVE_BY_SLOT.items() if v > 0}
+        sess_cnt = by_sess.get(session_name or "", 0) if session_name else 0
+        slot_cnt = by_slot.get((slot or "").lower(), 0) if slot else 0
+        return {
+            "total": _ACTIVE_STREAMS,
+            "session_active": sess_cnt,
+            "slot_active": slot_cnt,
+            "by_session": by_sess,
+            "by_slot": by_slot,
+        }
+
+
+def _resolve_slot_name_from_state(st: Dict[str, Any], slot: str, prefix: str) -> str:
+    """优先从 `slots[slot].session_name`、`{slot}_session`、`active_session`/`standby_session` 读取真实会话名，最后回退 `{prefix}-{slot}`。"""
+    slot_norm = (slot or "blue").strip().lower()
+    slots = st.get("slots")
+    if isinstance(slots, dict) and isinstance(slots.get(slot_norm), dict):
+        sn = str(slots[slot_norm].get("session_name") or "").strip()
+        if sn:
+            return sn
+    direct = st.get(f"{slot_norm}_session")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    if str(st.get("active_slot") or "").lower() == slot_norm:
+        act = st.get("active_session")
+        if isinstance(act, str) and act.strip():
+            return act.strip()
+    if str(st.get("standby_slot") or "").lower() == slot_norm:
+        stb = st.get("standby_session")
+        if isinstance(stb, str) and stb.strip():
+            return stb.strip()
+    return prefix if slot_norm == "standalone" else f"{prefix}-{slot_norm}"
+
+
 def resolve_slot_session(
     forced_slot: Optional[str] = None,
     forced_vm: Optional[str] = None,
@@ -215,9 +257,17 @@ def resolve_slot_session(
     slot = (forced_slot or st.get("active_slot") or "blue").lower()
 
     if forced_slot:
-        sess_name = f"{prefix}-{slot}"
-        sess = sessions.get(sess_name)
-        resolved_name = sess_name
+        preferred_name = _resolve_slot_name_from_state(st, slot, prefix)
+        fallback_name = f"{prefix}-{slot}"
+        cand_names = [preferred_name] + ([fallback_name] if fallback_name != preferred_name else [])
+        sess = None
+        resolved_name = preferred_name
+        for cand_name in cand_names:
+            cand_sess = sessions.get(cand_name)
+            if isinstance(cand_sess, dict):
+                sess = cand_sess
+                resolved_name = cand_name
+                break
         if not isinstance(sess, dict):
             for cand_vm, cand_meta in vms_cfg.items():
                 if (
@@ -234,18 +284,27 @@ def resolve_slot_session(
         return slot, merged_st, _apply_token_override(sess, resolved_name)
 
     active_session = st.get("active_session")
-    sess_name = active_session if (isinstance(active_session, str) and active_session.strip()) else f"{prefix}-{slot}"
+    sess_name = (
+        active_session.strip()
+        if (isinstance(active_session, str) and active_session.strip())
+        else _resolve_slot_name_from_state(st, slot, prefix)
+    )
     sess = sessions.get(sess_name)
     resolved_name = sess_name
     if not isinstance(sess, dict) and sessions:
-        # 仅回退到同前缀蓝/绿会话或已在 llm_api_keys.json 显式注册的大模型会话，绝不误用普通训练会话
+        # 仅回退到同前缀记录的真实槽位名/默认蓝绿名或已在 llm_api_keys.json 显式注册的大模型会话，绝不误用普通训练会话
         for cand_slot in ("blue", "green"):
-            cand_name = f"{prefix}-{cand_slot}"
-            cand_sess = sessions.get(cand_name)
-            if isinstance(cand_sess, dict):
-                sess = cand_sess
-                resolved_name = cand_name
-                slot = cand_slot
+            for cand_name in (
+                _resolve_slot_name_from_state(st, cand_slot, prefix),
+                f"{prefix}-{cand_slot}",
+            ):
+                cand_sess = sessions.get(cand_name)
+                if isinstance(cand_sess, dict):
+                    sess = cand_sess
+                    resolved_name = cand_name
+                    slot = cand_slot
+                    break
+            if isinstance(sess, dict):
                 break
         if not isinstance(sess, dict):
             for cand_vm, cand_meta in vms_cfg.items():
@@ -531,6 +590,8 @@ def make_gateway_handler(forced_slot: Optional[str] = None, forced_vm: Optional[
             effective_phase = raw_phase if sess is not None else ("failed" if raw_phase == "failed" else "offline")
             stale_state = bool(st and raw_phase == "serving" and sess is None)
 
+            gw_counts = get_active_gateway_counts(session_name=session_name, slot=slot)
+
             if self.path.startswith("/pilot/gateway"):
                 self._send_json(
                     200,
@@ -551,6 +612,10 @@ def make_gateway_handler(forced_slot: Optional[str] = None, forced_vm: Optional[
                         "model_name": st.get("model_name") if sess is not None or raw_phase == "failed" else None,
                         "engine": st.get("engine"),
                         "gpu": st.get("gpu"),
+                        "active_streams": gw_counts["total"],
+                        "active_requests": gw_counts["total"],
+                        "active_requests_by_session": gw_counts["by_session"],
+                        "active_requests_by_slot": gw_counts["by_slot"],
                     },
                 )
                 return
@@ -562,6 +627,8 @@ def make_gateway_handler(forced_slot: Optional[str] = None, forced_vm: Optional[
                     if (remote_st and sess is not None)
                     else (sess is not None)
                 )
+                rem_streams = int((remote_st or {}).get("active_streams") or 0)
+                rem_reqs = int((remote_st or {}).get("active_requests") or rem_streams)
                 self._send_json(
                     200 if healthy else 503,
                     {
@@ -576,7 +643,8 @@ def make_gateway_handler(forced_slot: Optional[str] = None, forced_vm: Optional[
                         "engine": (remote_st or {}).get("engine", st.get("engine", "llama.cpp")),
                         "model_name": (remote_st or {}).get("model_name", st.get("model_name", "")),
                         "instant_tps": (remote_st or {}).get("instant_tps", 0.0),
-                        "active_streams": (remote_st or {}).get("active_streams", 0),
+                        "active_streams": max(rem_streams, gw_counts["session_active"]),
+                        "active_requests": max(rem_reqs, gw_counts["session_active"]),
                     },
                 )
                 return
@@ -679,9 +747,18 @@ def make_gateway_handler(forced_slot: Optional[str] = None, forced_vm: Optional[
             req_b64 = base64.b64encode(raw_body).decode("ascii")
             remote_code = build_remote_proxy_code(remote_port, req_path, req_b64)
 
+            tracked_session = str(
+                sess.get("session_name")
+                or effective_vm
+                or _resolve_slot_name_from_state(st, slot, (st.get("session_prefix") or "llm").strip() or "llm")
+            )
+            tracked_slot = str(slot or "blue").lower()
+
             global _ACTIVE_STREAMS
             with _ACTIVE_LOCK:
                 _ACTIVE_STREAMS += 1
+                _ACTIVE_BY_SESSION[tracked_session] = _ACTIVE_BY_SESSION.get(tracked_session, 0) + 1
+                _ACTIVE_BY_SLOT[tracked_slot] = _ACTIVE_BY_SLOT.get(tracked_slot, 0) + 1
             try:
                 from colab_cli.runtime import ColabRuntime
 
@@ -919,6 +996,16 @@ def make_gateway_handler(forced_slot: Optional[str] = None, forced_vm: Optional[
             finally:
                 with _ACTIVE_LOCK:
                     _ACTIVE_STREAMS = max(0, _ACTIVE_STREAMS - 1)
+                    rem_sess = max(0, _ACTIVE_BY_SESSION.get(tracked_session, 0) - 1)
+                    if rem_sess > 0:
+                        _ACTIVE_BY_SESSION[tracked_session] = rem_sess
+                    else:
+                        _ACTIVE_BY_SESSION.pop(tracked_session, None)
+                    rem_slot = max(0, _ACTIVE_BY_SLOT.get(tracked_slot, 0) - 1)
+                    if rem_slot > 0:
+                        _ACTIVE_BY_SLOT[tracked_slot] = rem_slot
+                    else:
+                        _ACTIVE_BY_SLOT.pop(tracked_slot, None)
 
     return GatewayHandler
 

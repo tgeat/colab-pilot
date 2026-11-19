@@ -88,7 +88,34 @@ relay.finish_training(final_epoch=relay.total_epochs, final_loss=loss, metrics=m
 ```
 
 #### Pattern B: High-Level Frameworks (HuggingFace `Trainer` / Lightning / YOLO)
-Attach `make_hf_trainer_callback(relay)` without modifying framework internals.
+Attach `make_hf_trainer_callback(relay)` and pass `relay.resolve_hf_resume_checkpoint(...)` to `trainer.train(...)` so Round 1's `hf_checkpoints/checkpoint-*/trainer_state.json` is automatically synced and resumed on Round 2+:
+
+```python
+from transformers import Trainer, TrainingArguments
+from colab_relay_adapter import ColabRelayContext, make_hf_trainer_callback
+
+relay = ColabRelayContext(
+    model_name="qwen-lora-sft",
+    framework="huggingface",
+    total_epochs=int(os.environ.get("TOTAL_EPOCHS", "10")),
+    hf_checkpoints_dir="./hf_checkpoints",
+)
+relay.prepare_cloud_workspace()
+resume_ckpt = relay.resolve_hf_resume_checkpoint("./hf_checkpoints")
+
+training_args = TrainingArguments(
+    output_dir="./hf_checkpoints",
+    num_train_epochs=relay.total_epochs,
+    save_strategy="epoch",
+)
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    callbacks=[make_hf_trainer_callback(relay)],
+)
+trainer.train(resume_from_checkpoint=resume_ckpt)
+```
 
 #### Pattern C: Black-Box Third-Party CLI Project
 Use `colab_relay_adapter.py --wrap "<train_cmd>"` to wrap any unmodified repository.

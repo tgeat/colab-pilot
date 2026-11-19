@@ -3,7 +3,7 @@ import { CheckCircle2, Loader2, PowerOff, ShieldAlert, ShieldCheck } from "lucid
 import { ColabIcon, Modal, KV } from "./ui";
 import { errText } from "../api";
 import type { TerminateReceipt, VmView } from "../types";
-import { num } from "../format";
+import { formatBurnRate, num } from "../format";
 
 type Stage = "confirm" | "running" | "done";
 
@@ -41,7 +41,14 @@ export function DeleteVmDialog(props: {
     setStage("done");
   };
 
-  const ok = receipt?.verified_unassigned;
+  const ok = receipt?.verified_unassigned === true;
+  const hasRemaining = Boolean(
+    receipt &&
+      (!receipt.verified_unassigned ||
+        receipt.remaining_endpoints.length > 0 ||
+        (receipt.ccu?.assignments_count ?? 0) > 0),
+  );
+  const burnRate = formatBurnRate(receipt?.ccu, hasRemaining);
 
   return (
     <Modal
@@ -71,27 +78,27 @@ export function DeleteVmDialog(props: {
       footer={
         stage === "confirm" ? (
           <>
-            <button className="btn" onClick={props.onClose}>
+            <button type="button" className="btn" onClick={props.onClose}>
               取消
             </button>
-            <button className="btn btn-danger" onClick={run}>
+            <button type="button" className="btn btn-danger" onClick={run}>
               <PowerOff size={15} />
               立即关机并停止计费
             </button>
           </>
         ) : stage === "running" ? (
-          <button className="btn" disabled>
+          <button type="button" className="btn" disabled>
             <Loader2 size={15} className="spin" />
             正在关机并核验计费状态…
           </button>
         ) : (
           <>
             {!ok && (
-              <button className="btn btn-danger" onClick={run}>
+              <button type="button" className="btn btn-danger" onClick={run}>
                 重试关机
               </button>
             )}
-            <button className="btn btn-primary" onClick={props.onClose}>
+            <button type="button" className="btn btn-primary" onClick={props.onClose}>
               完成
             </button>
           </>
@@ -150,6 +157,14 @@ export function DeleteVmDialog(props: {
                   ? "服务端二次核验通过：该实例已从 Google Colab 计费列表中彻底移除。"
                   : receipt.error ?? "服务端仍存在该实例，请点击重试关机"}
               </div>
+              {receipt.remaining_endpoints.length > 0 && !ok && (
+                <div className="banner banner-warn" style={{ margin: 0 }}>
+                  <div>
+                    <b>未释放端点：</b>
+                    <span className="mono">{receipt.remaining_endpoints.join(", ")}</span>
+                  </div>
+                </div>
+              )}
               <div className="receipt-grid">
                 <KV
                   label="剩余计费实例"
@@ -158,9 +173,9 @@ export function DeleteVmDialog(props: {
                 />
                 <KV
                   label="当前计费速率"
-                  value={`${num(receipt.ccu?.burn_rate_hourly).toFixed(2)} CU/h`}
+                  value={burnRate.text}
                   mono
-                  cls={(receipt.ccu?.burn_rate_hourly ?? 0) > 0 ? "warn" : "ok"}
+                  cls={burnRate.cls}
                 />
                 <KV
                   label="账户余额"

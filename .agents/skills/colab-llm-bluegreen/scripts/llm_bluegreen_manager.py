@@ -78,8 +78,6 @@ def validate_hardware_engine_compatibility(
             f"请改选 T4 / L4 / G4 / A100 / H100。"
         )
     if eng == "transformers":
-        if acc == "CPU" and allow_cpu_llama_cpp:
-            return None
         return (
             f"硬件与推理引擎预设不兼容：当前所选硬件为 [{hw_desc}]（非 NVIDIA GPU），"
             f"默认 `transformers` 预设依赖 CUDA (`device_map='cuda'`)。请改选 T4 / L4 / G4 / A100 / H100。"

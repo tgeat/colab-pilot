@@ -551,6 +551,45 @@ def check_remote_active_lock(
     return True, ""
 
 
+def _find_latest_valid_hf_checkpoint_dir(hf_root: str) -> Optional[str]:
+    """在本地 `hf_checkpoints` 目录中查找最新且含非空合法 `trainer_state.json` 的 `checkpoint-*` 子目录。"""
+    if not hf_root or not os.path.isdir(hf_root):
+        return None
+    candidates: List[Tuple[int, str]] = []
+    for entry in os.listdir(hf_root):
+        m = re.match(r"^checkpoint-(\d+)$", entry)
+        if not m:
+            continue
+        sub = os.path.join(hf_root, entry)
+        ts_path = os.path.join(sub, "trainer_state.json")
+        if not os.path.isdir(sub) or not os.path.isfile(ts_path) or os.path.getsize(ts_path) <= 0:
+            continue
+        dir_step = int(m.group(1))
+        try:
+            with open(ts_path, "r", encoding="utf-8") as f:
+                parsed = json.load(f)
+            if not isinstance(parsed, dict):
+                continue
+            step = max(dir_step, int(parsed.get("global_step", dir_step)))
+        except Exception:
+            continue
+        candidates.append((step, os.path.abspath(sub)))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def find_valid_local_final_weights(workspace_abs: str, ckpt_basename: str) -> Optional[str]:
+    """检查本地工作区是否已具备非空最终权重（支持标准 `{stem}_final.pt` 或 HuggingFace `hf_checkpoints/checkpoint-*`）。"""
+    stem, ext = os.path.splitext(ckpt_basename)
+    local_ckpt = os.path.join(workspace_abs, f"{stem}_final{ext or '.pt'}")
+    if os.path.isfile(local_ckpt) and os.path.getsize(local_ckpt) > 0:
+        return local_ckpt
+    local_hf_dir = os.path.join(workspace_abs, "hf_checkpoints")
+    return _find_latest_valid_hf_checkpoint_dir(local_hf_dir)
+
+
 def download_and_verify_final_weights(
     rclone_bin: str,
     rclone_conf: str,
@@ -559,11 +598,15 @@ def download_and_verify_final_weights(
     workspace_abs: str,
 ) -> Tuple[bool, str, str]:
     """
-    将云盘最终权重下载到本地工作区并严格校验文件存在且非空（Issue #53）。
-    返回 `(ok, local_ckpt_path, error_message)`。
+    将云盘最终权重下载到本地工作区并严格校验文件存在且非空（Issue #47 + #53）：
+    1. 优先拉取 `${gdrive_dir}/${ckpt_basename}` 并校验本地非空；
+    2. 若经 `rclone lsf` 明确确认远端不存在 `${ckpt_basename}`（排除网络/鉴权错误）且远端存在 `hf_checkpoints/`，
+       回退拉取 `${gdrive_dir}/hf_checkpoints` 至 `${workspace_abs}/hf_checkpoints`，并校验存在非空有效 `checkpoint-*/trainer_state.json`；
+    3. 任一拉取失败、网络/鉴权报错或两者均缺失，严格返回 `(False, ..., error_message)`。
     """
     stem, ext = os.path.splitext(ckpt_basename)
     local_ckpt = os.path.join(workspace_abs, f"{stem}_final{ext or '.pt'}")
+    local_hf_dir = os.path.join(workspace_abs, "hf_checkpoints")
     local_results = os.path.join(workspace_abs, "results")
     os.makedirs(local_results, exist_ok=True)
 
@@ -578,25 +621,55 @@ def download_and_verify_final_weights(
         base_rclone.extend(["--config", rclone_conf])
     base_rclone.extend(["--retries=5", "--low-level-retries=20"])
 
+    remote_root = gdrive_dir.rstrip("/")
     rc1 = run_cmd(
-        base_rclone + ["copyto", "--", f"{gdrive_dir.rstrip('/')}/{ckpt_basename}", local_ckpt],
+        base_rclone + ["copyto", "--", f"{remote_root}/{ckpt_basename}", local_ckpt],
         timeout=300,
     )
     rc2 = run_cmd(
-        base_rclone + ["copy", "--", f"{gdrive_dir.rstrip('/')}/results", local_results],
+        base_rclone + ["copy", "--", f"{remote_root}/results", local_results],
         timeout=300,
     )
     if rc2.returncode != 0:
         print(f"⚠️ 拉取 results 目录警告: {(rc2.stderr or '').strip()[:240]}", flush=True)
 
+    if rc1.returncode == 0 and os.path.isfile(local_ckpt) and os.path.getsize(local_ckpt) > 0:
+        return True, local_ckpt, ""
+
+    # 若主断点未拉取成功，进一步通过 `rclone lsf`（含目录条目）区分“远端无此文件但有 hf_checkpoints”与“网络/鉴权/拉取错误”
+    res_lsf = run_cmd(base_rclone + ["lsf", "--", remote_root], timeout=90)
+    if res_lsf.returncode == 0:
+        entries = {ln.strip() for ln in (res_lsf.stdout or "").splitlines() if ln.strip()}
+        ckpt_present_remotely = ckpt_basename in entries
+        hf_present_remotely = "hf_checkpoints/" in entries or "hf_checkpoints" in entries
+
+        if not ckpt_present_remotely and hf_present_remotely:
+            os.makedirs(local_hf_dir, exist_ok=True)
+            rc_hf = run_cmd(
+                base_rclone + ["copy", "--", f"{remote_root}/hf_checkpoints", local_hf_dir],
+                timeout=600,
+            )
+            if rc_hf.returncode != 0:
+                hf_err = strip_ansi((rc_hf.stderr or "") + "\n" + (rc_hf.stdout or "")).strip()[:240]
+                return (
+                    False,
+                    local_hf_dir,
+                    f"rclone 下载 hf_checkpoints 最终权重失败 ({rc_hf.returncode}): {hf_err or '未知错误'}",
+                )
+            best_hf = _find_latest_valid_hf_checkpoint_dir(local_hf_dir)
+            if not best_hf:
+                return (
+                    False,
+                    local_hf_dir,
+                    f"已拉取 hf_checkpoints，但本地未找到非空有效的 checkpoint-*/trainer_state.json: {local_hf_dir}",
+                )
+            return True, best_hf, ""
+
     if rc1.returncode != 0:
         err_detail = strip_ansi((rc1.stderr or "") + "\n" + (rc1.stdout or "")).strip()[:240]
         return False, local_ckpt, f"rclone 下载最终权重返回非零退出码 ({rc1.returncode}): {err_detail or '未知错误'}"
 
-    if not os.path.isfile(local_ckpt) or os.path.getsize(local_ckpt) <= 0:
-        return False, local_ckpt, f"本地最终权重文件不存在或大小为 0 字节: {local_ckpt}"
-
-    return True, local_ckpt, ""
+    return False, local_ckpt, f"本地最终权重文件不存在或大小为 0 字节: {local_ckpt}"
 
 
 def write_local_relay_receipt(
@@ -772,10 +845,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             if (effective_round > 1 or not args.reset_done_flag) and gdrive_has_done_flag(
                 rclone_bin, rclone_conf, effective_gdrive_dir
             ):
-                if os.path.isfile(local_final_ckpt) and os.path.getsize(local_final_ckpt) > 0:
-                    write_local_relay_receipt(workspace_abs, True, True, local_final_ckpt, None)
+                ready_local_weights = find_valid_local_final_weights(workspace_abs, ckpt_basename)
+                if ready_local_weights:
+                    write_local_relay_receipt(workspace_abs, True, True, ready_local_weights, None)
                     print(
-                        f"🎉 检测到 Google Drive 已存在完成标记，且本地最终模型权重已就绪 ({local_final_ckpt})！",
+                        f"🎉 检测到 Google Drive 已存在完成标记，且本地最终模型权重已就绪 ({ready_local_weights})！",
                         flush=True,
                     )
                     return 0

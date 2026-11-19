@@ -2355,11 +2355,137 @@ class IssueRegressionTests(unittest.TestCase):
                         self.assertEqual(cli_calls, [])
                         self.assertIn("不兼容", err_buf.getvalue())
 
-            # Explicit --llama-cpp-cpu on CPU and NVIDIA GPUs with vllm/llama.cpp pass validation
+            # Explicit --llama-cpp-cpu ONLY exempts llama.cpp on CPU (NEVER transformers or vllm)
             self.assertIsNone(manager_mod.validate_hardware_engine_compatibility("CPU", "llama.cpp", allow_cpu_llama_cpp=True))
+            self.assertIsNotNone(manager_mod.validate_hardware_engine_compatibility("CPU", "transformers", allow_cpu_llama_cpp=True))
+            self.assertIsNotNone(manager_mod.validate_hardware_engine_compatibility("CPU", "vllm", allow_cpu_llama_cpp=True))
+            args_tf_cpu = parser.parse_args(
+                [
+                    "deploy",
+                    "--session-name",
+                    "bad-tf-cpu",
+                    "--slot",
+                    "standalone",
+                    "--workspace",
+                    ws_dir,
+                    "--gpu",
+                    "CPU",
+                    "--engine",
+                    "transformers",
+                    "--llama-cpp-cpu",
+                    "--model-name",
+                    "Qwen-7B",
+                ]
+            )
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(manager_mod, "api_keys_path", return_value=keys_file),
+                mock.patch.object(manager_mod, "run_cmd", side_effect=fail_if_called),
+                mock.patch.object(sys, "stderr", io.StringIO()),
+            ):
+                self.assertEqual(manager_mod.cmd_deploy(args_tf_cpu), 1)
+            self.assertEqual(cli_calls, [])
+
             self.assertIsNone(manager_mod.validate_hardware_engine_compatibility("CPU", "builtin"))
             self.assertIsNone(manager_mod.validate_hardware_engine_compatibility("G4", "vllm"))
             self.assertIsNone(manager_mod.validate_hardware_engine_compatibility("T4", "llama.cpp"))
+
+    def test_issue_47_53_hf_trainer_final_download_fallback_and_rerun_verification(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws_dir = os.path.join(td, "ws_hf")
+            os.makedirs(ws_dir, exist_ok=True)
+            Path(ws_dir, "train.py").write_text("print('hf')\n", encoding="utf-8")
+            rclone_conf = os.path.join(td, "rclone.conf")
+            Path(rclone_conf).write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+            locks_file = os.path.join(td, "locks.json")
+
+            remote_hf = os.path.join(td, "remote_hf_checkpoints")
+            os.makedirs(os.path.join(remote_hf, "checkpoint-20"), exist_ok=True)
+            Path(remote_hf, "checkpoint-20", "trainer_state.json").write_text(
+                json.dumps({"global_step": 20, "epoch": 2.0}), encoding="utf-8"
+            )
+
+            mode = {"lsf_err": False, "hf_copy_ok": True, "done": False}
+            new_vm_calls = {"n": 0}
+            hf_copy_calls = {"n": 0}
+
+            def fake_run(cmd, timeout=300, stdin_text=None):
+                prog = os.path.basename(cmd[0]).lower()
+                if "rclone" in prog:
+                    if "lsf" in cmd:
+                        if mode["lsf_err"] and "--files-only" not in cmd:
+                            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="googleapi: Error 401: Invalid Credentials")
+                        if "--files-only" in cmd:
+                            out = "training_done.flag\n" if mode["done"] else ""
+                            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+                        out = "training_done.flag\nhf_checkpoints/\n" if mode["done"] else ""
+                        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+                    if "copyto" in cmd:
+                        # HF Trainer never produces checkpoint.pt on Drive
+                        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="file not found")
+                    if "copy" in cmd and cmd[-2].endswith("/hf_checkpoints"):
+                        hf_copy_calls["n"] += 1
+                        if not mode["hf_copy_ok"]:
+                            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="rclone hf copy failed")
+                        shutil.copytree(remote_hf, cmd[-1], dirs_exist_ok=True)
+                        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+                sub = cmd[1]
+                if sub == "new":
+                    new_vm_calls["n"] += 1
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Session READY", stderr="")
+                if sub == "exec":
+                    mode["done"] = True
+                    return subprocess.CompletedProcess(cmd, 0, stdout="TRAINING_COMPLETED\nTRAIN_EXIT_CODE=0\n", stderr="")
+                if sub == "status":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No active session")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            # 1) When rclone lsf fails with auth/network error (cannot confirm checkpoint.pt absent), MUST return 1
+            mode["lsf_err"] = True
+            with (
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_run),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(runner_mod.main(["--session", "hf-job", "--workspace", ws_dir]), 1)
+
+            # 2) When remote has training_done.flag + hf_checkpoints/ (no checkpoint.pt), re-run backfills hf_checkpoints and exits 0
+            mode["lsf_err"] = False
+            mode["hf_copy_ok"] = True
+            with (
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_run),
+                redirect_stdout(io.StringIO()),
+            ):
+                rc_backfill = runner_mod.main(["--session", "hf-job", "--workspace", ws_dir])
+
+            self.assertEqual(rc_backfill, 0)
+            self.assertEqual(new_vm_calls["n"], 1, "Backfill re-run must not allocate a second VM")
+            self.assertEqual(hf_copy_calls["n"], 1)
+            local_ts = os.path.join(ws_dir, "hf_checkpoints", "checkpoint-20", "trainer_state.json")
+            self.assertTrue(os.path.isfile(local_ts))
+            receipt = json.loads(Path(ws_dir, ".colab_dl_relay_status.json").read_text(encoding="utf-8"))
+            self.assertTrue(receipt["weights_downloaded"])
+            self.assertTrue(receipt["local_weights_path"].endswith("checkpoint-20"))
+
+            # 3) Subsequent re-run sees local hf_checkpoints/checkpoint-20 ready -> skips download and returns 0 immediately
+            with (
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_run),
+                redirect_stdout(io.StringIO()),
+            ):
+                rc_cached = runner_mod.main(["--session", "hf-job", "--workspace", ws_dir])
+
+            self.assertEqual(rc_cached, 0)
+            self.assertEqual(hf_copy_calls["n"], 1, "Local hf_checkpoints already valid; should not re-download")
 
 
 if __name__ == "__main__":

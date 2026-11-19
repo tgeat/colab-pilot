@@ -16,15 +16,23 @@ import {
 } from "lucide-react";
 import { api, errText } from "./api";
 import type {
+  CloseRequestedRelayPayload,
   CreateVmLlmConfig,
   CreateVmRequest,
   LlmBlueGreenState,
   Overview,
   RelayConfig,
+  StopRelayResult,
   VmView,
 } from "./types";
-import { num, numOrNull, str } from "./format";
-import { isLlmVmReady, resolveBlueGreenStatus, resolveEffectiveHighMem } from "./chatUtils";
+import { fmtSnapshotTime, formatRealtimeTps, num, numOrNull, str } from "./format";
+import {
+  buildPresetFromRecentSession,
+  isLlmVmReady,
+  resolveBlueGreenStatus,
+  resolveEffectiveHighMem,
+  resolveVmSlot,
+} from "./chatUtils";
 import {
   CreateVmDialog,
   DEFAULT_LLM_ENGINE,
@@ -36,7 +44,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Header } from "./components/Header";
 import { LlmChatModal } from "./components/LlmChatModal";
 import { ScriptDialog } from "./components/ScriptDialog";
-import { StopRelayDialog } from "./components/StopRelayDialog";
+import { CloseAppRelayDialog, StopRelayDialog } from "./components/StopRelayDialog";
 import { VmCard } from "./components/VmCard";
 import { ColabIcon, ToastProvider, useToast } from "./components/ui";
 
@@ -112,9 +120,21 @@ function LlmBlueGreenBanner({
         ? "warming"
         : "standby";
     const role = str(llm?.role, defaultRole).toLowerCase();
-    const tps = llm ? num(llm.instant_tps) || num(llm.last_request_tps) : 0;
+    // #65：严格区分实时输出速率与上次请求速率，空闲时保持 0.0 tok/s
+    const tpsView = formatRealtimeTps({
+      instantTps: llm?.instant_tps,
+      lastRequestTps: llm?.last_request_tps,
+      peakTps: llm?.peak_tps,
+      activeStreams: llm?.active_streams,
+    });
     const avgTps = num(llm?.avg_tps_60s);
     const ttft = numOrNull(llm?.ttft_ms) ?? numOrNull(llm?.avg_ttft_ms);
+    const slotModel =
+      str(llm?.model_name) ||
+      vm?.llm_api?.model_name ||
+      str(bg?.slots?.[slot]?.model_name) ||
+      str(bg?.model_name) ||
+      "LLM";
 
     return (
       <div className={`bg-slot-card slot-${slot} ${isOnline && role === "active" ? "is-active" : ""}`}>
@@ -181,10 +201,16 @@ function LlmBlueGreenBanner({
           <>
             <div className="bg-slot-metrics">
               <div>
-                <div className="bg-m-label">实时</div>
+                <div className="bg-m-label">实时速率</div>
                 <div className="bg-m-val">
-                  {tps.toFixed(1)} <small>tok/s</small>
+                  {tpsView.realtimeTps.toFixed(1)}{" "}
+                  <small>tok/s{tpsView.isIdle ? " (空闲)" : ""}</small>
                 </div>
+                {tpsView.isIdle && tpsView.lastRequestText && (
+                  <div className="dim mono" style={{ fontSize: 10.5, marginTop: 1 }}>
+                    {tpsView.lastRequestText}
+                  </div>
+                )}
               </div>
               <div>
                 <div className="bg-m-label">60s 均值</div>
@@ -206,7 +232,7 @@ function LlmBlueGreenBanner({
                 <b>{vm.name}</b> · {vm.accelerator}
                 {vm.llm_api ? ` · :${vm.llm_api.local_port}` : ""}
               </span>
-              <code>{str(llm?.model_name) || vm.llm_api?.model_name || str(bg?.model_name) || "LLM"}</code>
+              <code>{slotModel}</code>
             </div>
           </>
         ) : (
@@ -224,7 +250,7 @@ function LlmBlueGreenBanner({
         : "pill pill-gray";
   const pillLabel =
     clusterState === "online"
-      ? `${activeSlot.toUpperCase()} 在线`
+      ? `${activeSlot.toUpperCase()} 在线${activeVm ? ` (${activeVm.name})` : ""}`
       : clusterState === "starting"
         ? `${activeSlot.toUpperCase()} 启动中`
         : "集群离线";
@@ -302,26 +328,47 @@ function Dashboard() {
   const [chatTarget, setChatTarget] = useState<string | null>(null);
   const [shutdownVm, setShutdownVm] = useState<VmView | null>(null);
   const [stopRelayVm, setStopRelayVm] = useState<VmView | null>(null);
-  const [scriptOpen, setScriptOpen] = useState(false);
+  const [scriptTarget, setScriptTarget] = useState<{
+    open: boolean;
+    workspacePath: string | null;
+    vmName: string | null;
+  }>({ open: false, workspacePath: null, vmName: null });
   const [createOpen, setCreateOpen] = useState(false);
   const [createPreset, setCreatePreset] = useState<CreateVmPreset | null>(null);
+  const [closeRelayVms, setCloseRelayVms] = useState<string[] | null>(null);
   const didInitRef = useRef(false);
 
   const applyOverview = useCallback((next: Overview) => {
     if (!next) return;
-    setOv((prev) => (!prev || next.timestamp >= prev.timestamp ? next : prev));
+    setOv((prev) => {
+      if (!prev) return next;
+      const prevSnap = prev.last_ok_timestamp ?? prev.timestamp;
+      const nextSnap = next.last_ok_timestamp ?? next.timestamp;
+      return nextSnap >= prevSnap || Boolean(next.is_stale) ? next : prev;
+    });
   }, []);
 
-  const refresh = useCallback(async () => {
-    setRefreshing(true);
-    try {
-      applyOverview(await api.refreshNow());
-    } catch (e) {
-      toast(errText(e), "error");
-    } finally {
-      setRefreshing(false);
-    }
-  }, [applyOverview, toast]);
+  const refresh = useCallback(
+    async (manual = false) => {
+      setRefreshing(true);
+      try {
+        const next = await api.refreshNow();
+        applyOverview(next);
+        // #57：手动点击刷新但服务端查询失败命中缓存时，弹出明确告警 Toast，不伪装为成功新数据
+        if (manual && (next?.is_stale || next?.stale_reason)) {
+          toast(
+            `最新查询失败：${next.stale_reason || next.error || "连接异常"}（当前显示上次成功同步的缓存数据）`,
+            "warn",
+          );
+        }
+      } catch (e) {
+        toast(`刷新查询失败：${errText(e)}`, "error");
+      } finally {
+        setRefreshing(false);
+      }
+    },
+    [applyOverview, toast],
+  );
 
   useEffect(() => {
     let disposed = false;
@@ -334,10 +381,10 @@ function Dashboard() {
 
     if (!didInitRef.current) {
       didInitRef.current = true;
-      refresh();
+      refresh(false);
     }
 
-    const unPromise = listen<Overview>("overview", (e) => {
+    const unOverviewPromise = listen<Overview>("overview", (e) => {
       if (!disposed && e.payload) applyOverview(e.payload);
     })
       .then((fn) => {
@@ -349,9 +396,28 @@ function Dashboard() {
       })
       .catch(() => null);
 
+    // #72：监听后端窗口关闭拦截事件，弹出活跃接力训练保护确认弹窗
+    const unCloseRelayPromise = listen<CloseRequestedRelayPayload>(
+      "close-requested-with-relay",
+      (e) => {
+        if (disposed) return;
+        const names = Array.isArray(e.payload?.active_vms) ? e.payload.active_vms : [];
+        setCloseRelayVms(names);
+      },
+    )
+      .then((fn) => {
+        if (disposed) {
+          fn();
+          return null;
+        }
+        return fn;
+      })
+      .catch(() => null);
+
     return () => {
       disposed = true;
-      unPromise.then((fn) => fn?.());
+      unOverviewPromise.then((fn) => fn?.());
+      unCloseRelayPromise.then((fn) => fn?.());
     };
   }, [applyOverview, refresh]);
 
@@ -370,7 +436,7 @@ function Dashboard() {
       } else {
         toast(`实例 [${createdName}] 已开机分配并自动配置免密 SSH`, "success");
       }
-      await refresh();
+      await refresh(false);
     } catch (e) {
       toast(errText(e), "error");
       throw e;
@@ -381,7 +447,7 @@ function Dashboard() {
     try {
       await api.deployLlmOnVm(name, config);
       toast(`已在实例 [${name}] 启动后台大模型部署，预热完成后自动开放对话与 API`, "info");
-      await refresh();
+      await refresh(false);
     } catch (e) {
       toast(errText(e), "error");
       throw e;
@@ -397,13 +463,17 @@ function Dashboard() {
     }
   };
 
+  // #59：严格校验后端持久化返回有效新 Key 后才提示轮换成功，失败时报错且不污染旧状态
   const handleRotateLlmKey = async (vmName: string, customKey?: string | null) => {
     try {
       const updated = await api.rotateLlmApiKey(vmName, customKey);
+      if (!updated || typeof updated.api_key !== "string" || !updated.api_key.trim()) {
+        throw new Error("API Key 写入校验未返回有效新密钥");
+      }
       toast(`已更新 [${vmName}] 的专属 API Key: ${updated.api_key.slice(0, 14)}…`, "success");
-      await refresh();
+      await refresh(false);
     } catch (e) {
-      toast(errText(e), "error");
+      toast(`轮换 API Key 失败：${errText(e)}`, "error");
     }
   };
 
@@ -411,32 +481,55 @@ function Dashboard() {
     try {
       await api.deployProbe(name);
       toast(`已重新触发 [${name}] 的遥测探针注入`, "info");
-      await refresh();
+      await refresh(false);
     } catch (e) {
       toast(errText(e), "error");
     }
   };
 
-  const handleStartRelay = async (name: string, config: RelayConfig) => {
+  // #42：启动接力时传入该实例绑定的专属工作区路径
+  const handleStartRelay = async (
+    name: string,
+    config: RelayConfig,
+    workspacePath?: string | null,
+  ) => {
     try {
-      await api.startRelay(name, config);
+      const vmObj = (ov?.vms ?? []).find((x) => x.name === name);
+      const effectiveWs = workspacePath ?? vmObj?.workspace?.path ?? null;
+      await api.startRelay(name, config, effectiveWs);
       toast(`已在实例 [${name}] 启动自动接力训练监工`, "success");
-      await refresh();
+      await refresh(false);
     } catch (e) {
       toast(errText(e), "error");
     }
   };
 
-  const handleStopRelay = async (vm: VmView, destroy: boolean) => {
-    const receipt = await api.stopRelay(vm.name, destroy);
-    toast(destroy ? `已关闭 [${vm.name}] 接力并销毁云端实例` : `已停止 [${vm.name}] 接力监工（保留实例）`, "info");
-    await refresh();
-    return receipt;
+  // #40 & #41：不在校验回执前盲目弹出“已销毁”或“已中断”成功提示，交由 StopRelayDialog 按真实核验结果提示
+  const handleStopRelay = async (vm: VmView, destroy: boolean): Promise<StopRelayResult> => {
+    const res = await api.stopRelay(vm.name, destroy);
+    await refresh(false);
+    return res;
+  };
+
+  // #73：清除已结束/已释放的离线接力记录卡片
+  const handleDismissRelay = async (name: string) => {
+    try {
+      await api.dismissRelayStatus(name);
+      toast(`已清除 [${name}] 的离线接力任务记录`, "info");
+      await refresh(false);
+    } catch (e) {
+      toast(errText(e), "error");
+    }
   };
 
   const env = ov?.env;
+  // #73：保留 on_server === false && relay !== null 的离线接力记录卡片，绝不过滤隐藏
   const vms = ov?.vms ?? [];
   const recents = ov?.recent_sessions ?? [];
+  const hasRelayWorkload = vms.some((v) => v.relay !== null || Boolean(v.telemetry?.training));
+  const isStaleOverview = Boolean(ov && (ov.is_stale || ov.stale_reason));
+  const snapshotTs = ov ? (ov.last_ok_timestamp ?? ov.timestamp) : null;
+
   const liveShutdownVm = shutdownVm
     ? vms.find((x) => x.name === shutdownVm.name) ?? shutdownVm
     : null;
@@ -449,28 +542,67 @@ function Dashboard() {
       <Header
         ov={ov}
         refreshing={refreshing}
-        onRefresh={refresh}
+        onRefresh={() => refresh(true)}
         onOpenLlmChat={(target) => setChatTarget(target)}
         onOpenCreateVm={() => openCreateModal(null)}
       />
 
       <main className="main">
-        {ov?.error && (
+        {/* #57：查询失败回退缓存快照时的顶部黄/橙色提示条 */}
+        {ov && isStaleOverview && (
+          <div className="banner banner-warn" role="status" style={{ alignItems: "center" }}>
+            <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+            <div style={{ flex: 1 }}>
+              <div>
+                <b>最新查询失败：</b>
+                <span>{ov.stale_reason || ov.error || "未能连接服务端获取最新实例列表"}</span>
+              </div>
+              <div style={{ fontSize: 12, marginTop: 2 }}>
+                当前显示上次成功同步的缓存数据（快照时间：{fmtSnapshotTime(snapshotTs)}）
+              </div>
+            </div>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => refresh(true)}
+              disabled={refreshing}
+            >
+              重试刷新
+            </button>
+          </div>
+        )}
+
+        {ov?.error && !isStaleOverview && (
           <div className="banner banner-danger">
             <AlertTriangle size={16} />
             {ov.error}
           </div>
         )}
-        {env && (!env.colab_ok || !env.rclone_ok || !env.rclone_conf_ok) && (
-          <div className="banner banner-warn">
-            <AlertTriangle size={16} />
-            <div>
-              {!env.colab_ok && <div>未找到 colab-cli：{env.colab_bin}</div>}
-              {!env.rclone_ok && <div>未找到 rclone：{env.rclone_bin}</div>}
-              {!env.rclone_conf_ok && <div>未检测到 rclone 授权文件：{env.rclone_conf}</div>}
+
+        {/* #75 & #67：引导有效的 `colab auth` / `colab status`，通用无接力场景不强制要求 Google Drive */}
+        {env &&
+          (!env.colab_ok ||
+            !env.token_ok ||
+            (hasRelayWorkload && (!env.rclone_ok || !env.rclone_conf_ok))) && (
+            <div className="banner banner-warn">
+              <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+              <div>
+                {!env.colab_ok && <div>未找到 colab-cli：{env.colab_bin}</div>}
+                {env.colab_ok && !env.token_ok && (
+                  <div>
+                    尚未登录 Colab OAuth：请在终端执行 <code>colab auth</code> 完成授权（可通过{" "}
+                    <code>colab status</code> 检查登录状态）。
+                  </div>
+                )}
+                {hasRelayWorkload && !env.rclone_ok && (
+                  <div>未找到 rclone：{env.rclone_bin}</div>
+                )}
+                {hasRelayWorkload && !env.rclone_conf_ok && (
+                  <div>未检测到 Google Drive rclone 授权文件：{env.rclone_conf}</div>
+                )}
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
         {/* LLM 蓝绿槽位（仅在存在 LLM 部署时显示） */}
         <ErrorBoundary label="llm-bluegreen">
@@ -480,15 +612,26 @@ function Dashboard() {
             onOpenChat={(target) => setChatTarget(target)}
             onShutdown={(vm) => setShutdownVm(vm)}
             onBootSlot={(slot) => {
-              const slotGpu = ov?.llm_bluegreen?.gpu ?? "T4";
+              const bgState = ov?.llm_bluegreen;
+              const slotGpu = bgState?.gpu ?? "T4";
+              const recordedSession =
+                str(bgState?.slots?.[slot]?.session_name).trim() ||
+                (slot === "blue"
+                  ? str(bgState?.blue_session).trim()
+                  : str(bgState?.green_session).trim()) ||
+                `${bgState?.session_prefix ?? "llm"}-${slot}`;
+              const slotModel =
+                str(bgState?.slots?.[slot]?.model_name).trim() ||
+                bgState?.model_name ||
+                DEFAULT_LLM_MODEL;
               openCreateModal({
-                name: `${ov?.llm_bluegreen?.session_prefix ?? "llm"}-${slot}`,
+                name: recordedSession,
                 accelerator: slotGpu,
-                high_mem: resolveEffectiveHighMem(slotGpu, ov?.llm_bluegreen?.high_mem ?? true),
+                high_mem: resolveEffectiveHighMem(slotGpu, bgState?.high_mem ?? true),
                 boot_mode: "llm",
                 llm_slot: slot,
-                llm_model: ov?.llm_bluegreen?.model_name || DEFAULT_LLM_MODEL,
-                llm_engine: ov?.llm_bluegreen?.engine || DEFAULT_LLM_ENGINE,
+                llm_model: slotModel,
+                llm_engine: bgState?.engine || DEFAULT_LLM_ENGINE,
               });
             }}
           />
@@ -521,8 +664,14 @@ function Dashboard() {
               <button
                 type="button"
                 className="btn"
-                onClick={() => setScriptOpen(true)}
-                title="编辑工作区 train.py 与 requirements.txt 接力训练脚本"
+                onClick={() =>
+                  setScriptTarget({
+                    open: true,
+                    workspacePath: env?.workspace ?? null,
+                    vmName: null,
+                  })
+                }
+                title="编辑默认工作区 train.py 与 requirements.txt 接力训练脚本"
               >
                 <FileCode2 size={15} color="var(--text-2)" />
                 <span>配置训练脚本</span>
@@ -535,34 +684,40 @@ function Dashboard() {
               <ErrorBoundary key={vm.name} label={`vm:${vm.name}`}>
                 <VmCard
                   vm={vm}
+                  allVms={vms}
                   onOpenLlmChat={(name) => setChatTarget(name)}
                   onShutdown={(v) => setShutdownVm(v)}
                   onOpenSshTerminal={handleOpenSshTerminal}
                   onRotateLlmKey={handleRotateLlmKey}
                   onRetryProbe={handleRetryProbe}
-                  onDeployLlm={(v) =>
+                  onDeployLlm={(v) => {
+                    const detectedSlot = resolveVmSlot(v, ov?.llm_bluegreen);
                     openCreateModal({
                       target_existing_vm: v.name,
+                      accelerator: v.accelerator,
                       boot_mode: "llm",
-                      llm_slot: v.name.endsWith("-blue")
-                        ? "blue"
-                        : v.name.endsWith("-green")
-                          ? "green"
-                          : "standalone",
+                      llm_slot: detectedSlot ?? "standalone",
                       llm_model: v.llm_api?.model_name || DEFAULT_LLM_MODEL,
                       llm_engine: v.llm_api?.engine || DEFAULT_LLM_ENGINE,
-                    })
-                  }
+                    });
+                  }}
                   onStartRelay={handleStartRelay}
                   onRequestStopRelay={(v) => setStopRelayVm(v)}
-                  onOpenScriptDialog={() => setScriptOpen(true)}
+                  onDismissRelay={handleDismissRelay}
+                  onOpenScriptDialog={(v) =>
+                    setScriptTarget({
+                      open: true,
+                      workspacePath: v.workspace?.path ?? null,
+                      vmName: v.name,
+                    })
+                  }
                 />
               </ErrorBoundary>
             ))}
           </div>
         )}
 
-        {/* 历史会话：默认折叠，支持按原规格一键重新开机 */}
+        {/* 历史会话：默认折叠，支持按保存配置精确恢复（未保存配置时绝不凭名称前缀猜测 #74） */}
         {recents.length > 0 && (
           <details className="history">
             <summary>
@@ -598,17 +753,8 @@ function Dashboard() {
                         <button
                           type="button"
                           className="btn btn-sm"
-                          onClick={() => {
-                            const acc = r.accelerator || "T4";
-                            openCreateModal({
-                              name: r.session_name,
-                              accelerator: acc,
-                              high_mem: resolveEffectiveHighMem(acc, r.machine_shape === "HIGH_RAM"),
-                              boot_mode: r.session_name.startsWith("llm-") ? "llm" : "general",
-                              workspace_path: r.workspace_path ?? undefined,
-                            });
-                          }}
-                          title={`使用原规格 (${r.accelerator}) 重新开机启动 ${r.session_name}`}
+                          onClick={() => openCreateModal(buildPresetFromRecentSession(r))}
+                          title={`重新开机启动 ${r.session_name} (${r.accelerator})`}
                         >
                           <Power size={12} color="var(--primary)" />
                           <span>重新开机</span>
@@ -627,6 +773,8 @@ function Dashboard() {
         <CreateVmDialog
           open={createOpen}
           defaultWorkspace={env?.workspace}
+          env={env}
+          vms={vms}
           preset={createPreset}
           onClose={() => setCreateOpen(false)}
           onCreate={handleCreateVm}
@@ -635,7 +783,14 @@ function Dashboard() {
       </ErrorBoundary>
 
       <ErrorBoundary label="script-dialog">
-        <ScriptDialog open={scriptOpen} onClose={() => setScriptOpen(false)} />
+        <ScriptDialog
+          open={scriptTarget.open}
+          workspacePath={scriptTarget.workspacePath}
+          vmName={scriptTarget.vmName}
+          onClose={() =>
+            setScriptTarget((prev) => ({ ...prev, open: false }))
+          }
+        />
       </ErrorBoundary>
 
       <ErrorBoundary label="stop-relay">
@@ -643,6 +798,15 @@ function Dashboard() {
           vm={liveStopRelayVm}
           onClose={() => setStopRelayVm(null)}
           onStop={handleStopRelay}
+        />
+      </ErrorBoundary>
+
+      <ErrorBoundary label="close-app-relay">
+        <CloseAppRelayDialog
+          open={closeRelayVms !== null}
+          activeVms={closeRelayVms ?? []}
+          onCancel={() => setCloseRelayVms(null)}
+          onConfirmClose={(mode) => api.confirmAppClose(mode)}
         />
       </ErrorBoundary>
 

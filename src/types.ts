@@ -12,6 +12,7 @@ export interface EnvStatus {
   rclone_conf: string;
   rclone_conf_ok: boolean;
   token_ok: boolean;
+  adc_ok?: boolean;
   workspace: string;
   sessions_path: string;
   history_dir: string;
@@ -56,6 +57,11 @@ export interface RelayStatus {
   config: RelayConfig;
   logs: string[];
   child_pid: number | null;
+  training_completed?: boolean;
+  weights_downloaded?: boolean;
+  download_error?: string | null;
+  local_weights_path?: string | null;
+  last_error?: string | null;
 }
 
 export interface WorkspaceInfo {
@@ -90,6 +96,10 @@ export interface RecentSessionView {
   exec_count: number;
   file_op_count: number;
   last_summary: string;
+  boot_mode?: "general" | "llm" | "relay" | null;
+  llm_config?: CreateVmLlmConfig | null;
+  relay_config?: RelayConfig | null;
+  profile_saved?: boolean;
 }
 
 export interface ProcInfo {
@@ -168,10 +178,22 @@ export interface LlmTelemetry {
   handover_in_seconds?: number;
 }
 
+export interface LlmBlueGreenSlotInfo {
+  session_name?: string | null;
+  role?: string | null;
+  model_name?: string | null;
+  endpoint?: string | null;
+}
+
 export interface LlmBlueGreenState {
   session_prefix?: string;
   active_slot?: string;
   standby_slot?: string | null;
+  active_session?: string | null;
+  standby_session?: string | null;
+  blue_session?: string | null;
+  green_session?: string | null;
+  slots?: Record<string, LlmBlueGreenSlotInfo>;
   phase?: string;
   engine?: string;
   model_name?: string;
@@ -312,6 +334,9 @@ export interface VmView {
 
 export interface Overview {
   timestamp: number;
+  last_ok_timestamp?: number | null;
+  is_stale?: boolean;
+  stale_reason?: string | null;
   auth_ok: boolean;
   error: string | null;
   ccu: Ccu | null;
@@ -331,6 +356,18 @@ export interface TerminateReceipt {
   steps: string[];
   ccu: Ccu | null;
   error: string | null;
+}
+
+export interface StopRelayResult {
+  supervisor_stopped: boolean;
+  destroy_vm: boolean;
+  kernel_interrupted: boolean;
+  kernel_interrupt_error: string | null;
+  terminate_receipt: TerminateReceipt | null;
+}
+
+export interface CloseRequestedRelayPayload {
+  active_vms: string[];
 }
 
 export interface WorkspaceFiles {

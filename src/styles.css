@@ -321,26 +321,40 @@ td.cmd { max-width: 460px; overflow: hidden; text-overflow: ellipsis; color: var
 .log .ln-err { color: var(--danger); }
 .log .ln-ok { color: var(--success); }
 
-/* ───────── 弹窗 ───────── */
+/* ───────── 弹窗（三段式固定头尾 + 单一主滚动区 #66, #70） ───────── */
 .overlay {
   position: fixed; inset: 0; z-index: 100; background: rgba(28, 36, 58, 0.35);
-  backdrop-filter: blur(3px); display: grid; place-items: center; padding: 24px;
-  animation: fade .15s ease;
+  backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; padding: 20px;
+  overflow: hidden; animation: fade .15s ease;
 }
 @keyframes fade { from { opacity: 0; } }
 .modal {
   background: var(--surface); border-radius: 18px; box-shadow: var(--shadow-lg);
-  width: 100%; max-width: 560px; max-height: calc(100vh - 48px); display: flex; flex-direction: column;
+  width: 100%; max-width: 560px; max-height: calc(100vh - 40px); min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden; outline: none;
   animation: pop .18s ease;
 }
 .modal.wide { max-width: 980px; }
 @keyframes pop { from { transform: translateY(8px) scale(.98); opacity: 0; } }
-.modal-head { display: flex; align-items: center; gap: 12px; padding: 18px 22px 0; }
+.modal-head {
+  flex: 0 0 auto; flex-shrink: 0;
+  display: flex; align-items: center; gap: 12px; padding: 16px 22px 12px;
+  border-bottom: 1px solid var(--border); background: var(--surface);
+}
 .modal-head h3 { font-size: 16.5px; font-weight: 700; }
 .modal-head .sub { font-size: 12.5px; color: var(--muted); }
 .modal-icon { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; flex-shrink: 0; }
-.modal-body { padding: 18px 22px; overflow: auto; display: flex; flex-direction: column; gap: 14px; }
-.modal-foot { padding: 14px 22px 18px; display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--border); }
+.modal-body {
+  flex: 1 1 auto; min-height: 0; padding: 16px 22px 18px;
+  overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.modal-body > * { flex-shrink: 0; }
+.modal-foot {
+  flex: 0 0 auto; flex-shrink: 0; padding: 12px 22px 16px;
+  display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap;
+  border-top: 1px solid var(--border); background: var(--surface);
+}
 
 .hw-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
 .hw-opt {
@@ -676,12 +690,13 @@ tr.row-active td {
 }
 
 .chat-modal {
-  max-width: 920px; width: 100%; height: min(780px, calc(100vh - 48px));
+  max-width: 920px; width: 100%; height: min(780px, calc(100vh - 40px)); min-height: 0;
   display: flex; flex-direction: column; overflow: hidden;
   border: 1px solid var(--border);
 }
 
 .chat-modal-head {
+  flex-shrink: 0;
   display: flex; align-items: center; justify-content: space-between; gap: 14px;
   padding: 15px 20px; border-bottom: 1px solid var(--border); background: var(--surface);
   flex-wrap: wrap;
@@ -724,6 +739,7 @@ tr.row-active td {
 }
 
 .chat-telemetry-strip {
+  flex-shrink: 0;
   display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
   padding: 9px 20px; background: var(--surface-2); border-bottom: 1px solid var(--border);
 }
@@ -743,6 +759,7 @@ tr.row-active td {
 }
 
 .chat-settings-bar {
+  flex-shrink: 0;
   display: grid; grid-template-columns: 1.6fr 1fr 1fr; gap: 12px;
   padding: 12px 20px; background: #f8faff; border-bottom: 1px solid #dbe3ff;
 }
@@ -764,7 +781,7 @@ tr.row-active td {
 }
 
 .chat-body {
-  flex: 1; overflow-y: auto; padding: 20px; background: var(--bg);
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 20px; background: var(--bg);
   display: flex; flex-direction: column; gap: 16px;
 }
 
@@ -889,6 +906,7 @@ tr.row-active td {
 }
 
 .chat-input-bar {
+  flex-shrink: 0;
   display: flex; align-items: flex-end; gap: 10px; padding: 14px 20px;
   background: var(--surface); border-top: 1px solid var(--border);
 }
@@ -1054,13 +1072,23 @@ tr.row-active td {
 
 @media (max-height: 640px) {
   .overlay {
-    padding: 10px;
+    padding: 8px;
   }
   .modal {
-    max-height: calc(100vh - 20px);
+    max-height: calc(100vh - 16px);
+  }
+  .modal-head {
+    padding: 10px 16px 8px;
+  }
+  .modal-body {
+    padding: 10px 16px 14px;
+    gap: 10px;
+  }
+  .modal-foot {
+    padding: 9px 16px 11px;
   }
   .chat-modal {
-    height: calc(100vh - 20px);
+    height: calc(100vh - 16px);
   }
   .chat-modal-head {
     padding: 8px 14px;
@@ -1505,10 +1533,10 @@ tr.row-active td {
 }
 
 .adv-config-box {
+  flex-shrink: 0;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--surface-2);
-  overflow: hidden;
 }
 .adv-config-toggle {
   width: 100%;
@@ -1518,6 +1546,7 @@ tr.row-active td {
   gap: 8px;
   padding: 9px 13px;
   border: none;
+  border-radius: 9px;
   background: transparent;
   color: var(--text-2);
   font-size: 12.5px;
@@ -1531,6 +1560,7 @@ tr.row-active td {
 .adv-config-body {
   padding: 12px 13px;
   border-top: 1px solid var(--border);
+  border-radius: 0 0 9px 9px;
   background: var(--surface);
   display: flex;
   flex-direction: column;
@@ -1676,4 +1706,36 @@ tr.row-active td {
   .form-grid-4 {
     grid-template-columns: repeat(2, 1fr);
   }
+}
+
+/* ───────── 补充交互态、离线接力记录卡片与校验提示样式 ───────── */
+.vm-card.offline-relay-card {
+  border-style: dashed;
+  border-color: #c5d0e6;
+  background: linear-gradient(180deg, #fafbfe 0%, #ffffff 100%);
+}
+.preset-pill:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+.field-hint {
+  font-size: 11.5px;
+  color: var(--text-2);
+  margin-top: 4px;
+  line-height: 1.45;
+}
+.field-err {
+  font-size: 11.5px;
+  color: var(--danger);
+  font-weight: 600;
+  margin-top: 4px;
+  line-height: 1.45;
+}
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
 }

@@ -1,6 +1,7 @@
-import { type ReactNode, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
+  AlertTriangle,
   Check,
   Copy,
   Cpu,
@@ -18,15 +19,19 @@ import {
 } from "lucide-react";
 import { api, errText } from "../api";
 import type { LlmChatStreamEvent, Overview, VmView } from "../types";
-import { num, numOrNull, str } from "../format";
+import { formatRealtimeTps, num, numOrNull, str } from "../format";
 import {
   buildHistoryMessages,
   extractThinkParts,
+  formatChatOptionLabel,
+  hasAnyReadyLlmVm,
   isLlmVm,
+  isLlmVmReady,
   isSafeMarkdownUrl,
   parseMarkdownSegments,
+  resolveChatTargetState,
 } from "../chatUtils";
-import { ColabIcon, useToast } from "./ui";
+import { ColabIcon, useModalFocusTrap, useToast } from "./ui";
 
 export { isLlmVm };
 
@@ -435,6 +440,11 @@ export function LlmChatModal(props: {
   const stickToBottomRef = useRef<boolean>(true);
   const chatBodyRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const modalRef = useRef<HTMLDivElement | null>(null);
+  const titleId = useId();
+  const [lostTargetNotice, setLostTargetNotice] = useState<string | null>(null);
+
+  useModalFocusTrap(open, modalRef, inputRef);
 
   const handleStop = useCallback(() => {
     const reqId = activeReqIdRef.current;
@@ -464,6 +474,7 @@ export function LlmChatModal(props: {
   useEffect(() => {
     if (open && initialTarget) {
       setTargetVm(initialTarget);
+      setLostTargetNotice(null);
       stickToBottomRef.current = true;
       setTimeout(() => inputRef.current?.focus(), 60);
     }
@@ -485,51 +496,47 @@ export function LlmChatModal(props: {
 
   const vms = ov?.vms ?? [];
   const bg = ov?.llm_bluegreen ?? null;
-  const llmVms = useMemo(() => {
-    const matched = vms.filter(isLlmVm);
-    return matched.length > 0 ? matched : vms.filter((v) => v.on_server);
-  }, [vms]);
+  const targetState = useMemo(
+    () => resolveChatTargetState(targetVm, bg, vms),
+    [targetVm, bg, vms],
+  );
+  const llmVms = targetState.llmVms;
+  const resolvedVm: VmView | undefined = targetState.resolvedVm;
+  const anyReadyNode = hasAnyReadyLlmVm(vms);
 
-  // 解析当前选中的目标实例详情（严格优先匹配 `${prefix}-${activeSlot}`，杜绝跨集群误匹配）
-  const resolvedVm: VmView | undefined = useMemo(() => {
-    if (targetVm === "auto") {
-      const prefix = (str(bg?.session_prefix, "llm") || "llm").trim();
-      const activeSlot = (str(bg?.active_slot, "blue") || "blue").toLowerCase();
-      return (
-        llmVms.find((v) => v.name === `${prefix}-${activeSlot}`) ??
-        llmVms.find((v) => str(v.telemetry?.llm?.slot).toLowerCase() === activeSlot) ??
-        llmVms.find(
-          (v) =>
-            v.telemetry?.llm?.online &&
-            str(v.telemetry?.llm?.role, "active").toLowerCase() === "active",
-        ) ??
-        llmVms[0]
+  // #64：当选定的具体目标实例从在线列表中消失时，同步切回 "auto" 并提示用户，确保下拉框展示值与 IPC 提交一致
+  useEffect(() => {
+    if (!open) return;
+    if (targetState.targetDisappeared && targetState.disappearedVmName) {
+      setLostTargetNotice(
+        `原选定节点 [${targetState.disappearedVmName}] 已离线或被释放，已自动切回「自动路由活跃节点」`,
       );
+      setTargetVm("auto");
     }
-    return vms.find((v) => v.name === targetVm) ?? llmVms[0];
-  }, [targetVm, bg, llmVms, vms]);
+  }, [open, targetState.targetDisappeared, targetState.disappearedVmName]);
 
   const llmTel = resolvedVm?.telemetry?.llm ?? null;
   const displayModel =
-    str(llmTel?.model_name) ||
-    str(bg?.model_name) ||
+    targetState.submitModel ||
     str(resolvedVm?.workspace?.description) ||
     "Colab Cloud LLM";
-  const displayEngine = str(llmTel?.engine) || str(bg?.engine) || "OpenAI-Compatible";
-  const prefix = (str(bg?.session_prefix, "llm") || "llm").trim();
-  const inferredVmSlot =
-    resolvedVm?.name === `${prefix}-green`
-      ? "green"
-      : resolvedVm?.name === `${prefix}-blue`
-        ? "blue"
-        : null;
+  const displayEngine =
+    str(llmTel?.engine) ||
+    str(resolvedVm?.llm_api?.engine) ||
+    str(bg?.engine) ||
+    "OpenAI-Compatible";
   const displaySlot =
-    str(liveStreamMetrics?.slot ?? llmTel?.slot ?? inferredVmSlot ?? null).toLowerCase() ||
+    str(liveStreamMetrics?.slot ?? targetState.resolvedSlot ?? null).toLowerCase() ||
     undefined;
 
-  const displayTps =
-    numOrNull(liveStreamMetrics?.tps) ??
-    (llmTel ? num(llmTel.instant_tps) || num(llmTel.last_request_tps) : num(bg?.warmup_tps));
+  // #65：严格区分实时输出频率与上次请求速率，空闲时保持 0.0 tok/s (空闲)，绝不把 last_request_tps 冒充为实时速率
+  const tpsView = formatRealtimeTps({
+    instantTps: llmTel?.instant_tps,
+    lastRequestTps: llmTel?.last_request_tps ?? bg?.warmup_tps,
+    peakTps: llmTel?.peak_tps,
+    activeStreams: llmTel?.active_streams,
+    liveStreamTps: sending ? liveStreamMetrics?.tps : null,
+  });
   const displayAvgTps = num(llmTel?.avg_tps_60s);
   const displayTtft =
     numOrNull(liveStreamMetrics?.ttft) ??
@@ -661,6 +668,14 @@ export function LlmChatModal(props: {
   const handleSend = async (customPrompt?: string) => {
     const text = (customPrompt ?? input).trim();
     if (!text || sending) return;
+    if (!targetState.canSend || !targetState.submitTargetVm) {
+      toast(targetState.disabledReason ?? "当前目标节点尚未就绪，暂不可发送消息", "warn");
+      return;
+    }
+
+    const submitTarget = targetState.submitTargetVm;
+    const submitModel = targetState.submitModel;
+    setLostTargetNotice(null);
 
     const nowStr = new Date().toLocaleTimeString("zh-CN", { hour12: false });
     const reqId = `chat-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -680,7 +695,7 @@ export function LlmChatModal(props: {
       role: "assistant",
       content: "",
       createdAt: nowStr,
-      vmName: resolvedVm?.name,
+      vmName: submitTarget,
       slot: displaySlot ?? null,
       model: displayModel,
       streaming: true,
@@ -702,8 +717,8 @@ export function LlmChatModal(props: {
     try {
       const resp = await api.streamLlmChat({
         request_id: reqId,
-        target_vm: targetVm,
-        model: str(llmTel?.model_name) || str(bg?.model_name) || null,
+        target_vm: submitTarget,
+        model: submitModel,
         messages: historyMessages,
         max_tokens: maxTokens,
         temperature,
@@ -772,11 +787,19 @@ export function LlmChatModal(props: {
   return (
     <div
       className="overlay"
-      onClick={() => {
-        if (!sending) handleCloseModal();
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !sending) handleCloseModal();
       }}
     >
-      <div className="modal chat-modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={modalRef}
+        className="modal chat-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        onClick={(e) => e.stopPropagation()}
+      >
         {/* 顶栏：模型信息、目标节点切换器与实时 tok/s 监控 */}
         <div className="chat-modal-head">
           <div className="chat-head-left">
@@ -785,7 +808,7 @@ export function LlmChatModal(props: {
             </div>
             <div>
               <div className="chat-title-row">
-                <h3>大模型交互对话窗口</h3>
+                <h3 id={titleId}>大模型交互对话窗口</h3>
                 <code className="chat-model-badge">{displayModel}</code>
                 {displaySlot && (
                   <span className={`slot-badge slot-badge-${displaySlot}`}>
@@ -801,9 +824,9 @@ export function LlmChatModal(props: {
                 <span>引擎: {displayEngine}</span>
                 <span>·</span>
                 <span>
-                  {targetVm === "auto"
-                    ? "蓝绿零中断自动路由 (Make-Before-Break)"
-                    : `直连指定节点 (${targetVm})`}
+                  {targetState.effectiveSelectValue === "auto"
+                    ? `蓝绿零中断自动路由 (${targetState.submitTargetVm ?? "等待节点就绪"})`
+                    : `直连指定节点 (${targetState.effectiveSelectValue})`}
                 </span>
               </div>
             </div>
@@ -814,22 +837,27 @@ export function LlmChatModal(props: {
               <GitCompare size={13} color="var(--primary)" />
               <select
                 className="chat-target-select"
-                value={targetVm}
-                onChange={(e) => setTargetVm(e.target.value)}
+                value={targetState.effectiveSelectValue}
+                onChange={(e) => {
+                  setLostTargetNotice(null);
+                  setTargetVm(e.target.value);
+                }}
                 disabled={sending}
               >
                 <option value="auto">
                   🔄 自动路由活跃节点
-                  {str(bg?.active_slot) ? ` (${str(bg?.active_slot).toUpperCase()})` : ""}
+                  {targetState.effectiveSelectValue === "auto" && resolvedVm
+                    ? ` (${resolvedVm.name}${displaySlot ? ` · ${displaySlot.toUpperCase()}` : ""})`
+                    : str(bg?.active_slot)
+                      ? ` (${str(bg?.active_slot).toUpperCase()})`
+                      : ""}
+                  {!anyReadyNode ? "（暂无就绪节点）" : ""}
                 </option>
                 {llmVms.map((v) => {
-                  const sl = str(v.telemetry?.llm?.slot);
-                  const role = str(v.telemetry?.llm?.role);
+                  const ready = isLlmVmReady(v);
                   return (
-                    <option key={v.name} value={v.name}>
-                      🖥️ {v.name} ({v.accelerator}
-                      {sl ? ` · ${sl.toUpperCase()}` : ""}
-                      {role ? `/${role}` : ""})
+                    <option key={v.name} value={v.name} disabled={!ready}>
+                      {formatChatOptionLabel(v, bg)}
                     </option>
                   );
                 })}
@@ -837,6 +865,7 @@ export function LlmChatModal(props: {
             </div>
 
             <button
+              type="button"
               className={`icon-btn ${showSettings ? "active-icon-btn" : ""}`}
               onClick={() => setShowSettings((s) => !s)}
               title="生成参数与 System Prompt 设置"
@@ -844,6 +873,7 @@ export function LlmChatModal(props: {
               <SlidersHorizontal size={15} />
             </button>
             <button
+              type="button"
               className="icon-btn"
               onClick={() => setTurns([])}
               disabled={sending || turns.length === 0}
@@ -851,7 +881,7 @@ export function LlmChatModal(props: {
             >
               <Trash2 size={15} />
             </button>
-            <button className="icon-btn" onClick={handleCloseModal} title="关闭窗口 (Esc)">
+            <button type="button" className="icon-btn" onClick={handleCloseModal} title="关闭窗口 (Esc)">
               <X size={16} />
             </button>
           </div>
@@ -863,8 +893,14 @@ export function LlmChatModal(props: {
             <span className="ct-label">
               <Gauge size={12} color="var(--primary)" /> 实时输出频率
             </span>
-            <span className="ct-val mono">
-              <b>{displayTps.toFixed(1)}</b> <small>tok/s</small>
+            <span className="ct-val mono" style={{ textAlign: "right" }}>
+              <b>{tpsView.realtimeTps.toFixed(1)}</b>{" "}
+              <small>tok/s{tpsView.isIdle ? " (空闲)" : ""}</small>
+              {tpsView.isIdle && tpsView.lastRequestText && (
+                <small className="dim" style={{ display: "block", fontSize: 10.5 }}>
+                  {tpsView.lastRequestText}
+                </small>
+              )}
             </span>
           </div>
           <div className="ct-item">
@@ -924,6 +960,25 @@ export function LlmChatModal(props: {
           </div>
         )}
 
+        {/* #64：目标消失或节点预热未就绪提示条 */}
+        {(lostTargetNotice || !targetState.canSend) && (
+          <div
+            className="banner banner-warn"
+            role="status"
+            style={{ margin: 0, borderRadius: 0, borderLeft: "none", borderRight: "none", flexShrink: 0 }}
+          >
+            <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+            <div style={{ flex: 1, fontSize: 12.5 }}>
+              {lostTargetNotice && <div>{lostTargetNotice}</div>}
+              {!targetState.canSend && targetState.disabledReason && (
+                <div>
+                  <b>{targetState.disabledReason}</b>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* 对话消息流 */}
         <div
           className="chat-body"
@@ -945,10 +1000,11 @@ export function LlmChatModal(props: {
               <div className="chat-quick-grid">
                 {QUICK_PROMPTS.map((q, idx) => (
                   <button
+                    type="button"
                     key={idx}
                     className="chat-quick-btn"
                     onClick={() => handleSend(q)}
-                    disabled={sending}
+                    disabled={sending || !targetState.canSend}
                   >
                     <Sparkles size={13} color="var(--primary)" />
                     <span>{q}</span>
@@ -1071,11 +1127,16 @@ export function LlmChatModal(props: {
                 handleSend();
               }
             }}
-            placeholder={`向 ${displayModel} 提问（Enter 发送，Shift + Enter 换行，Esc 停止/关闭）…`}
+            placeholder={
+              targetState.canSend
+                ? `向 ${displayModel} 提问（Enter 发送，Shift + Enter 换行，Esc 停止/关闭）…`
+                : (targetState.disabledReason ?? "等待云端推理节点预热就绪后即可对话…")
+            }
             disabled={sending}
           />
           {sending ? (
             <button
+              type="button"
               className="btn btn-danger chat-send-btn"
               onClick={handleStop}
               title="立即中断本次流式生成 (Esc)"
@@ -1085,9 +1146,11 @@ export function LlmChatModal(props: {
             </button>
           ) : (
             <button
+              type="button"
               className="btn btn-primary chat-send-btn"
               onClick={() => handleSend()}
-              disabled={!input.trim()}
+              disabled={!input.trim() || !targetState.canSend}
+              title={!targetState.canSend ? (targetState.disabledReason ?? "目标节点未就绪") : "发送消息"}
             >
               <Send size={15} />
               发送

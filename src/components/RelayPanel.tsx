@@ -1,9 +1,20 @@
 import { useEffect, useState } from "react";
-import { Repeat2 } from "lucide-react";
+import { AlertTriangle, Download, Repeat2 } from "lucide-react";
 import type { RelayConfig, VmView } from "../types";
 import { DEFAULT_RELAY } from "../types";
 import { fmtDuration, pct } from "../format";
-import { isSingleShapeAccelerator, resolveEffectiveHighMem } from "../chatUtils";
+import {
+  MAX_RELAY_SESSION_HOURS,
+  MIN_RELAY_SESSION_HOURS,
+  findConflictingRelayVm,
+  isDefaultBareGdriveDir,
+  isSingleShapeAccelerator,
+  isValidRelaySessionHours,
+  resolveEffectiveHighMem,
+  resolveEffectiveRelayGdriveDir,
+  resolveRelayCompletionView,
+  sanitizeRelayVmSegment,
+} from "../chatUtils";
 
 const PHASES = [
   ["preparing_gdrive", "准备网盘"],
@@ -18,6 +29,7 @@ const GPUS = ["T4", "L4", "A100", "H100", "G4", "V5E1", "V6E1", "CPU"];
 
 export function RelayPanel(props: {
   vm: VmView;
+  allVms?: VmView[];
   onStart: (cfg: RelayConfig) => void;
   onStopRequest: () => void;
   pending: boolean;
@@ -28,10 +40,9 @@ export function RelayPanel(props: {
   const tr = vm.telemetry?.training ?? null;
 
   const [cfg, setCfg] = useState<RelayConfig>(() => {
-    const initGpu =
-      vm.accelerator && vm.accelerator !== "CPU" && vm.accelerator !== "…"
-        ? vm.accelerator
-        : "T4";
+    const normAcc = (vm.accelerator ?? "").trim().toUpperCase();
+    // #52：保留 CPU 等全部受支持加速器类型，绝不将 CPU 静默篡改为 T4
+    const initGpu = GPUS.includes(normAcc) ? normAcc : "T4";
     return {
       ...DEFAULT_RELAY,
       gpu_type: initGpu,
@@ -39,10 +50,13 @@ export function RelayPanel(props: {
       ...(relay?.config ?? {}),
     };
   });
+  const [confirmReuseGdrive, setConfirmReuseGdrive] = useState(false);
 
-  // 运行中以后端配置为准
+  // 运行中或后端已有配置时同步
   useEffect(() => {
-    if (running && relay?.config) setCfg(relay.config);
+    if (relay?.config) {
+      setCfg(relay.config);
+    }
   }, [running, relay?.config]);
 
   const rawIdx = PHASES.findIndex(([k]) => k === relay?.phase);
@@ -51,55 +65,105 @@ export function RelayPanel(props: {
   const totEpoch = tr?.total_epochs ?? cfg.total_epochs;
   const epochPct = totEpoch > 0 ? (curEpoch / totEpoch) * 100 : 0;
   const elapsed = tr?.elapsed_seconds ?? 0;
-  const sessionSec = Math.max(180, (Number.isFinite(cfg.max_session_hours) ? cfg.max_session_hours : 22.5) * 3600);
+  const sessionSec = Math.max(
+    180,
+    (isValidRelaySessionHours(cfg.max_session_hours) ? cfg.max_session_hours : 22.5) * 3600,
+  );
   const handoverPct = (elapsed / sessionSec) * 100;
 
   const singleShape = isSingleShapeAccelerator(cfg.gpu_type);
   const effectiveHighMem = resolveEffectiveHighMem(cfg.gpu_type, cfg.high_mem);
-  const set = <K extends keyof RelayConfig>(k: K, v: RelayConfig[K]) => setCfg((c) => ({ ...c, [k]: v }));
+  const set = <K extends keyof RelayConfig>(k: K, v: RelayConfig[K]) => {
+    setCfg((c) => ({ ...c, [k]: v }));
+    if (k === "gdrive_dir") setConfirmReuseGdrive(false);
+  };
+
   const gdriveValid =
     /^[A-Za-z0-9_-]{2,}:[^\\\s]+$/.test(cfg.gdrive_dir.trim()) &&
     !cfg.gdrive_dir.trim().startsWith("-") &&
     !cfg.gdrive_dir.includes("..");
-  const disabled = running || props.pending || !!vm.busy;
+  const hoursValid = isValidRelaySessionHours(cfg.max_session_hours);
+  const effectiveGdriveDir = resolveEffectiveRelayGdriveDir(cfg.gdrive_dir, vm.name);
+  const conflictingVm = !running
+    ? findConflictingRelayVm(cfg.gdrive_dir, vm.name, props.allVms ?? [])
+    : undefined;
+  const gdriveConflictBlocked = Boolean(conflictingVm && !confirmReuseGdrive);
 
-  let stateLabel = relay?.phase_label ?? "未开启接力";
-  let sub = "开启后自动换棒、定时热备、到期销毁旧实例";
-  if (running) sub = `第 ${relay?.round || 1} 棒 · 已运行 ${fmtDuration(relay?.started_at ? Date.now() / 1000 - relay.started_at : 0)}`;
-  else if (relay?.phase === "completed") sub = "已从 Google Drive 回收最终 checkpoint";
-  else if (relay?.phase === "error") sub = "请查看下方「接力日志」";
+  const disabled = running || props.pending || !!vm.busy;
+  const canStart = gdriveValid && hoursValid && !gdriveConflictBlocked;
+
+  const completionView = resolveRelayCompletionView(relay);
+  const stateLabel = running ? (relay?.phase_label || "接力运行中") : completionView.stateLabel;
+  const sub = running
+    ? `第 ${relay?.round || 1} 棒 · 已运行 ${fmtDuration(relay?.started_at ? Date.now() / 1000 - relay.started_at : 0)}`
+    : completionView.sub;
+
+  const triggerStart = (overrideResetDoneFlag?: boolean) => {
+    if (!canStart || props.pending || !!vm.busy) return;
+    props.onStart({
+      ...cfg,
+      high_mem: effectiveHighMem,
+      reset_done_flag: overrideResetDoneFlag ?? cfg.reset_done_flag,
+    });
+  };
 
   return (
     <div>
       <div className="relay-top">
         <div className="relay-state">
           <div className="label" title={stateLabel}>
-            {running ? <span className="ok">● </span> : null}
+            {running ? (
+              <span className="ok">● </span>
+            ) : completionView.isCompletedAndDownloaded ? (
+              <span className="ok">✓ </span>
+            ) : completionView.isDownloadFailed ? (
+              <span className="bad">⚠ </span>
+            ) : null}
             {stateLabel}
           </div>
-          <div className="sub">{sub}</div>
+          <div className={`sub ${completionView.isDownloadFailed ? "bad" : completionView.isCompletedAndDownloaded ? "ok" : ""}`}>
+            {sub}
+          </div>
         </div>
         <button
           type="button"
           className={`switch ${running ? "on" : ""}`}
-          disabled={props.pending || !!vm.busy || (!running && !gdriveValid)}
+          disabled={props.pending || !!vm.busy || (!running && !canStart)}
           title={
             running
               ? "关闭接力训练"
-              : gdriveValid
-                ? "开启接力训练"
-                : "Google Drive 目录格式必须为 remote:path（如 gdrive:colab_relay）"
+              : !hoursValid
+                ? `单棒时长须在 ${MIN_RELAY_SESSION_HOURS} ~ ${MAX_RELAY_SESSION_HOURS} 小时之间`
+                : !gdriveValid
+                  ? "Google Drive 目录格式必须为 remote:path（如 gdrive:colab_relay）"
+                  : gdriveConflictBlocked
+                    ? `目录正被实例 [${conflictingVm?.name}] 占用，请修改目录或勾选下方显式确认续训`
+                    : "开启接力训练"
           }
-          onClick={() =>
-            running
-              ? props.onStopRequest()
-              : props.onStart({
-                  ...cfg,
-                  high_mem: effectiveHighMem,
-                })
-          }
+          onClick={() => (running ? props.onStopRequest() : triggerStart())}
         />
       </div>
+
+      {/* #53：最终权重下载失败时展示醒目告警与一键补下载按钮 */}
+      {!running && completionView.isDownloadFailed && (
+        <div className="vm-alert-box vm-alert-danger" role="alert" style={{ marginBottom: 10 }}>
+          <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+          <div className="vm-alert-content">
+            <div className="vm-alert-title">云端训练已完成，但最终权重下载到本地失败</div>
+            <div className="vm-alert-desc mono">{completionView.detailError}</div>
+          </div>
+          <button
+            type="button"
+            className="btn btn-primary btn-sm"
+            disabled={props.pending || !!vm.busy || !canStart}
+            onClick={() => triggerStart(false)}
+            title="保留云盘完成标记并立即重跑补下载最终权重到本地工作区"
+          >
+            <Download size={13} />
+            <span>重试补下载权重</span>
+          </button>
+        </div>
+      )}
 
       <div className="steps" title={PHASES.map((p) => p[1]).join(" → ")}>
         {PHASES.map(([k, label], i) => (
@@ -115,21 +179,27 @@ export function RelayPanel(props: {
         <div className="field">
           <label>换棒硬件</label>
           <select value={cfg.gpu_type} disabled={disabled} onChange={(e) => set("gpu_type", e.target.value)}>
-            {GPUS.map((g) => <option key={g} value={g}>{g}</option>)}
+            {GPUS.map((g) => (
+              <option key={g} value={g}>
+                {g}
+              </option>
+            ))}
           </select>
         </div>
         <div className="field">
-          <label>单棒时长 (h)</label>
+          <label>单棒时长 (0.1~23.5h)</label>
           <input
             type="number"
             step={0.5}
-            min={0.1}
-            max={23.5}
-            value={cfg.max_session_hours}
+            min={MIN_RELAY_SESSION_HOURS}
+            max={MAX_RELAY_SESSION_HOURS}
+            value={Number.isFinite(cfg.max_session_hours) ? cfg.max_session_hours : ""}
             disabled={disabled}
+            style={!hoursValid ? { borderColor: "var(--danger)" } : undefined}
             onChange={(e) => {
-              const v = Number(e.target.value);
-              set("max_session_hours", Number.isFinite(v) ? Math.min(48, Math.max(0.05, v)) : 22.5);
+              const raw = e.target.value;
+              const v = raw === "" ? Number.NaN : Number(raw);
+              set("max_session_hours", v);
             }}
           />
         </div>
@@ -164,10 +234,48 @@ export function RelayPanel(props: {
           />
         </div>
       </div>
+      {!hoursValid && (
+        <div className="field-err">
+          受限于 Colab 单次最长运行周期，单棒时长必须在 {MIN_RELAY_SESSION_HOURS} ~ {MAX_RELAY_SESSION_HOURS} 小时之间。
+        </div>
+      )}
+
       <div className="field" style={{ marginTop: 8 }}>
         <label>Google Drive 接力目录</label>
-        <input value={cfg.gdrive_dir} disabled={disabled} onChange={(e) => set("gdrive_dir", e.target.value)} />
+        <input
+          value={cfg.gdrive_dir}
+          disabled={disabled}
+          onChange={(e) => set("gdrive_dir", e.target.value)}
+        />
+        {isDefaultBareGdriveDir(cfg.gdrive_dir) && (
+          <div className="field-hint">
+            默认目录将自动按实例子目录隔离为：<code>gdrive:colab_relay/{sanitizeRelayVmSegment(vm.name)}</code>
+          </div>
+        )}
       </div>
+
+      {conflictingVm && !running && (
+        <div className="vm-alert-box vm-alert-warn" role="alert" style={{ marginTop: 8 }}>
+          <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 2 }} />
+          <div className="vm-alert-content">
+            <div className="vm-alert-title">
+              目录 <code>{effectiveGdriveDir}</code> 正被运行中的接力任务 [{conflictingVm.name}] 占用
+            </div>
+            <div className="vm-alert-desc">
+              多个运行中任务共用同一云盘目录会互相覆盖 checkpoint 与完成标记，建议改用独立子目录。
+            </div>
+            <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginTop: 5, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={confirmReuseGdrive}
+                onChange={(e) => setConfirmReuseGdrive(e.target.checked)}
+              />
+              <span>我已知晓风险，显式确认复用该目录续训</span>
+            </label>
+          </div>
+        </div>
+      )}
+
       <div className="checks">
         <label title={singleShape ? `${cfg.gpu_type} 采用固定内存规格，无需开启 High-RAM` : undefined}>
           <input
@@ -179,8 +287,12 @@ export function RelayPanel(props: {
           High-RAM {singleShape ? <span className="dim">(该型号固定内存规格)</span> : null}
         </label>
         <label>
-          <input type="checkbox" checked={cfg.reset_done_flag} disabled={disabled}
-            onChange={(e) => set("reset_done_flag", e.target.checked)} />
+          <input
+            type="checkbox"
+            checked={cfg.reset_done_flag}
+            disabled={disabled}
+            onChange={(e) => set("reset_done_flag", e.target.checked)}
+          />
           重置完成标记（重新训练）
         </label>
       </div>

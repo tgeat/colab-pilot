@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -27,6 +27,7 @@ import {
   ShieldCheck,
   Sparkles,
   Terminal,
+  Trash2,
 } from "lucide-react";
 import type {
   LlmApiAccessInfo,
@@ -37,8 +38,13 @@ import type {
   VmSshInfo,
   VmView,
 } from "../types";
-import { fmtDuration, num, numOrNull, pct, shortEndpoint, str } from "../format";
-import { isLlmVm, isLlmVmReady } from "../chatUtils";
+import { fmtDuration, formatRealtimeTps, num, numOrNull, pct, shortEndpoint, str } from "../format";
+import {
+  isLlmVm,
+  isLlmVmReady,
+  resolveRelayCompletionView,
+  resolveVmStatusPillSpec,
+} from "../chatUtils";
 import { RelayPanel } from "./RelayPanel";
 import { KV } from "./ui";
 
@@ -103,81 +109,11 @@ function MiniMeter({ name, value, display }: { name: string; value: number; disp
 }
 
 function statusPill(vm: VmView, activeProc: ProcInfo | null) {
-  const t = vm.telemetry;
-  const llm = t?.llm;
-  const tr = t?.training;
-
-  if (vm.busy === "creating") {
-    return (
-      <span className="pill pill-amber">
-        <span className="dot pulse" />
-        开机分配中…
-      </span>
-    );
-  }
-  if (vm.busy === "deploying_llm") {
-    return (
-      <span className="pill pill-amber">
-        <span className="dot pulse" />
-        部署大模型中…
-      </span>
-    );
-  }
-  if (vm.deploy_error) {
-    return (
-      <span className="pill pill-red" title={vm.deploy_error}>
-        <span className="dot" />
-        部署失败
-      </span>
-    );
-  }
-  if (vm.busy === "probing") {
-    return (
-      <span className="pill pill-blue">
-        <span className="dot pulse" />
-        连接中
-      </span>
-    );
-  }
-  if (llm && (llm.online || llm.backend_healthy)) {
-    const tps = num(llm.instant_tps) || num(llm.last_request_tps);
-    const cls = llm.role === "warming" ? "pill-amber" : llm.role === "draining" ? "pill-gray" : "pill-green";
-    return (
-      <span className={`pill ${cls}`}>
-        <span className="dot pulse" />
-        LLM · {tps.toFixed(1)} tok/s
-      </span>
-    );
-  }
-  if (tr && tr.status) {
-    const isDone = tr.status === "completed";
-    return (
-      <span className={`pill ${isDone ? "pill-green" : "pill-blue"}`}>
-        <span className={`dot ${isDone ? "" : "pulse"}`} />
-        {isDone ? "训练完成" : `训练中 · Epoch ${tr.current_epoch ?? 0}/${tr.total_epochs ?? "?"}`}
-      </span>
-    );
-  }
-  if (vm.running_task || activeProc) {
-    return (
-      <span className="pill pill-blue">
-        <span className="dot pulse" />
-        运行中
-      </span>
-    );
-  }
-  if (vm.on_server) {
-    return (
-      <span className="pill pill-green">
-        <span className="dot" />
-        空闲
-      </span>
-    );
-  }
+  const spec = resolveVmStatusPillSpec(vm, Boolean(activeProc));
   return (
-    <span className="pill pill-gray">
-      <span className="dot" />
-      离线
+    <span className={`pill ${spec.cls}`} title={spec.title}>
+      <span className={`dot ${spec.pulse ? "pulse" : ""}`} />
+      {spec.text}
     </span>
   );
 }
@@ -566,18 +502,25 @@ function LlmSupervisionBox({
   const slot = str(llm.slot, "blue").toLowerCase() || "blue";
   const role = str(llm.role, "active").toLowerCase() || "active";
   const modelName = str(llm.model_name) || llmApi?.model_name || "LLM";
-  const instantTps = num(llm.instant_tps);
-  const lastTps = num(llm.last_request_tps);
-  const displayTps = instantTps > 0 ? instantTps : lastTps;
+  // #65：严格区分实时输出速率与上次请求速率，空闲时保持 0.0 tok/s，绝不把 last_request_tps 冒充为实时速率
+  const tpsView = formatRealtimeTps({
+    instantTps: llm.instant_tps,
+    lastRequestTps: llm.last_request_tps,
+    peakTps: llm.peak_tps,
+    activeStreams: llm.active_streams,
+  });
   const avgTps = num(llm.avg_tps_60s);
   const peakTps = num(llm.peak_tps);
   const ttft = numOrNull(llm.ttft_ms) ?? numOrNull(llm.avg_ttft_ms);
-  const activeStreams = num(llm.active_streams);
+  const activeStreams = tpsView.activeStreams;
   const rawHistory = Array.isArray(llm.tps_history) ? llm.tps_history.map((v) => num(v)) : [];
   const history = rawHistory.length > 0 ? rawHistory : [0, 0, 0, 0, 0, 0, 0, 0];
   const maxHist = Math.max(50, ...history, peakTps);
   const chatReady =
     Boolean(llm.online || llm.backend_healthy) &&
+    role !== "warming" &&
+    llm.online !== false &&
+    llm.backend_healthy !== false &&
     vmBusy !== "deploying_llm" &&
     vmBusy !== "creating";
 
@@ -620,14 +563,15 @@ function LlmSupervisionBox({
             <Gauge size={13} /> 实时速率
           </div>
           <div className="tps-value">
-            {displayTps.toFixed(1)} <small>tok/s</small>
+            {tpsView.realtimeTps.toFixed(1)}{" "}
+            <small>tok/s{tpsView.isIdle ? " (空闲)" : ""}</small>
           </div>
           <div className="tps-sub">
             {activeStreams > 0
               ? `${activeStreams} 个流式请求进行中`
-              : lastTps > 0
-                ? `峰值 ${peakTps.toFixed(1)} tok/s`
-                : "等待请求"}
+              : tpsView.lastRequestText
+                ? `${tpsView.lastRequestText}${peakTps > 0 ? ` · 峰值 ${peakTps.toFixed(1)} tok/s` : ""}`
+                : "空闲 · 等待请求"}
           </div>
         </div>
 
@@ -686,6 +630,7 @@ function LlmSupervisionBox({
 
 export function VmCard({
   vm,
+  allVms,
   onOpenLlmChat,
   onShutdown,
   onOpenSshTerminal,
@@ -694,22 +639,47 @@ export function VmCard({
   onDeployLlm,
   onStartRelay,
   onRequestStopRelay,
+  onDismissRelay,
   onOpenScriptDialog,
 }: {
   vm: VmView;
+  allVms?: VmView[];
   onOpenLlmChat?: (name: string) => void;
   onShutdown?: (vm: VmView) => void;
   onOpenSshTerminal?: (name: string) => void;
   onRotateLlmKey?: (vmName: string, customKey?: string | null) => Promise<void>;
   onRetryProbe?: (name: string) => Promise<void>;
   onDeployLlm?: (vm: VmView) => void;
-  onStartRelay?: (name: string, config: RelayConfig) => Promise<void>;
+  onStartRelay?: (name: string, config: RelayConfig, workspacePath?: string | null) => Promise<void>;
   onRequestStopRelay?: (vm: VmView) => void;
-  onOpenScriptDialog?: () => void;
+  onDismissRelay?: (name: string) => Promise<void>;
+  onOpenScriptDialog?: (vm: VmView) => void;
 }) {
   const [probingLocal, setProbingLocal] = useState(false);
   const [relayPending, setRelayPending] = useState(false);
-  const [relayExpanded, setRelayExpanded] = useState(false);
+  const [dismissingRelay, setDismissingRelay] = useState(false);
+  // #76 & #73：当接力运行中或为离线接力记录时初始展开一次，但允许用户随时手动点击折叠/展开
+  const [relayExpanded, setRelayExpanded] = useState<boolean>(
+    () => Boolean(vm.relay?.running) || (!vm.on_server && Boolean(vm.relay)),
+  );
+  const prevRelayRunningRef = useRef<boolean>(Boolean(vm.relay?.running));
+  const prevOfflineRelayRef = useRef<boolean>(!vm.on_server && Boolean(vm.relay));
+
+  useEffect(() => {
+    const nowRunning = Boolean(vm.relay?.running);
+    if (nowRunning && !prevRelayRunningRef.current) {
+      setRelayExpanded(true);
+    }
+    prevRelayRunningRef.current = nowRunning;
+  }, [vm.relay?.running]);
+
+  useEffect(() => {
+    const nowOffline = !vm.on_server && Boolean(vm.relay);
+    if (nowOffline && !prevOfflineRelayRef.current) {
+      setRelayExpanded(true);
+    }
+    prevOfflineRelayRef.current = nowOffline;
+  }, [vm.on_server, vm.relay]);
 
   const t = vm.telemetry;
   const tr = t?.training ?? null;
@@ -722,6 +692,8 @@ export function VmCard({
   const isCreating = vm.busy === "creating";
   const isDeployingLlm = vm.busy === "deploying_llm";
   const isProbing = probingLocal || vm.busy === "probing";
+  const isOfflineRelayRecord = !vm.on_server && vm.relay !== null;
+  const offlineRelayView = isOfflineRelayRecord ? resolveRelayCompletionView(vm.relay) : null;
 
   const gpu = t?.gpu;
   const rawProcs = t?.threads?.processes;
@@ -738,7 +710,8 @@ export function VmCard({
     : [];
   const busy = !!(vm.running_task || activeProc || llm?.online || vm.relay?.running);
 
-  const showRelayDrawer = Boolean(vm.relay?.running) || relayExpanded;
+  // #76：直接使用 relayExpanded，确保点击折叠箭头可真正切换展开与收起状态
+  const showRelayDrawer = relayExpanded;
   const canUseWorkloadTools = vm.on_server && !isDeleting && !isCreating;
 
   const handleRetryProbeClick = async () => {
@@ -755,14 +728,27 @@ export function VmCard({
     if (!onStartRelay || relayPending) return;
     setRelayPending(true);
     try {
-      await onStartRelay(vm.name, cfg);
+      // #42：始终携带当前实例绑定的工作区路径
+      await onStartRelay(vm.name, cfg, vm.workspace?.path ?? null);
     } finally {
       setRelayPending(false);
     }
   };
 
+  const handleDismissRelayClick = async () => {
+    if (!onDismissRelay || dismissingRelay) return;
+    setDismissingRelay(true);
+    try {
+      await onDismissRelay(vm.name);
+    } finally {
+      setDismissingRelay(false);
+    }
+  };
+
   return (
-    <section className={`vm-card ${busy ? "relay-on" : ""} ${isDeleting ? "deleting" : ""}`}>
+    <section
+      className={`vm-card ${busy ? "relay-on" : ""} ${isOfflineRelayRecord ? "offline-relay-card" : ""} ${isDeleting ? "deleting" : ""}`}
+    >
       {/* 头部：会话名 · 硬件 · 状态 · 工作区与运行时长 · 部署/对话/关机按钮 */}
       <div className="vm-head">
         <span className="vm-name">{vm.name}</span>
@@ -770,6 +756,11 @@ export function VmCard({
           {vm.accelerator}
           {vm.high_ram ? " · High-RAM" : ""}
         </span>
+        {isOfflineRelayRecord && (
+          <span className="chip" title="云端实例已释放下线，保留最近一次接力任务结果与日志">
+            云端实例已下线 · 接力记录
+          </span>
+        )}
         {vm.orphan && (
           <span className="chip chip-red" title="浏览器或外部会话创建的云端实例（已自动接管监控与远程终端）">
             外部会话
@@ -781,11 +772,15 @@ export function VmCard({
             <FolderGit2 size={12} />
             {vm.workspace.name}
           </span>
-          <span>
-            <Clock size={12} />
-            {fmtDuration(t?.uptime_seconds)}
-          </span>
-          {stale && <span className="warn">遥测延迟 {vm.telemetry_age?.toFixed(0)}s</span>}
+          {vm.on_server && (
+            <span>
+              <Clock size={12} />
+              {fmtDuration(t?.uptime_seconds)}
+            </span>
+          )}
+          {vm.on_server && stale && (
+            <span className="warn">遥测延迟 {vm.telemetry_age?.toFixed(0)}s</span>
+          )}
         </span>
 
         {canUseWorkloadTools && !llmReady && onDeployLlm && (
@@ -828,7 +823,7 @@ export function VmCard({
           </button>
         )}
 
-        {onShutdown && (
+        {vm.on_server && onShutdown && (
           <button
             type="button"
             className="btn btn-danger-ghost btn-sm"
@@ -849,16 +844,31 @@ export function VmCard({
             )}
           </button>
         )}
+
+        {isOfflineRelayRecord && !vm.relay?.running && onDismissRelay && (
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={handleDismissRelayClick}
+            disabled={dismissingRelay}
+            title="清除此已结束/已释放的离线接力任务记录"
+          >
+            {dismissingRelay ? <Loader2 size={13} className="spin" /> : <Trash2 size={13} />}
+            <span>清除记录</span>
+          </button>
+        )}
       </div>
 
-      {/* 每台虚拟机均提供免密 SSH 连接栏 */}
-      <SshAccessBar
-        vmName={vm.name}
-        ssh={vm.ssh}
-        orphan={vm.orphan}
-        onServer={vm.on_server}
-        onOpenSshTerminal={onOpenSshTerminal}
-      />
+      {/* 每台在线虚拟机均提供免密 SSH 连接栏 */}
+      {vm.on_server && (
+        <SshAccessBar
+          vmName={vm.name}
+          ssh={vm.ssh}
+          orphan={vm.orphan}
+          onServer={vm.on_server}
+          onOpenSshTerminal={onOpenSshTerminal}
+        />
+      )}
 
       <div className="vm-main">
         {/* 部署异常横幅（可见、可复制、可一键重新部署） */}
@@ -994,6 +1004,42 @@ export function VmCard({
               )}
             </div>
           </div>
+        ) : isOfflineRelayRecord ? (
+          <div
+            className={`vm-alert-box ${
+              offlineRelayView?.isError || offlineRelayView?.isDownloadFailed
+                ? "vm-alert-danger"
+                : "vm-alert-warn"
+            }`}
+            role="status"
+          >
+            <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+            <div className="vm-alert-content">
+              <div className="vm-alert-title">
+                {vm.relay?.running
+                  ? `接力换棒处理中（${vm.relay.phase_label || "正在分配下一棒实例"}）`
+                  : `已结束/已释放接力任务记录 · ${offlineRelayView?.stateLabel ?? "实例已下线"}`}
+              </div>
+              <div className="vm-alert-desc">
+                {vm.relay?.running
+                  ? "上一棒云端实例已释放，本机监工正在推进下一棒流程。"
+                  : `云端 Colab 实例已下线释放（不再产生计费）。${offlineRelayView?.sub ?? ""}`}
+              </div>
+            </div>
+            {!vm.relay?.running && onDismissRelay && (
+              <div className="vm-alert-actions">
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={handleDismissRelayClick}
+                  disabled={dismissingRelay}
+                >
+                  <Trash2 size={12} />
+                  <span>清除记录</span>
+                </button>
+              </div>
+            )}
+          </div>
         ) : (
           <div className="probe-line">
             <Loader2 size={14} className="spin" />
@@ -1039,12 +1085,17 @@ export function VmCard({
               <button
                 type="button"
                 className="vm-tools-toggle"
+                aria-expanded={showRelayDrawer}
                 onClick={() => setRelayExpanded((v) => !v)}
               >
                 <Repeat2 size={13} color="var(--primary)" />
                 <span>接力训练 / 脚本配置</span>
                 {vm.relay?.running ? (
                   <span className="chip chip-blue">运行中 · 第 {vm.relay.round || 1} 棒</span>
+                ) : isOfflineRelayRecord ? (
+                  <span className="chip">
+                    {offlineRelayView?.stateLabel ?? "已结束接力记录"}
+                  </span>
                 ) : (
                   <span className="dim" style={{ fontWeight: 400, fontSize: 11.5 }}>
                     配置 `train.py` / `requirements.txt` 或开启 24h+ Google Drive 跨实例自动换棒训练
@@ -1061,8 +1112,8 @@ export function VmCard({
                 <button
                   type="button"
                   className="copy-chip-btn"
-                  onClick={onOpenScriptDialog}
-                  title="打开编辑器配置本地工作区 train.py 与 requirements.txt"
+                  onClick={() => onOpenScriptDialog(vm)}
+                  title={`打开编辑器配置工作区 (${vm.workspace.path ?? vm.workspace.name}) 的 train.py 与 requirements.txt`}
                 >
                   <FileCode2 size={12} />
                   <span>编辑训练脚本</span>
@@ -1074,15 +1125,16 @@ export function VmCard({
               <div className="vm-tools-body">
                 <RelayPanel
                   vm={vm}
+                  allVms={allVms}
                   pending={relayPending}
                   onStart={handleStartRelayClick}
                   onStopRequest={() => onRequestStopRelay?.(vm)}
                 />
                 {vm.relay?.logs && vm.relay.logs.length > 0 && (
-                  <details className="relay-logs-details">
+                  <details className="relay-logs-details" open={isOfflineRelayRecord || undefined}>
                     <summary>接力监工日志 ({vm.relay.logs.length})</summary>
-                    <pre className="llm-snippet-pre mono" style={{ maxHeight: 160, overflowY: "auto" }}>
-                      {vm.relay.logs.slice(-40).join("\n")}
+                    <pre className="llm-snippet-pre mono" style={{ maxHeight: 220, overflowY: "auto" }}>
+                      {vm.relay.logs.slice(-200).join("\n")}
                     </pre>
                   </details>
                 )}

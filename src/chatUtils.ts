@@ -43,6 +43,7 @@ export const NVIDIA_CUDA_ACCELERATORS: ReadonlySet<string> = new Set([
 export const CUDA_ONLY_LLM_ENGINES: ReadonlySet<string> = new Set([
   "llama.cpp",
   "vllm",
+  "transformers",
 ]);
 
 export const MIN_RELAY_SESSION_HOURS = 0.1;

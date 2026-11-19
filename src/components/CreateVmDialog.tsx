@@ -80,7 +80,7 @@ export const LLM_ENGINES = [
   { v: "llama.cpp", label: "llama.cpp (CUDA GGUF)", desc: "极速拉取 GGUF 量化权重，原生 CUDA 推理", requiresCuda: true },
   { v: "vllm", label: "vLLM (PagedAttention)", desc: "高并发吞吐 OpenAI 兼容服务端", requiresCuda: true },
   { v: "ollama", label: "Ollama", desc: "一键拉取 Ollama 模型仓库并暴露接口", requiresCuda: false },
-  { v: "transformers", label: "HF Transformers", desc: "原生 PyTorch 流式生成服务", requiresCuda: false },
+  { v: "transformers", label: "HF Transformers (CUDA)", desc: "原生 PyTorch CUDA bfloat16 流式生成服务", requiresCuda: true },
   { v: "builtin", label: "Builtin 轻量边车", desc: "秒级启动云端边车用于链路冒烟与调试", requiresCuda: false },
 ];
 

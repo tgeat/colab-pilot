@@ -839,8 +839,8 @@ test("Issues #66, #67, #68, #69, #70: modal scroll layout, general GDrive opt-in
     true,
   );
 
-  // #68: CUDA engines rejected on CPU and TPU, allowed on NVIDIA GPUs
-  for (const cudaEng of ["vllm", "llama.cpp"]) {
+  // #68: CUDA engines (vllm, llama.cpp, transformers) rejected on CPU and TPU, allowed on NVIDIA GPUs
+  for (const cudaEng of ["vllm", "llama.cpp", "transformers"]) {
     for (const nonCudaHw of ["CPU", "V5E1", "V6E1"]) {
       assert.equal(
         chatUtils.isLlmEngineCompatibleWithAccelerator(cudaEng, nonCudaHw),
@@ -864,6 +864,7 @@ test("Issues #66, #67, #68, #69, #70: modal scroll layout, general GDrive opt-in
     path.join(repoRoot, "src", "components", "CreateVmDialog.tsx"),
     "utf8",
   );
+  assert.match(createDlgSrc, /v:\s*"transformers"[^\n]*requiresCuda:\s*true/);
   assert.match(createDlgSrc, /const \[syncRclone, setSyncRclone\] = useState\(false\)/);
   assert.match(createDlgSrc, /<textarea[\s\S]{0,120}value=\{envVars\}/);
 

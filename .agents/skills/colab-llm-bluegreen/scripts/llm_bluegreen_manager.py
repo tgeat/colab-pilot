@@ -1662,8 +1662,8 @@ def resolve_switchover_settings(args: argparse.Namespace, st: Dict[str, Any]) ->
         new_session = explicit_new
     else:
         cand_new = resolve_slot_real_session(st, new_slot, prefix=args.session_prefix or prefix)
-        new_session = cand_new if cand_new != old_session else f"{prefix}-{new_slot}"
-        if new_session == old_session:
+        new_session = cand_new if cand_new.lower() != old_session.lower() else f"{prefix}-{new_slot}"
+        if new_session.lower() == old_session.lower():
             new_session = f"{prefix}-{new_slot}-next"
 
     engine = args.engine if args.engine is not None else st.get("engine", "builtin")
@@ -1707,6 +1707,18 @@ def validate_switchover_target_session(
             f"目标新槽位会话名 [{new_clean}] 与当前活跃会话 [{active_clean}] 同名，"
             f"拒绝在预热前覆盖或关闭正在提供服务的实例！请指定不同的 --session-name 或省略该参数。"
         )
+    slots_map = (st or {}).get("slots")
+    if isinstance(slots_map, dict):
+        for slot_key, slot_info in slots_map.items():
+            if not isinstance(slot_info, dict):
+                continue
+            role_low = str(slot_info.get("role") or slot_info.get("state") or "").strip().lower()
+            sess_name = str(slot_info.get("session_name") or "").strip()
+            if sess_name and role_low in ("active", "serving", "draining") and sess_name.lower() == new_clean.lower():
+                return (
+                    f"目标新槽位会话名 [{new_clean}] 与正在运行槽位 [{slot_key}: {sess_name}] 同名，"
+                    f"拒绝在预热前覆盖或关闭正在提供服务的实例！请指定不同的 --session-name 或省略该参数。"
+                )
     return None
 
 

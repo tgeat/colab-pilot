@@ -30,6 +30,7 @@ const GPUS = ["T4", "L4", "A100", "H100", "G4", "V5E1", "V6E1", "CPU"];
 export function RelayPanel(props: {
   vm: VmView;
   allVms?: VmView[];
+  serverStateUnknown?: boolean;
   onStart: (cfg: RelayConfig, legacyGdriveAction?: "migrate" | "ignore" | null) => void;
   onStopRequest: () => void;
   pending: boolean;
@@ -92,7 +93,8 @@ export function RelayPanel(props: {
   const disabled = running || props.pending || !!vm.busy;
   const canStart = gdriveValid && hoursValid && !gdriveConflictBlocked;
 
-  const completionView = resolveRelayCompletionView(relay);
+  const billingUnknown = Boolean(vm.server_state_unknown || props.serverStateUnknown);
+  const completionView = resolveRelayCompletionView(relay, billingUnknown);
   const stateLabel = running ? (relay?.phase_label || "接力运行中") : completionView.stateLabel;
   const sub = running
     ? `第 ${relay?.round || 1} 棒 · 已运行 ${fmtDuration(relay?.started_at ? Date.now() / 1000 - relay.started_at : 0)}`
@@ -101,6 +103,11 @@ export function RelayPanel(props: {
   const isLegacyMigrationPrompt = Boolean(
     !running && relay?.last_error && relay.last_error.includes("旧版默认目录"),
   );
+  const autoIsolatedDefault = resolveEffectiveRelayGdriveDir(DEFAULT_RELAY.gdrive_dir, vm.name);
+  const normCurrentGdrive = cfg.gdrive_dir.trim().replace(/\/+$/, "");
+  const legacyConfirmPending =
+    isLegacyMigrationPrompt &&
+    (isDefaultBareGdriveDir(normCurrentGdrive) || normCurrentGdrive === autoIsolatedDefault);
 
   const triggerStart = (
     overrideResetDoneFlag?: boolean,
@@ -108,6 +115,7 @@ export function RelayPanel(props: {
     overrideGdriveDir?: string,
   ) => {
     if (!canStart || props.pending || !!vm.busy) return;
+    if (legacyConfirmPending && !legacyGdriveAction) return;
     props.onStart(
       {
         ...cfg,
@@ -140,7 +148,7 @@ export function RelayPanel(props: {
         <button
           type="button"
           className={`switch ${running ? "on" : ""}`}
-          disabled={props.pending || !!vm.busy || (!running && !canStart)}
+          disabled={props.pending || !!vm.busy || (!running && (!canStart || legacyConfirmPending))}
           title={
             running
               ? "关闭接力训练"
@@ -150,7 +158,9 @@ export function RelayPanel(props: {
                   ? "Google Drive 目录格式必须为 remote:path（如 gdrive:colab_relay）"
                   : gdriveConflictBlocked
                     ? `目录正被实例 [${conflictingVm?.name}] 占用，请修改目录或勾选下方显式确认续训`
-                    : "开启接力训练"
+                    : legacyConfirmPending
+                      ? "检测到旧版根目录存在历史断点，请先点击下方「迁移旧断点并续训」或「忽略旧断点全新开始」确认"
+                      : "开启接力训练"
           }
           onClick={() => (running ? props.onStopRequest() : triggerStart())}
         />

@@ -2780,6 +2780,54 @@ class IssueRegressionTests(unittest.TestCase):
             self.assertTrue(receipt["training_completed"])
             self.assertTrue(receipt["weights_downloaded"])
 
+            # Verify detached child registered relative `train.py` (not absolute path) in workspaces.json
+            ws_reg_path = os.path.join(home_dir, ".config", "colab-cli", "workspaces.json")
+            if os.path.exists(ws_reg_path):
+                ws_reg = json.loads(Path(ws_reg_path).read_text(encoding="utf-8"))
+                self.assertEqual(ws_reg.get("det-rel", {}).get("active_script"), "train.py")
+
+            # Verify pre-detach GDrive lock conflict fails fast in parent without overwriting existing .colab_dl_relay.pid
+            locks_path = os.path.join(home_dir, ".config", "colab-cli", "dl_relay_locks.json")
+            os.makedirs(os.path.dirname(locks_path), exist_ok=True)
+            Path(locks_path).write_text(
+                json.dumps(
+                    {
+                        "gdrive:colab_relay/shared-lock": {
+                            "session": "sess-live",
+                            "pid": os.getpid(),
+                            "workspace": proj_dir,
+                            "updated_at": time.time(),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            pid_file = os.path.join(proj_dir, ".colab_dl_relay.pid")
+            Path(pid_file).write_text("999999", encoding="utf-8")
+            res_locked = subprocess.run(
+                [
+                    sys.executable,
+                    runner_script,
+                    "--session",
+                    "sess-intruder",
+                    "--workspace",
+                    "project",
+                    "--gdrive-dir",
+                    "gdrive:colab_relay/shared-lock",
+                    "--detach",
+                ],
+                cwd=parent_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+            self.assertNotEqual(res_locked.returncode, 0, "Conflicting GDrive lock must fail in --detach parent")
+            self.assertIn("sess-live", res_locked.stdout + res_locked.stderr)
+            self.assertEqual(Path(pid_file).read_text(encoding="utf-8"), "999999", "Must not overwrite .colab_dl_relay.pid")
+
 
 if __name__ == "__main__":
     unittest.main()

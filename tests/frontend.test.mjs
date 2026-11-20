@@ -1144,6 +1144,50 @@ test("Issue #82: mergeOverviewSnapshot ignores late older is_stale snapshots and
   assert.equal(mergedLaterErr.last_ok_timestamp, 2000);
   assert.equal(mergedLaterErr.is_stale, true);
   assert.equal(mergedLaterErr.stale_reason, "503 upstream timeout");
+
+  // 5) Regression (#57 + #82): newer seq stale fallback whose timestamp was pinned to prev_ok_ts (2000)
+  //    after an 8s cached_fresh poll (timestamp 2003, seq 6, last_ok_timestamp 2000) MUST NOT be dropped!
+  const afterCachedPoll = {
+    ...freshSnap,
+    timestamp: 2003,
+    seq: 6,
+    last_ok_timestamp: 2000,
+    is_stale: false,
+    stale_reason: null,
+  };
+  const manualRefreshStaleFallback = {
+    ...freshSnap,
+    timestamp: 2000,
+    seq: 7,
+    last_ok_timestamp: 2000,
+    is_stale: true,
+    stale_reason: "502 Bad Gateway",
+  };
+  const mergedManualFail = chatUtils.mergeOverviewSnapshot(afterCachedPoll, manualRefreshStaleFallback);
+  assert.equal(mergedManualFail.is_stale, true);
+  assert.equal(mergedManualFail.stale_reason, "502 Bad Gateway");
+  assert.equal(mergedManualFail.seq, 7);
+  assert.equal(mergedManualFail.vms.length, 1);
+
+  // 6) #78 sanitization: resolveRelayCompletionView strips prior 停费核验通过 label when billingUnknown=true
+  const sanitizedView = chatUtils.resolveRelayCompletionView(
+    {
+      vm_name: "stopped-job",
+      running: false,
+      round: 1,
+      phase: "stopped",
+      phase_label: "已关闭接力并销毁云端实例（停费核验通过）",
+      started_at: 1000,
+      round_started_at: 1000,
+      config: {},
+      logs: [],
+      child_pid: null,
+      last_error: null,
+    },
+    true,
+  );
+  assert.doesNotMatch(sanitizedView.stateLabel, /停费核验通过|销毁云端实例|已释放/);
+  assert.match(sanitizedView.stateLabel, /云端计费状态未知/);
 });
 
 test("Issues #80, #83, #87: setScriptDirty IPC, legacy GDrive confirmation UI, and topmost window-close modal stacking", async () => {
@@ -1218,4 +1262,5 @@ test("Issues #80, #83, #87: setScriptDirty IPC, legacy GDrive confirmation UI, a
   );
   assert.match(relayPanelSrc, /迁移旧断点并续训/);
   assert.match(relayPanelSrc, /忽略旧断点全新开始/);
+  assert.match(relayPanelSrc, /legacyConfirmPending/);
 });

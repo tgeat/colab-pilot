@@ -251,6 +251,7 @@ export function Modal(props: {
         const modalEl = modalRef.current;
         if (modalEl && !isTopmostModal(modalEl)) return;
         e.preventDefault();
+        e.stopImmediatePropagation();
         onCloseRef.current();
       }
     };

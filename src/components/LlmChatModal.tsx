@@ -488,6 +488,7 @@ export function LlmChatModal(props: {
         const modalEl = modalRef.current;
         if (modalEl && !isTopmostModal(modalEl)) return;
         e.preventDefault();
+        e.stopImmediatePropagation();
         if (sending) handleStop();
         else handleCloseModal();
       }

@@ -2067,12 +2067,17 @@ fn terminate_process_tree_win32(root_pid: u32) -> bool {
         fn Process32NextW(h_snapshot: isize, lppe: *mut ProcessEntry32W) -> i32;
         fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
         fn TerminateProcess(h_process: isize, u_exit_code: u32) -> i32;
+        fn GetExitCodeProcess(h_process: isize, lp_exit_code: *mut u32) -> i32;
+        fn GetLastError() -> u32;
         fn CloseHandle(h_object: isize) -> i32;
     }
 
     const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
     const INVALID_HANDLE_VALUE: isize = -1;
     const PROCESS_TERMINATE: u32 = 0x0001;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
 
     let self_pid = std::process::id();
     if root_pid == 0 || root_pid == self_pid {
@@ -2097,6 +2102,11 @@ fn terminate_process_tree_win32(root_pid: u32) -> bool {
         }
         let _ = CloseHandle(snap);
 
+        let root_present = pairs.iter().any(|&(pid, _)| pid == root_pid);
+        if !root_present {
+            return true;
+        }
+
         let mut visited = std::collections::HashSet::new();
         let mut order = Vec::new();
         visited.insert(root_pid);
@@ -2117,14 +2127,30 @@ fn terminate_process_tree_win32(root_pid: u32) -> bool {
         }
 
         // 先终止子孙进程，再终止根进程，防止父进程退出后子进程逃逸
+        let mut root_gone = false;
         for &pid in order.iter().rev() {
-            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            let mut h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h == 0 {
+                h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            }
             if h != 0 {
-                let _ = TerminateProcess(h, 1);
+                let term_ok = TerminateProcess(h, 1) != 0;
+                if pid == root_pid {
+                    if term_ok {
+                        root_gone = true;
+                    } else {
+                        let mut ec: u32 = 0;
+                        if GetExitCodeProcess(h, &mut ec) != 0 && ec != STILL_ACTIVE {
+                            root_gone = true;
+                        }
+                    }
+                }
                 let _ = CloseHandle(h);
+            } else if pid == root_pid && GetLastError() == ERROR_INVALID_PARAMETER {
+                root_gone = true;
             }
         }
-        true
+        root_gone
     }
 }
 

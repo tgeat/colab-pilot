@@ -635,7 +635,19 @@ export function isValidRelaySessionHours(hours: unknown): boolean {
 /**
  * 严格区分“云端训练已完成”与“最终权重已成功下载到本地” (#53)。
  */
-export function resolveRelayCompletionView(relay: RelayStatus | null | undefined): {
+function sanitizeRelayStateLabelWhenBillingUnknown(label: string, fallback: string): string {
+  const clean = str(label).trim();
+  if (!clean) return fallback;
+  if (/(停费核验通过|销毁云端实例|已释放|已停止计费|不再产生计费)/.test(clean)) {
+    return "本机接力已停止（云端计费状态未知）";
+  }
+  return clean;
+}
+
+export function resolveRelayCompletionView(
+  relay: RelayStatus | null | undefined,
+  billingUnknown = false,
+): {
   isDownloadFailed: boolean;
   isCompletedAndDownloaded: boolean;
   isError: boolean;
@@ -695,11 +707,14 @@ export function resolveRelayCompletionView(relay: RelayStatus | null | undefined
 
   if (isCompletedAndDownloaded) {
     const savedAt = str(relay.local_weights_path).trim();
+    const rawLabel = relay.phase_label || "训练与回收已完成";
     return {
       isDownloadFailed: false,
       isCompletedAndDownloaded: true,
       isError: false,
-      stateLabel: relay.phase_label || "训练与回收已完成",
+      stateLabel: billingUnknown
+        ? sanitizeRelayStateLabelWhenBillingUnknown(rawLabel, "训练与回收已完成")
+        : rawLabel,
       sub: savedAt
         ? `已从 Google Drive 回收最终 checkpoint（${savedAt}）`
         : "已从 Google Drive 回收最终 checkpoint",
@@ -709,22 +724,28 @@ export function resolveRelayCompletionView(relay: RelayStatus | null | undefined
   }
 
   if (relay.phase === "error" || Boolean(lastErr)) {
+    const rawLabel = relay.phase_label || "接力异常停止";
     return {
       isDownloadFailed: false,
       isCompletedAndDownloaded: false,
       isError: true,
-      stateLabel: relay.phase_label || "接力异常停止",
+      stateLabel: billingUnknown
+        ? sanitizeRelayStateLabelWhenBillingUnknown(rawLabel, "接力异常停止")
+        : rawLabel,
       sub: lastErr || "请查看下方「接力日志」排查原因",
       detailError: lastErr || null,
       canRetryDownload: false,
     };
   }
 
+  const rawIdleLabel = relay.phase_label || "未开启接力";
   return {
     isDownloadFailed: false,
     isCompletedAndDownloaded: false,
     isError: false,
-    stateLabel: relay.phase_label || "未开启接力",
+    stateLabel: billingUnknown
+      ? sanitizeRelayStateLabelWhenBillingUnknown(rawIdleLabel, "本机接力已停止")
+      : rawIdleLabel,
     sub: "开启后自动换棒、定时热备、到期销毁旧实例",
     detailError: null,
     canRetryDownload: false,
@@ -911,18 +932,41 @@ export function mergeOverviewSnapshot(
 
   const prevSeq = typeof prev.seq === "number" && prev.seq > 0 ? prev.seq : 0;
   const nextSeq = typeof next.seq === "number" && next.seq > 0 ? next.seq : 0;
-  if (prevSeq > 0 && nextSeq > 0 && nextSeq < prevSeq) {
-    return prev;
-  }
-
   const prevTs = typeof prev.timestamp === "number" ? prev.timestamp : 0;
   const nextTs = typeof next.timestamp === "number" ? next.timestamp : 0;
+  const prevOk = prev.last_ok_timestamp ?? prevTs;
+  const nextOk = next.last_ok_timestamp ?? nextTs;
+
+  // 当后端单调代次 seq 均存在时，严格以 seq 判定快照先后顺序（避免 60s 缓存回退将 timestamp 置为 prev_ok_ts 后被误丢弃）
+  if (prevSeq > 0 && nextSeq > 0) {
+    if (nextSeq < prevSeq) {
+      return prev;
+    }
+    if (next.server_list_known === false) {
+      return next;
+    }
+    if (nextOk < prevOk) {
+      if (next.is_stale || next.stale_reason || next.error) {
+        return {
+          ...prev,
+          seq: nextSeq,
+          is_stale: true,
+          stale_reason: next.stale_reason || next.error || "最新列表查询失败",
+        };
+      }
+      return prev;
+    }
+    return next;
+  }
+
   if (nextTs < prevTs) {
     return prev;
   }
 
-  const prevOk = prev.last_ok_timestamp ?? prevTs;
-  const nextOk = next.last_ok_timestamp ?? nextTs;
+  if (next.server_list_known === false) {
+    return next;
+  }
+
   if (nextOk < prevOk) {
     if (nextTs > prevTs && (next.is_stale || next.stale_reason || next.error)) {
       return {
@@ -1000,7 +1044,7 @@ export function resolveVmStatusPillSpec(
     };
   }
   if (!vm.on_server && vm.relay) {
-    const view = resolveRelayCompletionView(vm.relay);
+    const view = resolveRelayCompletionView(vm.relay, billingUnknown);
     if (billingUnknown) {
       if (view.isError) {
         return {

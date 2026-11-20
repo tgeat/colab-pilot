@@ -1682,6 +1682,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             ov.server_list_known = true;
             assignments = cached_list;
             ov.ccu = app.last_ccu.l().clone();
+            ov.timestamp = prev_ok_ts as i64;
             ov.last_ok_timestamp = Some(prev_ok_ts);
             ov.is_stale = false;
             ov.stale_reason = None;
@@ -2222,6 +2223,15 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             "GPU".to_string()
         };
         let cur_busy = app.busy.l().get(&name).cloned();
+        if ov.server_list_known && !ov.is_stale && !snap.running {
+            h.cloud_unassign_verified
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let card_state_unknown = !ov.server_list_known
+            || (ov.is_stale
+                && !h
+                    .cloud_unassign_verified
+                    .load(std::sync::atomic::Ordering::SeqCst));
         ov.vms.push(VmView {
             name: name.clone(),
             workspace,
@@ -2238,7 +2248,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             relay: Some(snap),
             busy: cur_busy,
             deploy_error: deploy_errs.get(&name).cloned(),
-            server_state_unknown: !ov.server_list_known,
+            server_state_unknown: card_state_unknown,
             ..Default::default()
         });
     }
@@ -2531,14 +2541,10 @@ pub async fn hard_terminate(
 
     let mut stopped_local_relay = false;
     let mut stopped_during_provisioning = false;
-    let mut pre_prov_snapshot_invalid = false;
+    let mut pre_prov_snapshot_invalid = true;
     let mut pre_prov_endpoints: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     if let Some(h) = app.relay(name) {
-        pre_prov_endpoints = h.pre_provision_endpoints.l().clone();
-        pre_prov_snapshot_invalid = h
-            .pre_provision_snapshot_invalid
-            .load(std::sync::atomic::Ordering::SeqCst);
         if stop_relay {
             h.keep_vm_on_stop
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2547,15 +2553,22 @@ pub async fn hard_terminate(
                 stopped_local_relay = true;
                 stopped_during_provisioning = h
                     .stopped_during_provisioning
-                    .load(std::sync::atomic::Ordering::SeqCst);
+                    .swap(false, std::sync::atomic::Ordering::SeqCst);
                 r.steps
                     .push("已停止本机接力监工任务并结束 colab 子进程树".into());
+            } else {
+                h.stopped_during_provisioning
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
             }
         } else {
             stopped_during_provisioning = h
                 .stopped_during_provisioning
-                .load(std::sync::atomic::Ordering::SeqCst);
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
         }
+        pre_prov_endpoints = h.pre_provision_endpoints.l().clone();
+        pre_prov_snapshot_invalid = h
+            .pre_provision_snapshot_invalid
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     if stopped_local_relay {
@@ -2719,6 +2732,10 @@ pub async fn hard_terminate(
                 ));
             }
         }
+        if let Some(h) = app.relay(name) {
+            h.cloud_unassign_verified
+                .store(r.verified_unassigned, std::sync::atomic::Ordering::SeqCst);
+        }
         if let Ok(c) = app.client.ccu_info().await {
             r.ccu = Some(c);
         }
@@ -2839,6 +2856,10 @@ pub async fn hard_terminate(
         }
     }
 
+    if let Some(h) = app.relay(name) {
+        h.cloud_unassign_verified
+            .store(r.verified_unassigned, std::sync::atomic::Ordering::SeqCst);
+    }
     if let Ok(c) = app.client.ccu_info().await {
         r.ccu = Some(c);
     }
@@ -3999,6 +4020,8 @@ fn start_relay_inner(
     h.pre_provision_endpoints.l().clear();
     h.auto_isolated_gdrive
         .store(auto_isolated_gdrive, std::sync::atomic::Ordering::SeqCst);
+    h.cloud_unassign_verified
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     *h.legacy_gdrive_action.l() = legacy_gdrive_action;
     h.task_alive
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4052,7 +4075,20 @@ async fn start_relay(
         return Err(format!("接力工作区路径不是有效文件夹：`{}`", ws_dir.display()));
     }
 
-    let was_auto_isolated = prepare_relay_config_for_vm(&app, &name, &mut config, None, None)?;
+    let mut was_auto_isolated = prepare_relay_config_for_vm(&app, &name, &mut config, None, None)?;
+    if !was_auto_isolated {
+        let iso_default = relay::resolve_isolated_gdrive_dir(relay::DEFAULT_BARE_GDRIVE_DIR, &name);
+        if relay::normalize_gdrive_dir(&config.gdrive_dir) == iso_default {
+            if let Some(existing_h) = app.relay(&name) {
+                if existing_h
+                    .auto_isolated_gdrive
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    was_auto_isolated = true;
+                }
+            }
+        }
+    }
     if !cli::rclone_conf_path().exists() {
         return Err("未检测到 rclone.conf，请先完成 Google Drive 授权".into());
     }
@@ -4394,24 +4430,30 @@ pub(crate) async fn save_workspace_files_inner(
         .into_iter()
         .enumerate()
     {
-        if let Ok(meta) = std::fs::symlink_metadata(target) {
-            if meta.file_type().is_symlink() {
-                return Err(format!("拒绝写入符号链接文件: {fname}"));
+        match std::fs::symlink_metadata(target) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(format!("拒绝写入符号链接文件: {fname}"));
+                }
+                if meta.is_dir() {
+                    return Err(format!("无法写入 `{fname}`：目标路径是一个文件夹"));
+                }
+                if meta.permissions().readonly() {
+                    return Err(format!("无法写入 `{fname}`：文件处于只读状态，未修改任何工作区文件"));
+                }
+                // 在不截断旧文件的前提下探测可写句柄，提前拦截 ACL 拒绝或独占锁
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(target)
+                    .map_err(|e| format!("无法写入 `{fname}`（未修改任何工作区文件）：{e}"))?;
+                let prev = std::fs::read(target)
+                    .map_err(|e| format!("备份 `{fname}` 原始内容失败（未修改任何工作区文件）：{e}"))?;
+                orig_snapshots[idx] = Some(prev);
             }
-            if meta.is_dir() {
-                return Err(format!("无法写入 `{fname}`：目标路径是一个文件夹"));
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!("无法访问 `{fname}` 元数据（未修改任何工作区文件）：{e}"));
             }
-            if meta.permissions().readonly() {
-                return Err(format!("无法写入 `{fname}`：文件处于只读状态，未修改任何工作区文件"));
-            }
-            // 在不截断旧文件的前提下探测可写句柄，提前拦截 ACL 拒绝或独占锁
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(target)
-                .map_err(|e| format!("无法写入 `{fname}`（未修改任何工作区文件）：{e}"))?;
-            let prev = std::fs::read(target)
-                .map_err(|e| format!("备份 `{fname}` 原始内容失败（未修改任何工作区文件）：{e}"))?;
-            orig_snapshots[idx] = Some(prev);
         }
     }
 
@@ -5527,12 +5569,15 @@ async fn stream_via_colab_runtime(
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
 
+    let payload_bytes = serde_json::to_vec(body_val)?;
     let mut child = cmd.spawn().context("启动 ColabRuntime 流式桥接进程失败")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let payload_bytes = serde_json::to_vec(body_val)?;
-        let _ = stdin.write_all(&payload_bytes).await;
-        let _ = stdin.shutdown().await;
-    }
+    let stdin_task = child.stdin.take().map(|mut stdin| {
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&payload_bytes).await;
+            let _ = stdin.shutdown().await;
+            drop(stdin);
+        })
+    });
 
     // 持续排空 stderr（防止管道写满导致子进程阻塞），仅保留末尾约 2KB 用于错误提示
     let stderr_task = child.stderr.take().map(|mut se| {
@@ -5642,6 +5687,10 @@ async fn stream_via_colab_runtime(
     if let Some(kid) = discovered_kid {
         let ep = a.endpoint.clone();
         let _ = tokio::task::spawn_blocking(move || cli::update_session_kernel_id(&ep, &kid)).await;
+    }
+
+    if let Some(t) = stdin_task {
+        t.abort();
     }
 
     if cancelled {
@@ -6668,7 +6717,16 @@ pub(crate) async fn confirm_app_close_inner(
     mode: &str,
 ) -> Result<(Vec<TerminateReceipt>, bool), String> {
     let m = mode.trim().to_ascii_lowercase();
-    if m == "keep_vms" || m == "force_exit" {
+    if m == "force_exit" {
+        app.script_dirty
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if should_intercept_window_close(app).is_some() {
+            return Ok((Vec::new(), false));
+        }
+        app.force_close_confirmed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok((Vec::new(), true))
+    } else if m == "keep_vms" {
         let handles: Vec<Arc<RelayHandle>> = app.relays.l().values().cloned().collect();
         for h in handles {
             if h.is_running() || h.task_alive.load(std::sync::atomic::Ordering::SeqCst) {
@@ -6740,7 +6798,7 @@ pub(crate) async fn confirm_app_close_inner(
         }
     } else {
         Err(format!(
-            "不支持的窗口关闭确认模式 `{mode}`（仅支持 keep_vms 或 shutdown_vms）"
+            "不支持的窗口关闭确认模式 `{mode}`（仅支持 keep_vms、shutdown_vms 或 force_exit）"
         ))
     }
 }
@@ -6760,6 +6818,14 @@ async fn confirm_app_close(
         }
         handle.exit(0);
     } else {
+        if mode.trim().eq_ignore_ascii_case("force_exit") {
+            if let Some(active_vms) = should_intercept_window_close(&app) {
+                let _ = handle.emit(
+                    "close-requested-with-relay",
+                    serde_json::json!({ "active_vms": active_vms }),
+                );
+            }
+        }
         let ov = refresh_overview(&app, true).await;
         emit_overview(&handle, &ov);
     }
@@ -8578,6 +8644,31 @@ sys.exit(rc)
             "unassign must ONLY be called on the confirmed session endpoint"
         );
 
+        // Subcase B (#77): consumed/repeated provisioning snapshot or 2-endpoint concurrent race must NEVER guess & kill m-s-other-project
+        std::fs::write(cfg_dir.join("sessions.json"), "{}").unwrap();
+        relay_alive.store(true, Ordering::SeqCst);
+        let h_race = Arc::new(RelayHandle::new("race-relay"));
+        h_race.status.l().running = true;
+        h_race.status.l().phase = "provisioning".into();
+        h_race.task_alive.store(true, Ordering::SeqCst);
+        h_race.pre_provision_snapshot_invalid.store(false, Ordering::SeqCst);
+        app.relays.l().insert("race-relay".into(), h_race.clone());
+
+        // Both `m-s-relay001` and `m-s-other-project` appear as newly_leaked (len == 2) -> must refuse guessing!
+        let r_race = hard_terminate(&app, "race-relay", None, true).await;
+        assert!(!r_race.verified_unassigned, "ambiguous 2-endpoint race must refuse guessing");
+        assert!(other_alive.load(Ordering::SeqCst), "must leave unrelated endpoint untouched");
+        assert!(relay_alive.load(Ordering::SeqCst), "must leave both untouched when ambiguous");
+        assert_eq!(*unassigned_eps.l(), vec!["m-s-relay001".to_string()]);
+
+        // Now suppose `m-s-relay001` disappeared externally leaving ONLY `m-s-other-project`, and a second hard_terminate runs:
+        // because the provisioning snapshot was already consumed, `m-s-other-project` MUST still NOT be unassigned!
+        relay_alive.store(false, Ordering::SeqCst);
+        let r_repeat = hard_terminate(&app, "race-relay", None, false).await;
+        assert!(!r_repeat.verified_unassigned);
+        assert!(other_alive.load(Ordering::SeqCst), "consumed snapshot must never kill remaining other-project endpoint");
+        assert_eq!(*unassigned_eps.l(), vec!["m-s-relay001".to_string()]);
+
         *cli::TEST_CONFIG_DIR.l() = None;
         *cli::TEST_COLAB_BIN.l() = None;
         srv.abort();
@@ -8673,6 +8764,35 @@ sys.exit(rc)
             .unwrap();
         assert!(!card_confirmed.server_state_unknown);
 
+        // #78 subcase: unverified offline relay during <60s stale cache fallback MUST ALSO mark server_state_unknown=true
+        let unverified_h = Arc::new(RelayHandle::new("unverified-stop-relay"));
+        unverified_h.status.l().running = false;
+        unverified_h.status.l().phase = "stopped".into();
+        unverified_h.cloud_unassign_verified.store(false, Ordering::SeqCst);
+        app.relays.l().insert("unverified-stop-relay".into(), unverified_h);
+        fail_server.store(true, Ordering::SeqCst);
+        let ov_stale_unverified = refresh_overview(&app, true).await;
+        assert!(ov_stale_unverified.is_stale);
+        let card_stale_unverified = ov_stale_unverified
+            .vms
+            .iter()
+            .find(|v| v.name == "unverified-stop-relay")
+            .expect("unverified offline relay retained");
+        assert!(
+            card_stale_unverified.server_state_unknown,
+            "unverified offline relay must NOT claim stopped billing on a stale cache fallback (#78)"
+        );
+        let card_prev_verified = ov_stale_unverified
+            .vms
+            .iter()
+            .find(|v| v.name == "offline-relay")
+            .unwrap();
+        assert!(
+            !card_prev_verified.server_state_unknown,
+            "previously verified offline relay stays known within 60s cache window"
+        );
+        fail_server.store(false, Ordering::SeqCst);
+
         // #84: Atomic workspace script save — read-only requirements.txt MUST preserve original train.py
         let train_p = ws_dir.join("train.py");
         let req_p = ws_dir.join("requirements.txt");
@@ -8729,6 +8849,26 @@ sys.exit(rc)
         assert!(exit_ok);
         assert!(!app.script_dirty.load(Ordering::SeqCst));
         assert!(evaluate_window_close_interception(&app).is_none());
+
+        // #83 + #72: `force_exit` MUST NOT bypass active relay protection if a relay is active
+        app.force_close_confirmed.store(false, Ordering::SeqCst);
+        app.script_dirty.store(true, Ordering::SeqCst);
+        let live_h = Arc::new(RelayHandle::new("live-relay"));
+        live_h.status.l().running = true;
+        live_h.status.l().phase = "training".into();
+        live_h.task_alive.store(true, Ordering::SeqCst);
+        app.relays.l().insert("live-relay".into(), live_h.clone());
+        let (_, exit_with_live) = confirm_app_close_inner(&app, "force_exit").await.unwrap();
+        assert!(
+            !exit_with_live,
+            "force_exit must NOT exit or kill active relays when a relay is running (#72 + #83)"
+        );
+        assert!(live_h.is_running(), "live relay must still be running until CloseAppRelayDialog decision");
+        assert!(!app.script_dirty.load(Ordering::SeqCst));
+        assert_eq!(
+            should_intercept_window_close(&app),
+            Some(vec!["live-relay".to_string()])
+        );
 
         *cli::TEST_CONFIG_DIR.l() = None;
         *cli::TEST_COLAB_BIN.l() = None;

@@ -701,7 +701,9 @@ export function VmCard({
   const isProbing = probingLocal || vm.busy === "probing";
   const isOfflineRelayRecord = !vm.on_server && vm.relay !== null;
   const isBillingUnknown = Boolean(vm.server_state_unknown || serverStateUnknown);
-  const offlineRelayView = isOfflineRelayRecord ? resolveRelayCompletionView(vm.relay) : null;
+  const offlineRelayView = isOfflineRelayRecord
+    ? resolveRelayCompletionView(vm.relay, isBillingUnknown)
+    : null;
 
   const gpu = t?.gpu;
   const rawProcs = t?.threads?.processes;
@@ -1152,6 +1154,7 @@ export function VmCard({
                 <RelayPanel
                   vm={vm}
                   allVms={allVms}
+                  serverStateUnknown={isBillingUnknown}
                   pending={relayPending}
                   onStart={handleStartRelayClick}
                   onStopRequest={() => onRequestStopRelay?.(vm)}

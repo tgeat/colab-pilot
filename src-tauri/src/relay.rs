@@ -249,6 +249,8 @@ pub struct RelayHandle {
     pub auto_isolated_gdrive: AtomicBool,
     /// 用户显式确认的旧版根目录断点处理动作：`Some("migrate")` | `Some("ignore")` | `None` (#80)
     pub legacy_gdrive_action: Mutex<Option<String>>,
+    /// 标记最近一次停止/完成后是否已由服务端实时查询确认该会话无在跑计费实例 (#78)
+    pub cloud_unassign_verified: AtomicBool,
     /// 后台监工任务是否仍在执行（stop 后到任务真正退出之间仍为 true，用于拒绝重复启动）
     pub task_alive: AtomicBool,
     /// 手动停止接力时是否保留当前云端实例（仅 `stop_relay(..., destroy_vm=false)` 时置 true）
@@ -275,6 +277,7 @@ impl RelayHandle {
             stopped_during_provisioning: AtomicBool::new(false),
             auto_isolated_gdrive: AtomicBool::new(false),
             legacy_gdrive_action: Mutex::new(None),
+            cloud_unassign_verified: AtomicBool::new(false),
             task_alive: AtomicBool::new(false),
             keep_vm_on_stop: AtomicBool::new(false),
             gen: AtomicU64::new(0),
@@ -1138,6 +1141,7 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
                     h.pre_provision_snapshot_invalid.store(true, Ordering::SeqCst);
                 }
             }
+            h.cloud_unassign_verified.store(false, Ordering::SeqCst);
             h.set_phase("provisioning", format!("第 {round} 棒：申请云端 {} 实例", cfg.gpu_type));
             h.log(format!("☁️ 正在向 Google Colab 申请实例 [{name}]…"));
             let hh = h.clone();
@@ -1154,6 +1158,9 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             if prov_res.is_ok() {
                 h.pre_provision_snapshot_invalid.store(true, Ordering::SeqCst);
                 h.set_phase("connecting", format!("第 {round} 棒：连接已分配实例"));
+            } else if !cancel.is_cancelled() {
+                h.pre_provision_snapshot_invalid.store(true, Ordering::SeqCst);
+                h.set_phase("alloc_failed", format!("第 {round} 棒：实例申请失败"));
             }
             prov_res?;
         }
@@ -1165,6 +1172,7 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             .find_assignment_by_name(&name)
             .await
             .ok_or_else(|| anyhow!("服务端未找到实例 [{name}]"))?;
+        h.cloud_unassign_verified.store(false, Ordering::SeqCst);
         h.log(format!("✅ 实例就绪，Endpoint：{}", a.endpoint));
 
         // 2. 上传 rclone.conf、工作区标记与绑定工作区的 train.py

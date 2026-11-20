@@ -245,6 +245,7 @@ def acquire_gdrive_dir_lock(
     session_name: str,
     workspace_dir: str,
     allow_shared: bool = False,
+    dry_run: bool = False,
 ) -> Tuple[bool, str]:
     """检查并登记本地活跃接力目录锁，防止两个不同会话误共用同一云盘目录互相覆盖断点与完成标记。"""
     lock_file = relay_locks_path()
@@ -276,6 +277,9 @@ def acquire_gdrive_dir_lock(
             f"云盘目录 `{norm_dir}` 正被另一活跃接力任务 [{other_sess}] (PID={other_pid}) 占用！"
             f"请改用独立的 `--gdrive-dir` / `--session-prefix`，或显式传入 `--allow-shared-gdrive-dir` 确认复用。",
         )
+
+    if dry_run:
+        return True, ""
 
     alive_locks[norm_dir] = {
         "session": session_name,
@@ -970,6 +974,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 1
 
     if args.detach and os.environ.get("DL_RELAY_DETACHED") != "1":
+        pre_lock_ok, pre_lock_err = acquire_gdrive_dir_lock(
+            effective_gdrive_dir,
+            session_name=session_name,
+            workspace_dir=workspace_abs,
+            allow_shared=args.allow_shared_gdrive_dir,
+            dry_run=True,
+        )
+        if not pre_lock_ok:
+            print(f"❌ {pre_lock_err}", flush=True)
+            return 1
+        if not was_auto_isolated and not args.allow_shared_gdrive_dir and not args.reset_done_flag:
+            rem_ok, rem_err = check_remote_active_lock(rclone_bin, rclone_conf, effective_gdrive_dir, session_name)
+            if not rem_ok:
+                print(f"❌ {rem_err}", flush=True)
+                return 1
+
         log_file = os.path.join(workspace_abs, ".colab_dl_relay.log")
         pid_file = os.path.join(workspace_abs, ".colab_dl_relay.pid")
         cmd = build_detached_child_cmd(args, workspace_abs, script_abs, effective_gdrive_dir)
@@ -1024,10 +1044,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"❌ {rem_err}", flush=True)
                 return 1
 
+        try:
+            rel_script = os.path.relpath(script_abs, workspace_abs)
+            if rel_script.startswith(".."):
+                rel_script = os.path.basename(script_abs)
+        except ValueError:
+            rel_script = os.path.basename(script_abs)
+
         register_workspace(
             session_name=args.session,
             workspace_dir=workspace_abs,
-            script_name=args.script,
+            script_name=rel_script,
             description=f"DL Serial Relay ({args.gpu}) -> {effective_gdrive_dir}",
         )
 

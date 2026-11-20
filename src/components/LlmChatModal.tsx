@@ -31,7 +31,7 @@ import {
   parseMarkdownSegments,
   resolveChatTargetState,
 } from "../chatUtils";
-import { ColabIcon, useModalFocusTrap, useToast } from "./ui";
+import { ColabIcon, isTopmostModal, useModalFocusTrap, useToast } from "./ui";
 
 export { isLlmVm };
 
@@ -485,6 +485,8 @@ export function LlmChatModal(props: {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        const modalEl = modalRef.current;
+        if (modalEl && !isTopmostModal(modalEl)) return;
         e.preventDefault();
         if (sending) handleStop();
         else handleCloseModal();

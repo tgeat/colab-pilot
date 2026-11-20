@@ -169,41 +169,26 @@ def rclone_pull_checkpoint(local_ckpt):
     """
     安全拉取历史断点：
     - 若云盘存在有效断点：拉取并校验本地非空，拉取失败立即抛错保护；
-    - 若云盘不存在主断点，但存在历史备份或训练结果产物（处于续训状态）且 RELAY_ROUND>1 未重置：报错拒绝归零覆写；
-    - 若云盘经查询确认尚无任何断点及训练产物（全新非续训状态）：即便 RELAY_ROUND>1（如前序分配失败重试导致），
-      输出清晰诊断提示后允许按实际无断点状态从头启动。
+    - 若云盘不存在主断点且本地也无有效断点：当 RELAY_ROUND>1 且未显式设置 RESET_DONE_FLAG=1 时，
+      无论云盘任务目录为空还是仅残留部分产物，均立即中止并指出断点缺失，杜绝第二棒丢失目录内容后从第 0 轮开训。
     """
     if SMOKE_TEST and os.environ.get("SMOKE_SKIP_RCLONE", "1") == "1":
         return False
     gd = _effective_gdrive_dir()
     ckpt_name = os.path.basename(local_ckpt)
-    stem, ext = os.path.splitext(ckpt_name)
-    prev_name = f"{stem}_prev{ext or '.pt'}"
     effective_round = int(os.environ.get("RELAY_ROUND", RELAY_ROUND))
     reset_flag = os.environ.get("RESET_DONE_FLAG", "0") == "1"
 
     entries = _list_remote_entries(gd)
     exists = ckpt_name in entries
-    has_prior_state = (
-        prev_name in entries
-        or "results/" in entries
-        or "results" in entries
-        or "training_done.flag" in entries
-        or "TRAINING_COMPLETED.flag" in entries
-    )
 
     if not exists:
         if os.path.exists(local_ckpt) and os.path.getsize(local_ckpt) > 0:
             return True
         if effective_round > 1 and not reset_flag:
-            if has_prior_state:
-                raise RuntimeError(
-                    f"第 {effective_round} 棒接力异常：Google Drive ({gd}) 存在历史训练产物但未找到 {ckpt_name}，拒绝从第 0 轮重跑覆写！"
-                )
-            print(
-                f"⚠️ [接力诊断] 当前 RELAY_ROUND={effective_round}，但已确认云盘目录 ({gd}) 尚无任何历史断点或训练产物"
-                f"（非续训状态，可能由前序实例分配失败重试导致），将按实际无断点状态从第 0 轮启动。",
-                flush=True,
+            raise RuntimeError(
+                f"第 {effective_round} 棒接力异常：Google Drive ({gd}) 中缺失历史断点 {ckpt_name}，本地也无有效断点，"
+                f"已中止启动防止从第 0 轮重训丢失进度！（若确需从头重新训练，请显式设置 RESET_DONE_FLAG=1）"
             )
         return False
 

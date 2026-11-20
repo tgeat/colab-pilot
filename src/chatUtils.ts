@@ -3,6 +3,7 @@ import type {
   CreateVmLlmConfig,
   EnvStatus,
   LlmBlueGreenState,
+  Overview,
   RecentSessionView,
   RelayConfig,
   RelayStatus,
@@ -884,18 +885,75 @@ export function computeNextFocusTrapIndex(
 }
 
 /**
- * 计算实例卡片顶部状态徽章文案与色调 (#65, #73, #76)：
+ * 判断总览快照是否因鉴权缺失或超出缓存窗口的列表查询失败而处于“云端计费状态未知”(#78)。
+ */
+export function isOverviewServerListUnknown(ov: Overview | null | undefined): boolean {
+  if (!ov) return true;
+  if (ov.server_list_known === false) return true;
+  if (ov.server_list_known === undefined && Boolean(ov.error) && !ov.is_stale) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 合并总览快照 (#82)：
+ * - 严格拒绝时间更早或代次 `seq` 更旧的迟到快照（包括 `is_stale=true` 的旧快照）回退覆盖已收到的更新实例数据；
+ * - 若新快照生成时间更晚 (`next.timestamp > prev.timestamp`) 但因查询失败携带较旧的 `last_ok_timestamp`，
+ *   仅将查询错误作为独立告警状态附加到当前最新数据上，绝不清空或回退上一帧在线实例列表。
+ */
+export function mergeOverviewSnapshot(
+  prev: Overview | null,
+  next: Overview | null | undefined,
+): Overview | null {
+  if (!next) return prev;
+  if (!prev) return next;
+
+  const prevSeq = typeof prev.seq === "number" && prev.seq > 0 ? prev.seq : 0;
+  const nextSeq = typeof next.seq === "number" && next.seq > 0 ? next.seq : 0;
+  if (prevSeq > 0 && nextSeq > 0 && nextSeq < prevSeq) {
+    return prev;
+  }
+
+  const prevTs = typeof prev.timestamp === "number" ? prev.timestamp : 0;
+  const nextTs = typeof next.timestamp === "number" ? next.timestamp : 0;
+  if (nextTs < prevTs) {
+    return prev;
+  }
+
+  const prevOk = prev.last_ok_timestamp ?? prevTs;
+  const nextOk = next.last_ok_timestamp ?? nextTs;
+  if (nextOk < prevOk) {
+    if (nextTs > prevTs && (next.is_stale || next.stale_reason || next.error)) {
+      return {
+        ...prev,
+        timestamp: nextTs,
+        seq: nextSeq || prevSeq || undefined,
+        is_stale: true,
+        stale_reason: next.stale_reason || next.error || "最新列表查询失败",
+      };
+    }
+    return prev;
+  }
+
+  return next;
+}
+
+/**
+ * 计算实例卡片顶部状态徽章文案与色调 (#65, #73, #76, #78)：
  * - `vm.relay?.running === true` 时必须反映接力活跃阶段，绝不显示“空闲”
  * - `llm` 空闲时只使用 `instant_tps`（0.0 tok/s 空闲），绝不把 `last_request_tps` 标为实时速率
- * - `!vm.on_server && vm.relay` 离线接力记录卡片清晰展示最终状态与实例已下线信息
+ * - `!vm.on_server && vm.relay` 离线接力记录卡片：若服务端列表查询失败则保留“计费状态未知”，仅在确认释放后显示已释放/已下线
  */
 export function resolveVmStatusPillSpec(
   vm: VmView,
   hasActiveProc: boolean,
+  serverStateUnknown = false,
 ): { cls: string; pulse: boolean; text: string; title?: string } {
   const t = vm.telemetry;
   const llm = t?.llm;
   const tr = t?.training;
+  const billingUnknown = Boolean(vm.server_state_unknown || serverStateUnknown);
 
   if (vm.busy === "creating") {
     return { cls: "pill-amber", pulse: true, text: "开机分配中…" };
@@ -943,6 +1001,30 @@ export function resolveVmStatusPillSpec(
   }
   if (!vm.on_server && vm.relay) {
     const view = resolveRelayCompletionView(vm.relay);
+    if (billingUnknown) {
+      if (view.isError) {
+        return {
+          cls: "pill-amber",
+          pulse: false,
+          text: "接力失败 · 计费状态未知",
+          title: "服务端实例列表查询失败，暂无法确认云端实例是否已停费",
+        };
+      }
+      if (view.isCompletedAndDownloaded || view.isDownloadFailed) {
+        return {
+          cls: "pill-amber",
+          pulse: false,
+          text: "接力已结束 · 计费状态未知",
+          title: "服务端实例列表查询失败，暂无法确认云端实例是否已停费",
+        };
+      }
+      return {
+        cls: "pill-amber",
+        pulse: false,
+        text: "已停止记录 · 计费状态未知",
+        title: "服务端实例列表查询失败，暂无法确认云端实例是否已停费",
+      };
+    }
     if (view.isDownloadFailed) {
       return { cls: "pill-amber", pulse: false, text: "权重待补下载 · 实例已下线" };
     }

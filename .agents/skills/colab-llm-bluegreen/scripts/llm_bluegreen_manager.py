@@ -1687,6 +1687,29 @@ def resolve_switchover_settings(args: argparse.Namespace, st: Dict[str, Any]) ->
     }
 
 
+def validate_switchover_target_session(
+    old_session: str,
+    new_session: str,
+    st: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    new_clean = (new_session or "").strip()
+    old_clean = (old_session or "").strip()
+    if not new_clean:
+        return "新槽位目标会话名不能为空"
+    if old_clean and new_clean.lower() == old_clean.lower():
+        return (
+            f"目标新槽位会话名 [{new_clean}] 与当前承载流量的旧槽位会话 [{old_clean}] 同名，"
+            f"拒绝在预热前覆盖或关闭正在提供服务的实例！请指定不同的 --session-name 或省略该参数。"
+        )
+    active_clean = str((st or {}).get("active_session") or "").strip()
+    if active_clean and new_clean.lower() == active_clean.lower():
+        return (
+            f"目标新槽位会话名 [{new_clean}] 与当前活跃会话 [{active_clean}] 同名，"
+            f"拒绝在预热前覆盖或关闭正在提供服务的实例！请指定不同的 --session-name 或省略该参数。"
+        )
+    return None
+
+
 def cmd_switchover(args: argparse.Namespace) -> int:
     workspace_abs = os.path.abspath(args.workspace)
     colab_bin = find_bin("colab")
@@ -1698,6 +1721,11 @@ def cmd_switchover(args: argparse.Namespace) -> int:
     new_slot = cfg["new_slot"]
     old_session = cfg["old_session"]
     new_session = cfg["new_session"]
+
+    target_err = validate_switchover_target_session(old_session, new_session, st)
+    if target_err:
+        print(f"❌ 蓝绿切换预检拦截: {target_err}", file=sys.stderr, flush=True)
+        return 1
 
     engine = cfg["engine"]
     model_name = cfg["model_name"]
@@ -1895,6 +1923,11 @@ def cmd_switchover(args: argparse.Namespace) -> int:
             f"已达到排空期限，按策略 (stop) 执行停机以防止持续双倍计费！",
             flush=True,
         )
+
+    if old_session.strip().lower() == new_session.strip().lower():
+        same_err = f"新旧槽位会话同名 ({new_session})，已拒绝向当前活跃服务发送 stop 指令"
+        print(f"❌ [防误停保护] {same_err}", file=sys.stderr, flush=True)
+        return 1
 
     print(f"🧹 正在销毁旧槽位实例 ({old_session}) 并核验服务端计费释放...", flush=True)
     stop_ok, stop_err = stop_and_verify_colab_session(

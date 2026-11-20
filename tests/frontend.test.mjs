@@ -998,3 +998,224 @@ test("Issues #73, #74, #76: offline relay card preserved, recent session avoids 
   assert.match(vmCardSrc, /const showRelayDrawer = relayExpanded;/);
   assert.match(vmCardSrc, /清除记录/);
 });
+
+// ───────────────────── Issues #78, #80, #82, #83, #87 ─────────────────────
+test("Issue #78: server list failure keeps offline relay card in billing-unknown state until confirmed unassigned", () => {
+  // 1) Overview unknown detection works for both explicit server_list_known=false and simulated error without cache
+  assert.equal(chatUtils.isOverviewServerListUnknown(null), true);
+  assert.equal(
+    chatUtils.isOverviewServerListUnknown({
+      timestamp: 2000,
+      server_list_known: false,
+      error: "503 Service Unavailable",
+      is_stale: false,
+    }),
+    true,
+  );
+  assert.equal(
+    chatUtils.isOverviewServerListUnknown({
+      timestamp: 2000,
+      error: "network error",
+      is_stale: false,
+    }),
+    true,
+  );
+  assert.equal(
+    chatUtils.isOverviewServerListUnknown({
+      timestamp: 2000,
+      server_list_known: true,
+      error: null,
+      is_stale: false,
+    }),
+    false,
+  );
+  assert.equal(
+    chatUtils.isOverviewServerListUnknown({
+      timestamp: 2000,
+      server_list_known: true,
+      error: null,
+      is_stale: true,
+      stale_reason: "timeout within 60s cache",
+    }),
+    false,
+  );
+
+  // 2) Offline relay pill reports 计费状态未知 when server list failed, and 实例已下线/已释放 only after confirmation
+  const offlineRelayVm = {
+    name: "relay-job",
+    on_server: false,
+    busy: null,
+    running_task: null,
+    telemetry: null,
+    relay: {
+      vm_name: "relay-job",
+      running: false,
+      round: 2,
+      phase: "error",
+      phase_label: "OOM",
+      started_at: 1000,
+      round_started_at: 1000,
+      config: {},
+      logs: ["err"],
+      child_pid: null,
+      last_error: "OOM",
+    },
+  };
+  const pillUnknown = chatUtils.resolveVmStatusPillSpec(offlineRelayVm, false, true);
+  assert.match(pillUnknown.text, /计费状态未知/);
+  assert.doesNotMatch(pillUnknown.text, /已下线|已释放/);
+
+  const pillConfirmed = chatUtils.resolveVmStatusPillSpec(offlineRelayVm, false, false);
+  assert.equal(pillConfirmed.text, "接力失败 · 实例已下线");
+
+  const headerSrc = fs.readFileSync(path.join(repoRoot, "src", "components", "Header.tsx"), "utf8");
+  const vmCardSrc = fs.readFileSync(path.join(repoRoot, "src", "components", "VmCard.tsx"), "utf8");
+  assert.match(headerSrc, /serverUnknown\s*\?\s*"未知"\s*:\s*ov\.server_count/);
+  assert.match(vmCardSrc, /isBillingUnknown[\s\S]{0,400}云端实例计费状态未知/);
+});
+
+test("Issue #82: mergeOverviewSnapshot ignores late older is_stale snapshots and preserves newer online VMs", () => {
+  const onlineVm = { name: "vm-online", on_server: true };
+  const freshSnap = {
+    timestamp: 2000,
+    seq: 5,
+    last_ok_timestamp: 2000,
+    is_stale: false,
+    stale_reason: null,
+    server_list_known: true,
+    auth_ok: true,
+    error: null,
+    ccu: { balance: 50, burn_rate_hourly: 1.96, assignments_count: 1 },
+    server_count: 1,
+    gdrive: null,
+    env: {},
+    vms: [onlineVm],
+    recent_sessions: [],
+  };
+
+  // 1) Late-arriving older stale snapshot (timestamp 1900 < 2000) MUST be completely ignored
+  const lateStale = {
+    ...freshSnap,
+    timestamp: 1900,
+    seq: undefined,
+    last_ok_timestamp: 1900,
+    is_stale: true,
+    stale_reason: "delayed timeout",
+    server_count: 0,
+    vms: [],
+  };
+  const afterLate = chatUtils.mergeOverviewSnapshot(freshSnap, lateStale);
+  assert.equal(afterLate, freshSnap);
+  assert.equal(afterLate.vms.length, 1);
+  assert.equal(afterLate.is_stale, false);
+
+  // 2) Same timestamp (2000) with older last_ok_timestamp (1950) MUST also be ignored
+  const sameSecOlderData = {
+    ...lateStale,
+    timestamp: 2000,
+    last_ok_timestamp: 1950,
+  };
+  assert.equal(chatUtils.mergeOverviewSnapshot(freshSnap, sameSecOlderData), freshSnap);
+
+  // 3) Out-of-order lower monotonic seq (seq 4 < 5) MUST be ignored even if timestamp matches
+  const lowerSeq = {
+    ...freshSnap,
+    seq: 4,
+    is_stale: true,
+    stale_reason: "out-of-order seq",
+    vms: [],
+  };
+  assert.equal(chatUtils.mergeOverviewSnapshot(freshSnap, lowerSeq), freshSnap);
+
+  // 4) Genuinely later query failure (timestamp 2010 > 2000) surfaces independent stale banner WITHOUT wiping online VMs
+  const laterFailure = {
+    ...freshSnap,
+    timestamp: 2010,
+    seq: 6,
+    last_ok_timestamp: 1900,
+    is_stale: true,
+    stale_reason: "503 upstream timeout",
+    server_count: 0,
+    vms: [],
+  };
+  const mergedLaterErr = chatUtils.mergeOverviewSnapshot(freshSnap, laterFailure);
+  assert.equal(mergedLaterErr.vms.length, 1);
+  assert.equal(mergedLaterErr.vms[0].name, "vm-online");
+  assert.equal(mergedLaterErr.last_ok_timestamp, 2000);
+  assert.equal(mergedLaterErr.is_stale, true);
+  assert.equal(mergedLaterErr.stale_reason, "503 upstream timeout");
+});
+
+test("Issues #80, #83, #87: setScriptDirty IPC, legacy GDrive confirmation UI, and topmost window-close modal stacking", async () => {
+  mockTauriCore.invokeCalls.length = 0;
+  await apiMod.api.setScriptDirty(true);
+  await apiMod.api.confirmAppClose("force_exit");
+  await apiMod.api.startRelay(
+    "legacy-run",
+    {
+      gpu_type: "T4",
+      high_mem: true,
+      gdrive_dir: "gdrive:colab_relay",
+      max_session_hours: 20,
+      backup_interval_minutes: 30,
+      total_epochs: 10,
+      reset_done_flag: false,
+    },
+    "D:/ws",
+    "migrate",
+  );
+  assert.deepEqual(mockTauriCore.invokeCalls[0], {
+    cmd: "set_script_dirty",
+    args: { dirty: true },
+  });
+  assert.deepEqual(mockTauriCore.invokeCalls[1], {
+    cmd: "confirm_app_close",
+    args: { mode: "force_exit" },
+  });
+  assert.equal(mockTauriCore.invokeCalls[2].cmd, "start_relay");
+  assert.equal(mockTauriCore.invokeCalls[2].args.legacyGdriveAction, "migrate");
+
+  // #87: `.overlay.overlay-topmost` z-index strictly exceeds `.overlay` (100) and stays below `.toasts` (200)
+  const css = fs.readFileSync(path.join(repoRoot, "src", "styles.css"), "utf8");
+  const topmostMatch = css.match(/\.overlay\.overlay-topmost\s*\{\s*z-index:\s*(\d+)\s*;\s*\}/);
+  assert.ok(topmostMatch, ".overlay.overlay-topmost z-index rule must exist");
+  const topmostZ = Number(topmostMatch[1]);
+  assert.ok(topmostZ > 100 && topmostZ < 200, `Expected 100 < topmostZ < 200, got ${topmostZ}`);
+
+  // #87 & #83: CloseAppRelayDialog and CloseAppUnsavedScriptDialog must be rendered AFTER LlmChatModal & DeleteVmDialog in App.tsx
+  const appSrc = fs.readFileSync(path.join(repoRoot, "src", "App.tsx"), "utf8");
+  const chatIdx = appSrc.indexOf("<LlmChatModal");
+  const deleteIdx = appSrc.indexOf("<DeleteVmDialog");
+  const closeRelayIdx = appSrc.indexOf("<CloseAppRelayDialog");
+  const closeScriptIdx = appSrc.indexOf("<CloseAppUnsavedScriptDialog");
+  assert.ok(chatIdx > 0 && deleteIdx > 0 && closeRelayIdx > 0 && closeScriptIdx > 0);
+  assert.ok(
+    closeRelayIdx > chatIdx && closeRelayIdx > deleteIdx,
+    "CloseAppRelayDialog must appear after LlmChatModal and DeleteVmDialog in DOM order",
+  );
+  assert.ok(
+    closeScriptIdx > chatIdx && closeScriptIdx > deleteIdx,
+    "CloseAppUnsavedScriptDialog must appear after LlmChatModal and DeleteVmDialog in DOM order",
+  );
+  assert.match(appSrc, /close-requested-unsaved-script/);
+
+  const stopDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "StopRelayDialog.tsx"),
+    "utf8",
+  );
+  assert.match(stopDlgSrc, /export function CloseAppRelayDialog[\s\S]*?<Modal[\s\S]{0,80}topPriority/);
+  assert.match(stopDlgSrc, /export function CloseAppUnsavedScriptDialog[\s\S]*?<Modal[\s\S]{0,80}topPriority/);
+
+  const chatModalSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "LlmChatModal.tsx"),
+    "utf8",
+  );
+  assert.match(chatModalSrc, /if\s*\(modalEl\s*&&\s*!isTopmostModal\(modalEl\)\)\s*return;/);
+
+  const relayPanelSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "RelayPanel.tsx"),
+    "utf8",
+  );
+  assert.match(relayPanelSrc, /迁移旧断点并续训/);
+  assert.match(relayPanelSrc, /忽略旧断点全新开始/);
+});

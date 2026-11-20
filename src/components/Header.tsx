@@ -1,7 +1,12 @@
 import { MessageSquare, Power, RefreshCw } from "lucide-react";
 import type { Overview } from "../types";
 import { fmtBytes, fmtSnapshotTime, formatBurnRate, num } from "../format";
-import { hasAnyReadyLlmVm, isLlmVm, resolveBlueGreenStatus } from "../chatUtils";
+import {
+  hasAnyReadyLlmVm,
+  isLlmVm,
+  isOverviewServerListUnknown,
+  resolveBlueGreenStatus,
+} from "../chatUtils";
 import { ColabIcon } from "./ui";
 
 export function Header(props: {
@@ -12,8 +17,9 @@ export function Header(props: {
   onOpenCreateVm: () => void;
 }) {
   const { ov } = props;
-  const ccu = ov?.ccu;
-  const hasActiveServerInstances = (ov?.server_count ?? 0) > 0;
+  const serverUnknown = Boolean(ov && isOverviewServerListUnknown(ov));
+  const ccu = serverUnknown ? null : ov?.ccu;
+  const hasActiveServerInstances = serverUnknown || (ov?.server_count ?? 0) > 0;
   const burnRate = formatBurnRate(ccu, hasActiveServerInstances);
   const gd = ov?.gdrive;
   const vms = ov?.vms ?? [];
@@ -40,9 +46,18 @@ export function Header(props: {
         </div>
 
         <div className="stats">
-          <div className="stat" title="服务端计费实例数">
+          <div
+            className="stat"
+            title={
+              serverUnknown
+                ? "服务端实例列表查询失败，当前在线计费实例数量未知"
+                : "服务端计费实例数"
+            }
+          >
             <span className="stat-label">实例</span>
-            <span className="stat-value">{ov ? ov.server_count : "—"}</span>
+            <span className={`stat-value ${serverUnknown ? "warn" : ""}`}>
+              {!ov ? "—" : serverUnknown ? "未知" : ov.server_count}
+            </span>
           </div>
           <div
             className="stat"

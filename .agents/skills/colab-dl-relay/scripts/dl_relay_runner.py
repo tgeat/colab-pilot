@@ -488,6 +488,128 @@ def upload_checked(colab_bin: str, session: str, local_path: str, remote_path: s
         raise RuntimeError(f"colab upload 失败 ({local_path} -> {remote_path}): {err}")
 
 
+def list_gdrive_entries(rclone_bin: str, rclone_conf: str, gdrive_dir: str) -> Optional[List[str]]:
+    cmd = [rclone_bin]
+    if rclone_conf and os.path.exists(rclone_conf):
+        cmd.extend(["--config", rclone_conf])
+    cmd.extend(["--retries=5", "--low-level-retries=20", "lsf", "--", gdrive_dir.rstrip("/")])
+    try:
+        res = run_cmd(cmd, timeout=90)
+    except OSError:
+        return None
+    if res.returncode == 0:
+        return [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
+    err_low = ((res.stderr or "") + "\n" + (res.stdout or "")).lower()
+    if any(k in err_low for k in ("directory not found", "object not found", "file not found")):
+        return []
+    return None
+
+
+def detect_legacy_gdrive_artifacts(entries: List[str], ckpt_basename: str) -> List[str]:
+    stem, ext = os.path.splitext(ckpt_basename or "checkpoint.pt")
+    prev_name = f"{stem}_prev{ext or '.pt'}"
+    file_targets = {
+        ckpt_basename or "checkpoint.pt",
+        prev_name,
+        "checkpoint.pt",
+        "checkpoint_prev.pt",
+        *DONE_FLAG_FILENAMES,
+    }
+    dir_targets = {"hf_checkpoints"}
+    found: List[str] = []
+    for raw in entries:
+        item = (raw or "").strip()
+        if not item:
+            continue
+        clean = item.rstrip("/")
+        if not item.endswith("/") and item in file_targets:
+            found.append(item)
+        elif clean in dir_targets:
+            found.append(f"{clean}/")
+    return found
+
+
+def check_or_migrate_legacy_bare_gdrive(
+    rclone_bin: str,
+    rclone_conf: str,
+    effective_gdrive_dir: str,
+    ckpt_basename: str,
+    session_name: str,
+    migrate_legacy: bool = False,
+    ignore_legacy: bool = False,
+) -> Tuple[bool, str]:
+    """
+    Issue #80：当默认裸目录 `gdrive:colab_relay` 被自动升级隔离为 `gdrive:colab_relay/<ident>` 时，
+    若新隔离子目录尚无任何断点/完成标记，但旧版根目录 `gdrive:colab_relay` 下存在顶层断点/完成标记：
+    - 默认在开训前中止并明确告知目录迁移方案、要求用户确认（拒绝静默跳过旧断点从头开训）；
+    - `--migrate-legacy-gdrive`：自动将旧版顶层断点与结果迁移至新隔离目录后继续续训；
+    - `--ignore-legacy-gdrive`：明确确认忽略旧版断点并在新隔离目录全新开训。
+    """
+    iso_entries = list_gdrive_entries(rclone_bin, rclone_conf, effective_gdrive_dir)
+    if iso_entries is not None and detect_legacy_gdrive_artifacts(iso_entries, ckpt_basename):
+        return True, ""
+
+    bare_entries = list_gdrive_entries(rclone_bin, rclone_conf, DEFAULT_BARE_GDRIVE_DIR)
+    if not bare_entries:
+        return True, ""
+
+    legacy_found = detect_legacy_gdrive_artifacts(bare_entries, ckpt_basename)
+    if not legacy_found:
+        return True, ""
+
+    if ignore_legacy:
+        print(
+            f"ℹ️ 已按 --ignore-legacy-gdrive 确认忽略旧版目录 ({DEFAULT_BARE_GDRIVE_DIR}) 中的历史断点 "
+            f"({', '.join(legacy_found)})，将在新隔离目录 {effective_gdrive_dir} 中全新运行。",
+            flush=True,
+        )
+        return True, ""
+
+    if not migrate_legacy:
+        return (
+            False,
+            f"检测到旧版默认目录 `{DEFAULT_BARE_GDRIVE_DIR}` 下存在历史断点 ({', '.join(legacy_found)})，"
+            f"而新版会话隔离目录 `{effective_gdrive_dir}` 尚无断点！为防止跳过旧断点从头训练，已中止启动并要求确认目录迁移：\n"
+            f"  1) 添加 `--migrate-legacy-gdrive` 自动将旧断点迁移至 `{effective_gdrive_dir}` 后继续续训；\n"
+            f"  2) 或手动执行 `rclone moveto {DEFAULT_BARE_GDRIVE_DIR}/{ckpt_basename} {effective_gdrive_dir}/{ckpt_basename}`；\n"
+            f"  3) 若确认为全新独立任务，请添加 `--ignore-legacy-gdrive` 或显式指定新的 `--gdrive-dir` 子目录。",
+        )
+
+    rem_ok, rem_err = check_remote_active_lock(rclone_bin, rclone_conf, DEFAULT_BARE_GDRIVE_DIR, session_name)
+    if not rem_ok:
+        return False, rem_err
+
+    base_rc = [rclone_bin]
+    if rclone_conf and os.path.exists(rclone_conf):
+        base_rc.extend(["--config", rclone_conf])
+    base_rc.extend(["--retries=5", "--low-level-retries=20"])
+
+    mk_res = run_cmd(base_rc + ["mkdir", "--", effective_gdrive_dir.rstrip("/")], timeout=90)
+    if mk_res.returncode != 0:
+        detail = strip_ansi((mk_res.stderr or "") + "\n" + (mk_res.stdout or "")).strip()[:200]
+        return False, f"创建迁移目标目录 `{effective_gdrive_dir}` 失败: {detail}"
+
+    migrate_items = list(legacy_found)
+    if ("results/" in bare_entries or "results" in bare_entries) and "results/" not in migrate_items:
+        migrate_items.append("results/")
+
+    for item in migrate_items:
+        clean_item = item.rstrip("/")
+        src_spec = f"{DEFAULT_BARE_GDRIVE_DIR}/{clean_item}"
+        dst_spec = f"{effective_gdrive_dir.rstrip('/')}/{clean_item}"
+        subcmd = "move" if item.endswith("/") else "moveto"
+        mv_res = run_cmd(base_rc + [subcmd, "--", src_spec, dst_spec], timeout=300)
+        if mv_res.returncode != 0:
+            detail = strip_ansi((mv_res.stderr or "") + "\n" + (mv_res.stdout or "")).strip()[:200]
+            return False, f"迁移旧版产物 `{src_spec}` -> `{dst_spec}` 失败: {detail}"
+
+    print(
+        f"✅ 已将旧版默认目录 `{DEFAULT_BARE_GDRIVE_DIR}` 下的历史断点 ({', '.join(legacy_found)}) 迁移至 `{effective_gdrive_dir}`！",
+        flush=True,
+    )
+    return True, ""
+
+
 def list_gdrive_files(rclone_bin: str, rclone_conf: str, gdrive_dir: str) -> Optional[List[str]]:
     cmd = [rclone_bin]
     if rclone_conf and os.path.exists(rclone_conf):
@@ -719,6 +841,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="显式允许与另一会话共用已被占用的云盘目录",
     )
+    parser.add_argument(
+        "--migrate-legacy-gdrive",
+        action="store_true",
+        help="确认将旧版默认根目录 gdrive:colab_relay 下的历史断点迁移至当前会话隔离子目录后续训",
+    )
+    parser.add_argument(
+        "--ignore-legacy-gdrive",
+        action="store_true",
+        help="确认忽略旧版默认根目录 gdrive:colab_relay 下的历史断点，在当前会话隔离子目录中全新启动",
+    )
     parser.add_argument("--gdrive-dataset-dir", default="", help="Google Drive 数据集路径 (可选)")
     parser.add_argument("--total-epochs", type=int, default=100, help="总训练轮次")
     parser.add_argument("--max-session-hours", type=float, default=22.5, help="单台实例最长运行小时数 (默认 22.5h)")
@@ -726,6 +858,55 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reset-done-flag", action="store_true", help="启动第 1 棒时清除旧的完成标记")
     parser.add_argument("--detach", action="store_true", help="在后台独立启动守护进程（关闭 Antigravity 不中断）")
     return parser
+
+
+def build_detached_child_cmd(
+    args: argparse.Namespace,
+    workspace_abs: str,
+    script_abs: str,
+    effective_gdrive_dir: str,
+) -> List[str]:
+    """构造后台子进程命令行：全部使用解析后的绝对路径，防止子进程切换 cwd 后重复拼接相对工作区路径 (#86)。"""
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--session",
+        args.session,
+        "--workspace",
+        workspace_abs,
+        "--script",
+        script_abs,
+        "--checkpoint-path",
+        args.checkpoint_path,
+        "--gpu",
+        args.gpu,
+        "--high-mem" if args.high_mem else "--no-high-mem",
+        "--gdrive-dir",
+        effective_gdrive_dir,
+        "--total-epochs",
+        str(args.total_epochs),
+        "--max-session-hours",
+        str(args.max_session_hours),
+        "--backup-interval-minutes",
+        str(args.backup_interval_minutes),
+    ]
+    if args.session_prefix:
+        cmd.extend(["--session-prefix", args.session_prefix])
+    if args.allow_shared_gdrive_dir:
+        cmd.append("--allow-shared-gdrive-dir")
+    if getattr(args, "migrate_legacy_gdrive", False):
+        cmd.append("--migrate-legacy-gdrive")
+    if getattr(args, "ignore_legacy_gdrive", False):
+        cmd.append("--ignore-legacy-gdrive")
+    if args.gdrive_dataset_dir:
+        cmd.extend(["--gdrive-dataset-dir", args.gdrive_dataset_dir])
+    if args.reset_done_flag:
+        cmd.append("--reset-done-flag")
+    if args.extra_files:
+        resolved_extras = [os.path.abspath(os.path.join(workspace_abs, ef)) for ef in args.extra_files]
+        cmd.append("--extra-files")
+        cmd.extend(resolved_extras)
+    return cmd
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -737,6 +918,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser.error("必须提供 --session (-s) 或 --session-prefix")
     args.session = session_name
 
+    if getattr(args, "migrate_legacy_gdrive", False) and getattr(args, "ignore_legacy_gdrive", False):
+        parser.error("--migrate-legacy-gdrive 与 --ignore-legacy-gdrive 不能同时使用")
+
     effective_gdrive_dir, was_auto_isolated = resolve_effective_gdrive_dir(
         args.gdrive_dir,
         session_name=session_name,
@@ -747,6 +931,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"🔒 已将默认云盘路径自动按会话隔离为: {effective_gdrive_dir}", flush=True)
 
     workspace_abs = os.path.abspath(args.workspace)
+    if not os.path.isdir(workspace_abs):
+        print(f"❌ 工作区目录不存在或无效: {workspace_abs}", flush=True)
+        return 1
+
     script_abs = os.path.abspath(os.path.join(workspace_abs, args.script))
     adapter_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), "colab_relay_adapter.py")
 
@@ -760,11 +948,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"❌ 上云前语法检查未通过，已阻止分配 Colab 实例: {e}", flush=True)
         return 1
 
+    colab_bin = find_bin("colab")
+    rclone_bin = find_bin("rclone")
+    rclone_conf = find_rclone_conf()
+    ckpt_basename = os.path.basename(args.checkpoint_path)
+    stem, ext = os.path.splitext(ckpt_basename)
+    local_final_ckpt = os.path.join(workspace_abs, f"{stem}_final{ext or '.pt'}")
+
+    if was_auto_isolated:
+        leg_ok, leg_err = check_or_migrate_legacy_bare_gdrive(
+            rclone_bin=rclone_bin,
+            rclone_conf=rclone_conf,
+            effective_gdrive_dir=effective_gdrive_dir,
+            ckpt_basename=ckpt_basename,
+            session_name=session_name,
+            migrate_legacy=bool(getattr(args, "migrate_legacy_gdrive", False)),
+            ignore_legacy=bool(getattr(args, "ignore_legacy_gdrive", False)),
+        )
+        if not leg_ok:
+            print(f"❌ {leg_err}", flush=True)
+            return 1
+
     if args.detach and os.environ.get("DL_RELAY_DETACHED") != "1":
         log_file = os.path.join(workspace_abs, ".colab_dl_relay.log")
         pid_file = os.path.join(workspace_abs, ".colab_dl_relay.pid")
-        raw_cli = list(argv) if argv is not None else sys.argv[1:]
-        cmd = [sys.executable, os.path.abspath(__file__)] + [a for a in raw_cli if a != "--detach"]
+        cmd = build_detached_child_cmd(args, workspace_abs, script_abs, effective_gdrive_dir)
         env = os.environ.copy()
         env["DL_RELAY_DETACHED"] = "1"
         env["PYTHONUTF8"] = "1"
@@ -775,6 +983,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             kwargs["start_new_session"] = True
         with open(log_file, "a", encoding="utf-8") as out_f:
             proc = subprocess.Popen(cmd, cwd=workspace_abs, env=env, stdout=out_f, stderr=subprocess.STDOUT, **kwargs)
+        for _ in range(5):
+            rc_early = proc.poll()
+            if rc_early is not None:
+                if rc_early != 0:
+                    tail = ""
+                    try:
+                        with open(log_file, "r", encoding="utf-8", errors="replace") as lf:
+                            tail = "".join(lf.readlines()[-8:]).strip()
+                    except Exception:
+                        pass
+                    print(
+                        f"❌ 后台串行接力守护进程启动失败 (exit={rc_early}){': ' + tail if tail else ''}",
+                        flush=True,
+                    )
+                    return rc_early or 1
+                break
+            time.sleep(0.04)
         with open(pid_file, "w", encoding="utf-8") as pf:
             pf.write(str(proc.pid))
         print(f"✅ 已在后台启动串行接力守护进程 PID={proc.pid}")
@@ -791,13 +1016,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not lock_ok:
         print(f"❌ {lock_err}", flush=True)
         return 1
-
-    colab_bin = find_bin("colab")
-    rclone_bin = find_bin("rclone")
-    rclone_conf = find_rclone_conf()
-    ckpt_basename = os.path.basename(args.checkpoint_path)
-    stem, ext = os.path.splitext(ckpt_basename)
-    local_final_ckpt = os.path.join(workspace_abs, f"{stem}_final{ext or '.pt'}")
 
     try:
         if not was_auto_isolated and not args.allow_shared_gdrive_dir and not args.reset_done_flag:

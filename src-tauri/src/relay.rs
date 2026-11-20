@@ -241,8 +241,14 @@ pub struct RelayHandle {
     pub auth_mode: Mutex<Option<String>>,
     /// 记录 provisioning 发起前服务端已有的计费 endpoint 集合，用于在取消分配时精准识别刚诞生的残留孤儿实例
     pub pre_provision_endpoints: Mutex<std::collections::HashSet<String>>,
+    /// 标记 `pre_provision_endpoints` 快照是否无效/尚未在本次 `colab new` 前成功拉取（无效时严禁猜测残留孤儿 #77）
+    pub pre_provision_snapshot_invalid: AtomicBool,
     /// 标记最近一次 stop 是否发生在 provisioning（colab new）阶段
     pub stopped_during_provisioning: AtomicBool,
+    /// 标记本次接力的 `gdrive_dir` 是否由默认裸值 `gdrive:colab_relay` 自动隔离而来（用于旧断点迁移保护 #80）
+    pub auto_isolated_gdrive: AtomicBool,
+    /// 用户显式确认的旧版根目录断点处理动作：`Some("migrate")` | `Some("ignore")` | `None` (#80)
+    pub legacy_gdrive_action: Mutex<Option<String>>,
     /// 后台监工任务是否仍在执行（stop 后到任务真正退出之间仍为 true，用于拒绝重复启动）
     pub task_alive: AtomicBool,
     /// 手动停止接力时是否保留当前云端实例（仅 `stop_relay(..., destroy_vm=false)` 时置 true）
@@ -265,7 +271,10 @@ impl RelayHandle {
             workspace_dir: Mutex::new(None),
             auth_mode: Mutex::new(None),
             pre_provision_endpoints: Mutex::new(std::collections::HashSet::new()),
+            pre_provision_snapshot_invalid: AtomicBool::new(false),
             stopped_during_provisioning: AtomicBool::new(false),
+            auto_isolated_gdrive: AtomicBool::new(false),
+            legacy_gdrive_action: Mutex::new(None),
             task_alive: AtomicBool::new(false),
             keep_vm_on_stop: AtomicBool::new(false),
             gen: AtomicU64::new(0),
@@ -824,10 +833,179 @@ pub async fn run_relay(app: Arc<AppState>, handle: Arc<RelayHandle>) {
     }
 }
 
+pub(crate) fn detect_legacy_gdrive_artifacts_in_lsf(lsf_stdout: &str) -> Vec<String> {
+    const FILE_TARGETS: &[&str] = &[
+        "checkpoint.pt",
+        "checkpoint_prev.pt",
+        "training_done.flag",
+        "TRAINING_COMPLETED.flag",
+    ];
+    let mut found = Vec::new();
+    for raw in lsf_stdout.lines() {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let clean = item.trim_end_matches('/');
+        if !item.ends_with('/') && FILE_TARGETS.contains(&item) {
+            found.push(item.to_string());
+        } else if clean == "hf_checkpoints" {
+            found.push("hf_checkpoints/".to_string());
+        }
+    }
+    found
+}
+
+async fn rclone_lsf_entries_with_conf(
+    rclone_bin: &std::path::PathBuf,
+    rclone_conf: &std::path::Path,
+    remote_dir: &str,
+) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    if rclone_conf.exists() {
+        args.push("--config".into());
+        args.push(rclone_conf.to_string_lossy().to_string());
+    }
+    args.extend(s(&["lsf", "--retries=5", "--low-level-retries=20", "--"]));
+    args.push(remote_dir.trim_end_matches('/').to_string());
+    let out = cli::run_simple(rclone_bin, &args, Duration::from_secs(90))
+        .await
+        .ok()?;
+    if out.code == 0 {
+        return Some(
+            out.stdout
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect(),
+        );
+    }
+    let low = out.output.to_ascii_lowercase();
+    if low.contains("directory not found")
+        || low.contains("object not found")
+        || low.contains("file not found")
+    {
+        return Some(Vec::new());
+    }
+    None
+}
+
+/// Issue #80：当默认裸路径 `gdrive:colab_relay` 自动升级隔离为 `gdrive:colab_relay/<vm>` 时，
+/// 若新隔离子目录尚无断点/完成标记，但旧版根目录 `gdrive:colab_relay` 下存在历史断点/完成标记：
+/// - 默认在开训前中止并提示确认目录迁移（拒绝静默跳过旧断点从头训练）；
+/// - `Some("migrate")`：自动将旧版顶层断点与结果迁移至新隔离目录后续训；
+/// - `Some("ignore")`：确认忽略旧版断点并在新隔离目录全新开训。
+pub(crate) async fn check_or_migrate_legacy_bare_gdrive_with_conf(
+    rclone_bin: &std::path::PathBuf,
+    rclone_conf: &std::path::Path,
+    isolated_gdrive: &str,
+    legacy_action: Option<&str>,
+    h: &RelayHandle,
+) -> Result<()> {
+    let iso_clean = isolated_gdrive.trim_end_matches('/');
+    if iso_clean == DEFAULT_BARE_GDRIVE_DIR {
+        return Ok(());
+    }
+
+    if let Some(iso_entries) = rclone_lsf_entries_with_conf(rclone_bin, rclone_conf, iso_clean).await {
+        let joined = iso_entries.join("\n");
+        if !detect_legacy_gdrive_artifacts_in_lsf(&joined).is_empty() {
+            return Ok(());
+        }
+    }
+
+    let Some(bare_entries) =
+        rclone_lsf_entries_with_conf(rclone_bin, rclone_conf, DEFAULT_BARE_GDRIVE_DIR).await
+    else {
+        return Ok(());
+    };
+    let bare_joined = bare_entries.join("\n");
+    let legacy_found = detect_legacy_gdrive_artifacts_in_lsf(&bare_joined);
+    if legacy_found.is_empty() {
+        return Ok(());
+    }
+
+    let action = legacy_action.map(str::trim).unwrap_or("");
+    if action.eq_ignore_ascii_case("ignore") {
+        h.log(format!(
+            "ℹ️ 已确认忽略旧版目录 `{DEFAULT_BARE_GDRIVE_DIR}` 中的历史断点（{}），将在新隔离目录 `{iso_clean}` 中全新启动",
+            legacy_found.join(", ")
+        ));
+        return Ok(());
+    }
+
+    if !action.eq_ignore_ascii_case("migrate") {
+        return Err(anyhow!(
+            "检测到旧版默认目录 `{DEFAULT_BARE_GDRIVE_DIR}` 下存在历史断点（{}），而新版会话隔离目录 `{iso_clean}` 尚无断点！为防止跳过旧断点从头训练已中止启动：请在接力面板点击确认「迁移旧断点并续训」或「忽略旧断点全新开始」（或执行 `rclone moveto {DEFAULT_BARE_GDRIVE_DIR}/checkpoint.pt {iso_clean}/checkpoint.pt`）",
+            legacy_found.join(", ")
+        ));
+    }
+
+    let mut mk_args = Vec::new();
+    if rclone_conf.exists() {
+        mk_args.push("--config".into());
+        mk_args.push(rclone_conf.to_string_lossy().to_string());
+    }
+    mk_args.extend(s(&["mkdir", "--retries=5", "--low-level-retries=20", "--"]));
+    mk_args.push(iso_clean.to_string());
+    let mk_out = cli::run_simple(rclone_bin, &mk_args, Duration::from_secs(90)).await?;
+    if mk_out.code != 0 {
+        return Err(anyhow!(
+            "创建迁移目标目录 `{iso_clean}` 失败：{}",
+            cli::last_meaningful_cli_line(&mk_out.output, "rclone mkdir 失败")
+        ));
+    }
+
+    let mut migrate_items = legacy_found.clone();
+    if bare_entries
+        .iter()
+        .any(|e| e == "results" || e == "results/")
+        && !migrate_items.iter().any(|e| e == "results/")
+    {
+        migrate_items.push("results/".to_string());
+    }
+
+    for item in &migrate_items {
+        let clean_item = item.trim_end_matches('/');
+        let src = format!("{DEFAULT_BARE_GDRIVE_DIR}/{clean_item}");
+        let dst = format!("{iso_clean}/{clean_item}");
+        let subcmd = if item.ends_with('/') { "move" } else { "moveto" };
+        let mut mv_args = Vec::new();
+        if rclone_conf.exists() {
+            mv_args.push("--config".into());
+            mv_args.push(rclone_conf.to_string_lossy().to_string());
+        }
+        mv_args.extend(s(&[subcmd, "--retries=5", "--low-level-retries=20", "--"]));
+        mv_args.push(src.clone());
+        mv_args.push(dst.clone());
+        let mv_out = cli::run_simple(rclone_bin, &mv_args, Duration::from_secs(300)).await?;
+        if mv_out.code != 0 {
+            return Err(anyhow!(
+                "迁移旧版断点 `{src}` -> `{dst}` 失败：{}",
+                cli::last_meaningful_cli_line(&mv_out.output, "rclone 迁移失败")
+            ));
+        }
+    }
+
+    h.log(format!(
+        "✅ 已将旧版目录 `{DEFAULT_BARE_GDRIVE_DIR}` 下的历史断点（{}）迁移至 `{iso_clean}`，继续续训",
+        legacy_found.join(", ")
+    ));
+    Ok(())
+}
+
 async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: CancellationToken) -> Result<()> {
     let name = h.status.l().vm_name.clone();
-    let cfg = h.status.l().config.clone();
+    let mut cfg = h.status.l().config.clone();
+    let raw_was_bare = normalize_gdrive_dir(&cfg.gdrive_dir) == DEFAULT_BARE_GDRIVE_DIR;
+    if raw_was_bare {
+        cfg.gdrive_dir = resolve_isolated_gdrive_dir(&cfg.gdrive_dir, &name);
+        h.status.l().config.gdrive_dir = cfg.gdrive_dir.clone();
+    }
     validate_relay_config(&cfg)?;
+    let was_auto_isolated = raw_was_bare || h.auto_isolated_gdrive.load(Ordering::SeqCst);
+    let legacy_action = h.legacy_gdrive_action.l().clone();
     let gdrive = cfg.gdrive_dir.trim().trim_end_matches('/').to_string();
     let max_secs = cfg.max_session_hours * 3600.0;
     let backup_secs = cfg.backup_interval_minutes * 60.0;
@@ -852,6 +1030,17 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
     h.log(format!("🔑 使用本机 Rclone 授权文件：{}", conf.display()));
     if !conf.exists() {
         return Err(anyhow!("未找到 rclone.conf，请先完成 rclone 授权"));
+    }
+    if was_auto_isolated {
+        check_or_migrate_legacy_bare_gdrive_with_conf(
+            &rclone,
+            &conf,
+            &gdrive,
+            legacy_action.as_deref(),
+            &h,
+        )
+        .await?;
+        *h.legacy_gdrive_action.l() = None;
     }
     let mkdir_args = vec![
         "--config".into(),
@@ -930,21 +1119,29 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             }
         }
         if !reuse {
-            h.set_phase("provisioning", format!("第 {round} 棒：申请云端 {} 实例", cfg.gpu_type));
             if app.find_assignment_by_name(&name).await.is_some() {
+                h.set_phase("destroying", format!("第 {round} 棒前清理残留同名实例"));
                 let r = hard_terminate(&app, &name, None, false).await;
                 h.log(format!("🧹 释放旧实例：{}", if r.verified_unassigned { "核验通过" } else { "未核验" }));
             }
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            if let Ok(existing) = app.client.list_assignments().await {
-                *h.pre_provision_endpoints.l() =
-                    existing.into_iter().map(|a| a.endpoint).collect();
+            match app.client.list_assignments().await {
+                Ok(existing) => {
+                    *h.pre_provision_endpoints.l() =
+                        existing.into_iter().map(|a| a.endpoint).collect();
+                    h.pre_provision_snapshot_invalid.store(false, Ordering::SeqCst);
+                }
+                Err(_) => {
+                    h.pre_provision_endpoints.l().clear();
+                    h.pre_provision_snapshot_invalid.store(true, Ordering::SeqCst);
+                }
             }
+            h.set_phase("provisioning", format!("第 {round} 棒：申请云端 {} 实例", cfg.gpu_type));
             h.log(format!("☁️ 正在向 Google Colab 申请实例 [{name}]…"));
             let hh = h.clone();
-            colab_new_with_opts(
+            let prov_res = colab_new_with_opts(
                 &name,
                 &cfg.gpu_type,
                 cfg.high_mem,
@@ -953,7 +1150,12 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
                 Some(&h.child_pid),
                 &move |l: &str| hh.log(l),
             )
-            .await?;
+            .await;
+            if prov_res.is_ok() {
+                h.pre_provision_snapshot_invalid.store(true, Ordering::SeqCst);
+                h.set_phase("connecting", format!("第 {round} 棒：连接已分配实例"));
+            }
+            prov_res?;
         }
         if cancel.is_cancelled() {
             return Ok(());
@@ -1685,6 +1887,62 @@ sys.exit(0)
         *cli::TEST_RCLONE_BIN.l() = None;
         *cli::TEST_RCLONE_CONF.l() = None;
         *cli::TEST_COLAB_BIN.l() = None;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_80_legacy_bare_gdrive_checkpoint_requires_confirmation_and_migrates_with_real_rclone() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let real_rclone = cli::rclone_bin();
+        if !real_rclone.exists() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("pilot_issue80_{}", uuid::Uuid::new_v4()));
+        let drive_root = tmp.join("drive_storage");
+        let legacy_dir = drive_root.join("colab_relay");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_ckpt = legacy_dir.join("checkpoint.pt");
+        std::fs::write(&legacy_ckpt, b"EPOCH_7_WEIGHTS").unwrap();
+
+        let conf = tmp.join("rclone.conf");
+        let drive_norm = drive_root.to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            &conf,
+            format!("[gdrive]\ntype = alias\nremote = {drive_norm}\n"),
+        )
+        .unwrap();
+
+        let h = RelayHandle::new("legacy-run");
+
+        // 1) Unconfirmed auto-isolated path MUST abort before starting training and explain migration
+        let err = check_or_migrate_legacy_bare_gdrive_with_conf(
+            &real_rclone,
+            &conf,
+            "gdrive:colab_relay/legacy-run",
+            None,
+            &h,
+        )
+        .await
+        .expect_err("unconfirmed legacy root checkpoint must block silent fresh start");
+        let err_str = err.to_string();
+        assert!(err_str.contains("gdrive:colab_relay"));
+        assert!(err_str.contains("gdrive:colab_relay/legacy-run"));
+        assert!(legacy_ckpt.exists(), "legacy checkpoint must remain untouched");
+
+        // 2) Confirmed `migrate` moves checkpoint.pt into `gdrive:colab_relay/legacy-run/checkpoint.pt`
+        check_or_migrate_legacy_bare_gdrive_with_conf(
+            &real_rclone,
+            &conf,
+            "gdrive:colab_relay/legacy-run",
+            Some("migrate"),
+            &h,
+        )
+        .await
+        .expect("confirmed migration with real rclone must succeed");
+        let migrated_ckpt = legacy_dir.join("legacy-run").join("checkpoint.pt");
+        assert_eq!(std::fs::read(&migrated_ckpt).unwrap(), b"EPOCH_7_WEIGHTS");
+        assert!(!legacy_ckpt.exists());
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

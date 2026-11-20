@@ -30,7 +30,7 @@ const GPUS = ["T4", "L4", "A100", "H100", "G4", "V5E1", "V6E1", "CPU"];
 export function RelayPanel(props: {
   vm: VmView;
   allVms?: VmView[];
-  onStart: (cfg: RelayConfig) => void;
+  onStart: (cfg: RelayConfig, legacyGdriveAction?: "migrate" | "ignore" | null) => void;
   onStopRequest: () => void;
   pending: boolean;
 }) {
@@ -98,13 +98,25 @@ export function RelayPanel(props: {
     ? `第 ${relay?.round || 1} 棒 · 已运行 ${fmtDuration(relay?.started_at ? Date.now() / 1000 - relay.started_at : 0)}`
     : completionView.sub;
 
-  const triggerStart = (overrideResetDoneFlag?: boolean) => {
+  const isLegacyMigrationPrompt = Boolean(
+    !running && relay?.last_error && relay.last_error.includes("旧版默认目录"),
+  );
+
+  const triggerStart = (
+    overrideResetDoneFlag?: boolean,
+    legacyGdriveAction?: "migrate" | "ignore" | null,
+    overrideGdriveDir?: string,
+  ) => {
     if (!canStart || props.pending || !!vm.busy) return;
-    props.onStart({
-      ...cfg,
-      high_mem: effectiveHighMem,
-      reset_done_flag: overrideResetDoneFlag ?? cfg.reset_done_flag,
-    });
+    props.onStart(
+      {
+        ...cfg,
+        gdrive_dir: overrideGdriveDir ?? cfg.gdrive_dir,
+        high_mem: effectiveHighMem,
+        reset_done_flag: overrideResetDoneFlag ?? cfg.reset_done_flag,
+      },
+      legacyGdriveAction ?? null,
+    );
   };
 
   return (
@@ -143,6 +155,35 @@ export function RelayPanel(props: {
           onClick={() => (running ? props.onStopRequest() : triggerStart())}
         />
       </div>
+
+      {/* #80：检测到旧版根目录 gdrive:colab_relay 下存在历史断点时，显式提示目录迁移并要求用户确认 */}
+      {isLegacyMigrationPrompt && (
+        <div className="vm-alert-box vm-alert-warn" role="alert" style={{ marginBottom: 10 }}>
+          <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+          <div className="vm-alert-content">
+            <div className="vm-alert-title">检测到旧版根目录存在历史断点，请确认迁移策略</div>
+            <div className="vm-alert-desc">{relay?.last_error}</div>
+            <div style={{ display: "inline-flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                disabled={props.pending || !!vm.busy}
+                onClick={() => triggerStart(false, "migrate", DEFAULT_RELAY.gdrive_dir)}
+              >
+                <span>迁移旧断点并续训</span>
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={props.pending || !!vm.busy}
+                onClick={() => triggerStart(cfg.reset_done_flag, "ignore", DEFAULT_RELAY.gdrive_dir)}
+              >
+                <span>忽略旧断点全新开始</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* #53：最终权重下载失败时展示醒目告警与一键补下载按钮 */}
       {!running && completionView.isDownloadFailed && (

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { type MutableRefObject, useCallback, useEffect, useState } from "react";
 import { AlertTriangle, Loader2, RefreshCw, Save } from "lucide-react";
 import { ColabIcon, Modal, useToast } from "./ui";
 import { api, errText } from "../api";
@@ -7,6 +7,9 @@ export function ScriptDialog(props: {
   open: boolean;
   workspacePath?: string | null;
   vmName?: string | null;
+  onDirtyChange?: (dirty: boolean) => void;
+  saveNowRef?: MutableRefObject<(() => Promise<boolean>) | null>;
+  discardNowRef?: MutableRefObject<(() => void) | null>;
   onClose: () => void;
 }) {
   const toast = useToast();
@@ -24,12 +27,25 @@ export function ScriptDialog(props: {
 
   const targetWs = props.workspacePath ?? null;
   const targetVm = props.vmName ?? null;
+  const onDirtyChange = props.onDirtyChange;
+
+  const notifyDirty = useCallback(
+    (dirty: boolean) => {
+      onDirtyChange?.(dirty);
+      api.setScriptDirty(dirty).catch(() => {});
+    },
+    [onDirtyChange],
+  );
 
   useEffect(() => {
-    if (!props.open) return;
+    if (!props.open) {
+      notifyDirty(false);
+      return;
+    }
     let cancelled = false;
 
-    // #58：每次打开立即清空上一份残留内容并进入加载态，防止读取失败时误保存旧内容或空串
+    // #58 & #83：每次打开立即清空上一份残留内容并重置 dirty 标记，防止读取失败时误保存旧内容或残留脏状态
+    notifyDirty(false);
     setTrain("");
     setReq("");
     setOrigTrain("");
@@ -51,12 +67,14 @@ export function ScriptDialog(props: {
         setWs(f.workspace || targetWs || "");
         setLoadedOk(true);
         setLoadError(null);
+        notifyDirty(false);
       })
       .catch((e) => {
         if (cancelled) return;
         const msg = errText(e);
         setLoadError(msg);
         setLoadedOk(false);
+        notifyDirty(false);
         toast(`读取工作区脚本失败：${msg}`, "error");
       })
       .finally(() => {
@@ -66,10 +84,26 @@ export function ScriptDialog(props: {
     return () => {
       cancelled = true;
     };
-  }, [props.open, targetWs, targetVm, reloadNonce, toast]);
+  }, [props.open, targetWs, targetVm, reloadNonce, toast, notifyDirty]);
+
+  useEffect(() => {
+    return () => {
+      api.setScriptDirty(false).catch(() => {});
+    };
+  }, []);
 
   const isDirty = loadedOk && !loadError && (train !== origTrain || req !== origReq);
   const canSave = !saving && !loading && loadedOk && !loadError;
+
+  useEffect(() => {
+    if (!props.open || !isDirty) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [props.open, isDirty]);
 
   const requestClose = useCallback(() => {
     if (saving) return;
@@ -78,23 +112,26 @@ export function ScriptDialog(props: {
       return;
     }
     setConfirmDiscard(false);
+    notifyDirty(false);
     props.onClose();
-  }, [saving, isDirty, props]);
+  }, [saving, isDirty, notifyDirty, props]);
 
-  const forceDiscardAndClose = () => {
+  const forceDiscardAndClose = useCallback(() => {
     if (saving) return;
     setConfirmDiscard(false);
+    notifyDirty(false);
     props.onClose();
-  };
+  }, [saving, notifyDirty, props]);
 
-  const save = async () => {
-    if (!canSave) return;
+  const save = useCallback(async (): Promise<boolean> => {
+    if (!canSave) return false;
     setSaving(true);
     try {
       await api.saveWorkspaceFiles(train, req, targetWs, targetVm);
       setOrigTrain(train);
       setOrigReq(req);
       setConfirmDiscard(false);
+      notifyDirty(false);
       toast(
         ws
           ? `已保存至工作区 ${ws}，下一棒开始时自动上传最新脚本`
@@ -102,12 +139,21 @@ export function ScriptDialog(props: {
         "success",
       );
       props.onClose();
+      return true;
     } catch (e) {
       toast(errText(e), "error");
+      return false;
     } finally {
       setSaving(false);
     }
-  };
+  }, [canSave, train, req, targetWs, targetVm, notifyDirty, toast, ws, props]);
+
+  if (props.saveNowRef) {
+    props.saveNowRef.current = props.open ? save : null;
+  }
+  if (props.discardNowRef) {
+    props.discardNowRef.current = props.open ? forceDiscardAndClose : null;
+  }
 
   const displayWs = ws || targetWs || "";
 
@@ -190,7 +236,9 @@ export function ScriptDialog(props: {
           placeholder={loading ? "正在读取工作区 train.py…" : ""}
           value={train}
           onChange={(e) => {
-            setTrain(e.target.value);
+            const nextTrain = e.target.value;
+            setTrain(nextTrain);
+            notifyDirty(Boolean(loadedOk && !loadError && (nextTrain !== origTrain || req !== origReq)));
             if (confirmDiscard) setConfirmDiscard(false);
           }}
         />
@@ -207,7 +255,9 @@ export function ScriptDialog(props: {
           placeholder={loading ? "正在读取工作区 requirements.txt…" : ""}
           value={req}
           onChange={(e) => {
-            setReq(e.target.value);
+            const nextReq = e.target.value;
+            setReq(nextReq);
+            notifyDirty(Boolean(loadedOk && !loadError && (train !== origTrain || nextReq !== origReq)));
             if (confirmDiscard) setConfirmDiscard(false);
           }}
         />

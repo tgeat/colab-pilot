@@ -99,10 +99,30 @@ function getVisibleFocusableElements(container: HTMLElement): HTMLElement[] {
   });
 }
 
-function isTopmostModal(container: HTMLElement): boolean {
-  const allModals = document.querySelectorAll<HTMLElement>(".overlay .modal");
+function getOverlayPriority(modal: HTMLElement): number {
+  const overlay = modal.closest<HTMLElement>(".overlay");
+  if (!overlay) return 100;
+  if (overlay.classList.contains("overlay-topmost")) return 180;
+  const computed =
+    typeof window !== "undefined"
+      ? Number.parseInt(window.getComputedStyle(overlay).zIndex, 10)
+      : Number.NaN;
+  return Number.isFinite(computed) ? computed : 100;
+}
+
+export function isTopmostModal(container: HTMLElement): boolean {
+  const allModals = Array.from(document.querySelectorAll<HTMLElement>(".overlay .modal"));
   if (allModals.length === 0) return true;
-  return allModals[allModals.length - 1] === container;
+  let best = allModals[0];
+  let bestZ = getOverlayPriority(best);
+  for (let i = 1; i < allModals.length; i++) {
+    const z = getOverlayPriority(allModals[i]);
+    if (z >= bestZ) {
+      best = allModals[i];
+      bestZ = z;
+    }
+  }
+  return best === container;
 }
 
 export function useModalFocusTrap(
@@ -211,6 +231,7 @@ export function Modal(props: {
   icon?: ReactNode;
   iconBg?: string;
   wide?: boolean;
+  topPriority?: boolean;
   footer?: ReactNode;
   children: ReactNode;
   closable?: boolean;
@@ -240,7 +261,7 @@ export function Modal(props: {
   if (!props.open) return null;
   return (
     <div
-      className="overlay"
+      className={`overlay ${props.topPriority ? "overlay-topmost" : ""}`.trim()}
       onMouseDown={(e) => e.target === e.currentTarget && closable && props.onClose()}
     >
       <div

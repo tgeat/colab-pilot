@@ -20,11 +20,17 @@ export const api = {
   deleteVm: (name: string, endpoint: string | null) =>
     invoke<TerminateReceipt>("delete_vm", { name, endpoint }),
   deployProbe: (name: string) => invoke<void>("deploy_probe", { name }),
-  startRelay: (name: string, config: RelayConfig, workspacePath?: string | null) =>
+  startRelay: (
+    name: string,
+    config: RelayConfig,
+    workspacePath?: string | null,
+    legacyGdriveAction?: "migrate" | "ignore" | null,
+  ) =>
     invoke<RelayStatus>("start_relay", {
       name,
       config,
       workspacePath: workspacePath ?? null,
+      ...(legacyGdriveAction ? { legacyGdriveAction } : {}),
     }),
   stopRelay: (name: string, destroyVm: boolean) =>
     invoke<StopRelayResult>("stop_relay", { name, destroyVm }),
@@ -45,6 +51,7 @@ export const api = {
       workspacePath: workspacePath ?? null,
       vmName: vmName ?? null,
     }),
+  setScriptDirty: (dirty: boolean) => invoke<void>("set_script_dirty", { dirty }),
   streamLlmChat: (req: LlmChatRequest) => invoke<LlmChatResponse>("stream_llm_chat", { req }),
   cancelLlmChat: (requestId: string) => invoke<void>("cancel_llm_chat", { requestId }),
   openVmSshTerminal: (name: string) => invoke<string>("open_vm_ssh_terminal", { name }),
@@ -55,7 +62,7 @@ export const api = {
     }),
   deployLlmOnVm: (name: string, config: CreateVmLlmConfig) =>
     invoke<LlmApiAccessInfo>("deploy_llm_on_vm", { name, config }),
-  confirmAppClose: (mode: "keep_vms" | "shutdown_vms") =>
+  confirmAppClose: (mode: "keep_vms" | "shutdown_vms" | "force_exit") =>
     invoke<TerminateReceipt[]>("confirm_app_close", { mode }),
   dismissRelayStatus: (name: string) => invoke<void>("dismiss_relay_status", { name }),
 };

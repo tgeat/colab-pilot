@@ -321,11 +321,14 @@ td.cmd { max-width: 460px; overflow: hidden; text-overflow: ellipsis; color: var
 .log .ln-err { color: var(--danger); }
 .log .ln-ok { color: var(--success); }
 
-/* ───────── 弹窗（三段式固定头尾 + 单一主滚动区 #66, #70） ───────── */
+/* ───────── 弹窗（三段式固定头尾 + 单一主滚动区 #66, #70, #87） ───────── */
 .overlay {
   position: fixed; inset: 0; z-index: 100; background: rgba(28, 36, 58, 0.35);
   backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; padding: 20px;
   overflow: hidden; animation: fade .15s ease;
+}
+.overlay.overlay-topmost {
+  z-index: 180;
 }
 @keyframes fade { from { opacity: 0; } }
 .modal {

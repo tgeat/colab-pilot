@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Loader2, PowerOff, ShieldAlert, Square, Trash2 } from "lucide-react";
+import { AlertTriangle, FileCode2, Loader2, PowerOff, Save, ShieldAlert, Square, Trash2 } from "lucide-react";
 import { errText, evaluateStopRelayOutcome } from "../api";
 import { formatBurnRate, num } from "../format";
 import { ColabIcon, KV, Modal, useToast } from "./ui";
@@ -247,6 +247,7 @@ export function CloseAppRelayDialog(props: {
   return (
     <Modal
       open={props.open}
+      topPriority
       onClose={() => !busyMode && props.onCancel()}
       closable={!busyMode}
       icon={<ShieldAlert size={22} color="var(--warning)" />}
@@ -347,6 +348,91 @@ export function CloseAppRelayDialog(props: {
             </div>
           </div>
         </button>
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * 桌面主窗口关闭（如 Alt+F4 / 点击标题栏关闭）时的未保存脚本编辑保护弹窗 (#83, #87)：
+ * 置于最高层级 `topPriority` (`.overlay-topmost`)，支持「继续编辑」「保存修改并关闭」「放弃未保存修改并关闭」。
+ */
+export function CloseAppUnsavedScriptDialog(props: {
+  open: boolean;
+  onCancel: () => void;
+  onSaveAndClose: () => Promise<void>;
+  onDiscardAndClose: () => Promise<void>;
+}) {
+  const [busyAction, setBusyAction] = useState<null | "save" | "discard">(null);
+
+  useEffect(() => {
+    if (props.open) {
+      setBusyAction(null);
+    }
+  }, [props.open]);
+
+  if (!props.open) return null;
+
+  const runAction = async (kind: "save" | "discard") => {
+    setBusyAction(kind);
+    try {
+      if (kind === "save") {
+        await props.onSaveAndClose();
+      } else {
+        await props.onDiscardAndClose();
+      }
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  return (
+    <Modal
+      open={props.open}
+      topPriority
+      onClose={() => !busyAction && props.onCancel()}
+      closable={!busyAction}
+      icon={<FileCode2 size={22} color="var(--warning)" />}
+      iconBg="var(--warning-50)"
+      title="有未保存的脚本修改，确认关闭主窗口？"
+      sub="脚本编辑器中存在尚未保存的 train.py / requirements.txt 修改内容"
+      footer={
+        <>
+          <button
+            type="button"
+            className="btn"
+            disabled={!!busyAction}
+            onClick={props.onCancel}
+          >
+            继续编辑
+          </button>
+          <button
+            type="button"
+            className="btn btn-danger-ghost"
+            disabled={!!busyAction}
+            onClick={() => runAction("discard")}
+          >
+            {busyAction === "discard" ? <Loader2 size={14} className="spin" /> : <Trash2 size={14} />}
+            <span>放弃修改并关闭</span>
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            disabled={!!busyAction}
+            onClick={() => runAction("save")}
+          >
+            {busyAction === "save" ? <Loader2 size={14} className="spin" /> : <Save size={14} />}
+            <span>保存并关闭</span>
+          </button>
+        </>
+      }
+    >
+      <div className="banner banner-warn" style={{ margin: 0 }}>
+        <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+        <div>
+          <b>检测到未保存的编辑内容：</b>
+          直接关闭主窗口将丢失当前在脚本编辑器中所做的修改。您可以选择先保存脚本后再关闭窗口，或返回编辑器继续修改。
+        </div>
       </div>
     </Modal>
   );

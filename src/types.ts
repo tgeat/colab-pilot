@@ -326,6 +326,7 @@ export interface VmView {
   telemetry_age: number | null;
   telemetry_error: string | null;
   deploy_error?: string | null;
+  server_state_unknown?: boolean;
   relay: RelayStatus | null;
   busy: string | null;
   ssh?: VmSshInfo | null;
@@ -334,9 +335,11 @@ export interface VmView {
 
 export interface Overview {
   timestamp: number;
+  seq?: number;
   last_ok_timestamp?: number | null;
   is_stale?: boolean;
   stale_reason?: string | null;
+  server_list_known?: boolean;
   auth_ok: boolean;
   error: string | null;
   ccu: Ccu | null;
@@ -368,6 +371,7 @@ export interface StopRelayResult {
 
 export interface CloseRequestedRelayPayload {
   active_vms: string[];
+  unsaved_script?: boolean;
 }
 
 export interface WorkspaceFiles {

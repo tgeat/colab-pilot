@@ -108,8 +108,8 @@ function MiniMeter({ name, value, display }: { name: string; value: number; disp
   );
 }
 
-function statusPill(vm: VmView, activeProc: ProcInfo | null) {
-  const spec = resolveVmStatusPillSpec(vm, Boolean(activeProc));
+function statusPill(vm: VmView, activeProc: ProcInfo | null, serverStateUnknown = false) {
+  const spec = resolveVmStatusPillSpec(vm, Boolean(activeProc), serverStateUnknown);
   return (
     <span className={`pill ${spec.cls}`} title={spec.title}>
       <span className={`dot ${spec.pulse ? "pulse" : ""}`} />
@@ -631,6 +631,7 @@ function LlmSupervisionBox({
 export function VmCard({
   vm,
   allVms,
+  serverStateUnknown = false,
   onOpenLlmChat,
   onShutdown,
   onOpenSshTerminal,
@@ -644,13 +645,19 @@ export function VmCard({
 }: {
   vm: VmView;
   allVms?: VmView[];
+  serverStateUnknown?: boolean;
   onOpenLlmChat?: (name: string) => void;
   onShutdown?: (vm: VmView) => void;
   onOpenSshTerminal?: (name: string) => void;
   onRotateLlmKey?: (vmName: string, customKey?: string | null) => Promise<void>;
   onRetryProbe?: (name: string) => Promise<void>;
   onDeployLlm?: (vm: VmView) => void;
-  onStartRelay?: (name: string, config: RelayConfig, workspacePath?: string | null) => Promise<void>;
+  onStartRelay?: (
+    name: string,
+    config: RelayConfig,
+    workspacePath?: string | null,
+    legacyGdriveAction?: "migrate" | "ignore" | null,
+  ) => Promise<void>;
   onRequestStopRelay?: (vm: VmView) => void;
   onDismissRelay?: (name: string) => Promise<void>;
   onOpenScriptDialog?: (vm: VmView) => void;
@@ -693,6 +700,7 @@ export function VmCard({
   const isDeployingLlm = vm.busy === "deploying_llm";
   const isProbing = probingLocal || vm.busy === "probing";
   const isOfflineRelayRecord = !vm.on_server && vm.relay !== null;
+  const isBillingUnknown = Boolean(vm.server_state_unknown || serverStateUnknown);
   const offlineRelayView = isOfflineRelayRecord ? resolveRelayCompletionView(vm.relay) : null;
 
   const gpu = t?.gpu;
@@ -724,12 +732,15 @@ export function VmCard({
     }
   };
 
-  const handleStartRelayClick = async (cfg: RelayConfig) => {
+  const handleStartRelayClick = async (
+    cfg: RelayConfig,
+    legacyGdriveAction?: "migrate" | "ignore" | null,
+  ) => {
     if (!onStartRelay || relayPending) return;
     setRelayPending(true);
     try {
-      // #42：始终携带当前实例绑定的工作区路径
-      await onStartRelay(vm.name, cfg, vm.workspace?.path ?? null);
+      // #42 & #80：始终携带当前实例绑定的工作区路径与可选旧目录迁移确认动作
+      await onStartRelay(vm.name, cfg, vm.workspace?.path ?? null, legacyGdriveAction ?? null);
     } finally {
       setRelayPending(false);
     }
@@ -757,8 +768,15 @@ export function VmCard({
           {vm.high_ram ? " · High-RAM" : ""}
         </span>
         {isOfflineRelayRecord && (
-          <span className="chip" title="云端实例已释放下线，保留最近一次接力任务结果与日志">
-            云端实例已下线 · 接力记录
+          <span
+            className={`chip ${isBillingUnknown ? "chip-red" : ""}`.trim()}
+            title={
+              isBillingUnknown
+                ? "服务端实例列表查询失败，暂无法确认云端实例是否已停费释放"
+                : "云端实例已释放下线，保留最近一次接力任务结果与日志"
+            }
+          >
+            {isBillingUnknown ? "云端计费状态未知 · 接力记录" : "云端实例已下线 · 接力记录"}
           </span>
         )}
         {vm.orphan && (
@@ -766,7 +784,7 @@ export function VmCard({
             外部会话
           </span>
         )}
-        {statusPill(vm, activeProc)}
+        {statusPill(vm, activeProc, isBillingUnknown)}
         <span className="vm-meta">
           <span title={vm.workspace.path ?? ""}>
             <FolderGit2 size={12} />
@@ -1017,13 +1035,21 @@ export function VmCard({
             <div className="vm-alert-content">
               <div className="vm-alert-title">
                 {vm.relay?.running
-                  ? `接力换棒处理中（${vm.relay.phase_label || "正在分配下一棒实例"}）`
-                  : `已结束/已释放接力任务记录 · ${offlineRelayView?.stateLabel ?? "实例已下线"}`}
+                  ? isBillingUnknown
+                    ? `接力处理中 · 云端计费状态未知（${vm.relay.phase_label || "正在推进流程"}）`
+                    : `接力换棒处理中（${vm.relay.phase_label || "正在分配下一棒实例"}）`
+                  : isBillingUnknown
+                    ? `本地接力记录 · 云端计费状态未知（${offlineRelayView?.stateLabel ?? "已停止"}）`
+                    : `已结束/已释放接力任务记录 · ${offlineRelayView?.stateLabel ?? "实例已下线"}`}
               </div>
               <div className="vm-alert-desc">
                 {vm.relay?.running
-                  ? "上一棒云端实例已释放，本机监工正在推进下一棒流程。"
-                  : `云端 Colab 实例已下线释放（不再产生计费）。${offlineRelayView?.sub ?? ""}`}
+                  ? isBillingUnknown
+                    ? "当前服务端计费列表查询失败，暂无法确认云端实例状态，本机监工正在推进流程。"
+                    : "上一棒云端实例已释放，本机监工正在推进下一棒流程。"
+                  : isBillingUnknown
+                    ? `服务端计费列表查询失败，当前云端实例计费状态未知（待服务端查询恢复并确认释放后，再显示已停费）。${offlineRelayView?.sub ?? ""}`
+                    : `云端 Colab 实例已下线释放（不再产生计费）。${offlineRelayView?.sub ?? ""}`}
               </div>
             </div>
             {!vm.relay?.running && onDismissRelay && (

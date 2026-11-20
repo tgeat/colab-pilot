@@ -29,6 +29,8 @@ import { fmtSnapshotTime, formatRealtimeTps, num, numOrNull, str } from "./forma
 import {
   buildPresetFromRecentSession,
   isLlmVmReady,
+  isOverviewServerListUnknown,
+  mergeOverviewSnapshot,
   resolveBlueGreenStatus,
   resolveEffectiveHighMem,
   resolveVmSlot,
@@ -44,7 +46,11 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Header } from "./components/Header";
 import { LlmChatModal } from "./components/LlmChatModal";
 import { ScriptDialog } from "./components/ScriptDialog";
-import { CloseAppRelayDialog, StopRelayDialog } from "./components/StopRelayDialog";
+import {
+  CloseAppRelayDialog,
+  CloseAppUnsavedScriptDialog,
+  StopRelayDialog,
+} from "./components/StopRelayDialog";
 import { VmCard } from "./components/VmCard";
 import { ColabIcon, ToastProvider, useToast } from "./components/ui";
 
@@ -336,16 +342,14 @@ function Dashboard() {
   const [createOpen, setCreateOpen] = useState(false);
   const [createPreset, setCreatePreset] = useState<CreateVmPreset | null>(null);
   const [closeRelayVms, setCloseRelayVms] = useState<string[] | null>(null);
+  const [closeUnsavedScriptVms, setCloseUnsavedScriptVms] = useState<string[] | null>(null);
+  const scriptSaveNowRef = useRef<(() => Promise<boolean>) | null>(null);
+  const scriptDiscardNowRef = useRef<(() => void) | null>(null);
   const didInitRef = useRef(false);
 
   const applyOverview = useCallback((next: Overview) => {
     if (!next) return;
-    setOv((prev) => {
-      if (!prev) return next;
-      const prevSnap = prev.last_ok_timestamp ?? prev.timestamp;
-      const nextSnap = next.last_ok_timestamp ?? next.timestamp;
-      return nextSnap >= prevSnap || Boolean(next.is_stale) ? next : prev;
-    });
+    setOv((prev) => mergeOverviewSnapshot(prev, next));
   }, []);
 
   const refresh = useCallback(
@@ -414,10 +418,29 @@ function Dashboard() {
       })
       .catch(() => null);
 
+    // #83：监听后端窗口关闭时的未保存脚本编辑拦截事件，弹出最高层级未保存提示弹窗
+    const unCloseUnsavedPromise = listen<CloseRequestedRelayPayload>(
+      "close-requested-unsaved-script",
+      (e) => {
+        if (disposed) return;
+        const names = Array.isArray(e.payload?.active_vms) ? e.payload.active_vms : [];
+        setCloseUnsavedScriptVms(names);
+      },
+    )
+      .then((fn) => {
+        if (disposed) {
+          fn();
+          return null;
+        }
+        return fn;
+      })
+      .catch(() => null);
+
     return () => {
       disposed = true;
       unOverviewPromise.then((fn) => fn?.());
       unCloseRelayPromise.then((fn) => fn?.());
+      unCloseUnsavedPromise.then((fn) => fn?.());
     };
   }, [applyOverview, refresh]);
 
@@ -487,16 +510,17 @@ function Dashboard() {
     }
   };
 
-  // #42：启动接力时传入该实例绑定的专属工作区路径
+  // #42 & #80：启动接力时传入该实例绑定的专属工作区路径及可选旧版根目录迁移确认动作
   const handleStartRelay = async (
     name: string,
     config: RelayConfig,
     workspacePath?: string | null,
+    legacyGdriveAction?: "migrate" | "ignore" | null,
   ) => {
     try {
       const vmObj = (ov?.vms ?? []).find((x) => x.name === name);
       const effectiveWs = workspacePath ?? vmObj?.workspace?.path ?? null;
-      await api.startRelay(name, config, effectiveWs);
+      await api.startRelay(name, config, effectiveWs, legacyGdriveAction ?? null);
       toast(`已在实例 [${name}] 启动自动接力训练监工`, "success");
       await refresh(false);
     } catch (e) {
@@ -528,6 +552,7 @@ function Dashboard() {
   const recents = ov?.recent_sessions ?? [];
   const hasRelayWorkload = vms.some((v) => v.relay !== null || Boolean(v.telemetry?.training));
   const isStaleOverview = Boolean(ov && (ov.is_stale || ov.stale_reason));
+  const serverListUnknown = Boolean(ov && isOverviewServerListUnknown(ov));
   const snapshotTs = ov ? (ov.last_ok_timestamp ?? ov.timestamp) : null;
 
   const liveShutdownVm = shutdownVm
@@ -640,7 +665,13 @@ function Dashboard() {
         {vms.length === 0 ? (
           <div className="empty">
             <ColabIcon size={38} />
-            <h3>{ov ? "当前没有运行中的 Colab 虚拟机" : "正在同步云端实例…"}</h3>
+            <h3>
+              {!ov
+                ? "正在同步云端实例…"
+                : serverListUnknown
+                  ? "暂无法确认云端实例状态（服务端列表查询失败）"
+                  : "当前没有运行中的 Colab 虚拟机"}
+            </h3>
             <p className="dim">
               点击下方按钮选择 GPU / TPU / CPU 型号与 Colab 运行时配置一键开机，每台虚拟机自动提供免密 SSH，大模型虚拟机自动提供 OpenAI API 与 Key。
             </p>
@@ -685,6 +716,7 @@ function Dashboard() {
                 <VmCard
                   vm={vm}
                   allVms={vms}
+                  serverStateUnknown={serverListUnknown}
                   onOpenLlmChat={(name) => setChatTarget(name)}
                   onShutdown={(v) => setShutdownVm(v)}
                   onOpenSshTerminal={handleOpenSshTerminal}
@@ -787,6 +819,8 @@ function Dashboard() {
           open={scriptTarget.open}
           workspacePath={scriptTarget.workspacePath}
           vmName={scriptTarget.vmName}
+          saveNowRef={scriptSaveNowRef}
+          discardNowRef={scriptDiscardNowRef}
           onClose={() =>
             setScriptTarget((prev) => ({ ...prev, open: false }))
           }
@@ -798,15 +832,6 @@ function Dashboard() {
           vm={liveStopRelayVm}
           onClose={() => setStopRelayVm(null)}
           onStop={handleStopRelay}
-        />
-      </ErrorBoundary>
-
-      <ErrorBoundary label="close-app-relay">
-        <CloseAppRelayDialog
-          open={closeRelayVms !== null}
-          activeVms={closeRelayVms ?? []}
-          onCancel={() => setCloseRelayVms(null)}
-          onConfirmClose={(mode) => api.confirmAppClose(mode)}
         />
       </ErrorBoundary>
 
@@ -824,6 +849,49 @@ function Dashboard() {
           vm={liveShutdownVm}
           onClose={() => setShutdownVm(null)}
           onDelete={(v) => api.deleteVm(v.name, v.endpoint)}
+        />
+      </ErrorBoundary>
+
+      {/* #87 & #83：系统窗口关闭确认弹窗置于最末 DOM 顺序并搭配 `.overlay-topmost` (z-index: 180)，确保不被聊天窗等覆盖 */}
+      <ErrorBoundary label="close-app-relay">
+        <CloseAppRelayDialog
+          open={closeRelayVms !== null}
+          activeVms={closeRelayVms ?? []}
+          onCancel={() => setCloseRelayVms(null)}
+          onConfirmClose={(mode) => api.confirmAppClose(mode)}
+        />
+      </ErrorBoundary>
+
+      <ErrorBoundary label="close-app-unsaved-script">
+        <CloseAppUnsavedScriptDialog
+          open={closeUnsavedScriptVms !== null}
+          onCancel={() => setCloseUnsavedScriptVms(null)}
+          onSaveAndClose={async () => {
+            const pendingActive = closeUnsavedScriptVms ?? [];
+            const saved = scriptSaveNowRef.current ? await scriptSaveNowRef.current() : true;
+            if (!saved) {
+              setCloseUnsavedScriptVms(null);
+              return;
+            }
+            await api.setScriptDirty(false).catch(() => {});
+            setCloseUnsavedScriptVms(null);
+            if (pendingActive.length > 0) {
+              setCloseRelayVms(pendingActive);
+            } else {
+              await api.confirmAppClose("force_exit");
+            }
+          }}
+          onDiscardAndClose={async () => {
+            const pendingActive = closeUnsavedScriptVms ?? [];
+            scriptDiscardNowRef.current?.();
+            await api.setScriptDirty(false).catch(() => {});
+            setCloseUnsavedScriptVms(null);
+            if (pendingActive.length > 0) {
+              setCloseRelayVms(pendingActive);
+            } else {
+              await api.confirmAppClose("force_exit");
+            }
+          }}
         />
       </ErrorBoundary>
     </>

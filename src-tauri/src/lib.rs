@@ -109,6 +109,8 @@ pub struct VmView {
     pub llm_api: Option<LlmApiAccessInfo>,
     #[serde(default)]
     pub deploy_error: Option<String>,
+    #[serde(default)]
+    pub server_state_unknown: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
@@ -175,6 +177,10 @@ pub struct Overview {
     pub is_stale: bool,
     #[serde(default)]
     pub stale_reason: Option<String>,
+    #[serde(default)]
+    pub server_list_known: bool,
+    #[serde(default)]
+    pub seq: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
@@ -300,7 +306,9 @@ pub struct AppState {
     probe_cooldown: Mutex<HashMap<String, Instant>>,
     gdrive: tokio::sync::Mutex<GdriveCache>,
     refresh_lock: tokio::sync::Mutex<()>,
+    overview_seq: std::sync::atomic::AtomicU64,
     force_close_confirmed: std::sync::atomic::AtomicBool,
+    script_dirty: std::sync::atomic::AtomicBool,
     pending_close_vms: Mutex<std::collections::HashSet<String>>,
 }
 
@@ -358,7 +366,9 @@ impl AppState {
             probe_cooldown: Mutex::new(HashMap::new()),
             gdrive: tokio::sync::Mutex::new(GdriveCache::default()),
             refresh_lock: tokio::sync::Mutex::new(()),
+            overview_seq: std::sync::atomic::AtomicU64::new(0),
             force_close_confirmed: std::sync::atomic::AtomicBool::new(false),
+            script_dirty: std::sync::atomic::AtomicBool::new(false),
             pending_close_vms: Mutex::new(std::collections::HashSet::new()),
         })
     }
@@ -1579,8 +1589,13 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
         }
     };
     let env = app.env_status();
+    let seq = app
+        .overview_seq
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
     let mut ov = Overview {
         timestamp: chrono::Utc::now().timestamp(),
+        seq,
         env: env.clone(),
         ..Default::default()
     };
@@ -1664,6 +1679,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
 
         if let Some((cached_list, prev_ok_ts)) = cached_fresh {
             ov.auth_ok = true;
+            ov.server_list_known = true;
             assignments = cached_list;
             ov.ccu = app.last_ccu.l().clone();
             ov.last_ok_timestamp = Some(prev_ok_ts);
@@ -1679,6 +1695,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
                     ov.is_stale = false;
                     ov.stale_reason = None;
                     ov.auth_ok = true;
+                    ov.server_list_known = true;
                     *app.last_assignments.l() = Some((l.clone(), Instant::now(), now_unix));
                     assignments = l;
                 }
@@ -1692,12 +1709,14 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
                         .map(|(l, _, ok_ts)| (l.clone(), *ok_ts));
                     if let Some((cached, prev_ok_ts)) = fallback {
                         ov.auth_ok = true;
+                        ov.server_list_known = true;
                         assignments = cached;
                         ov.timestamp = prev_ok_ts as i64;
                         ov.last_ok_timestamp = Some(prev_ok_ts);
                         ov.is_stale = true;
                         ov.stale_reason = Some(err_msg);
                     } else {
+                        ov.server_list_known = false;
                         ov.last_ok_timestamp = app
                             .last_assignments
                             .l()
@@ -1713,7 +1732,11 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
                     ov.ccu = Some(c);
                 }
                 Err(_) => {
-                    ov.ccu = app.last_ccu.l().clone();
+                    ov.ccu = if ov.server_list_known {
+                        app.last_ccu.l().clone()
+                    } else {
+                        None
+                    };
                 }
             }
         }
@@ -1767,7 +1790,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
         )
     }))
     .await;
-    {
+    if ov.server_list_known {
         let mut t = app.telemetry.l();
         t.retain(|ep, _| assignments.iter().any(|a| &a.endpoint == ep));
         for (a, entry) in assignments.iter().zip(fetched) {
@@ -1855,7 +1878,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
     // 维护每台在线受管实例的本机按需 SSH WebSocket 桥接监听，并自动回收已下线实例的桥接器
     let active_draft_names: std::collections::HashSet<String> =
         drafts.iter().map(|d| d.name.clone()).collect();
-    {
+    if ov.server_list_known {
         let mut bridges = app.ssh_bridges.l();
         let stale_keys: Vec<String> = bridges
             .keys()
@@ -2167,6 +2190,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             ssh: Some(ssh_info),
             llm_api,
             deploy_error: deploy_errs.get(&d.name).cloned(),
+            server_state_unknown: false,
         });
     }
 
@@ -2214,6 +2238,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             relay: Some(snap),
             busy: cur_busy,
             deploy_error: deploy_errs.get(&name).cloned(),
+            server_state_unknown: !ov.server_list_known,
             ..Default::default()
         });
     }
@@ -2506,10 +2531,14 @@ pub async fn hard_terminate(
 
     let mut stopped_local_relay = false;
     let mut stopped_during_provisioning = false;
+    let mut pre_prov_snapshot_invalid = false;
     let mut pre_prov_endpoints: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     if let Some(h) = app.relay(name) {
         pre_prov_endpoints = h.pre_provision_endpoints.l().clone();
+        pre_prov_snapshot_invalid = h
+            .pre_provision_snapshot_invalid
+            .load(std::sync::atomic::Ordering::SeqCst);
         if stop_relay {
             h.keep_vm_on_stop
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2573,16 +2602,32 @@ pub async fn hard_terminate(
         push_unique_endpoint(&mut target_endpoints, &other_session_endpoints, orphan_ep);
     }
 
-    // 若刚中止了 provisioning 阶段的 colab new，服务端分配可能晚几百毫秒才出现在 /tun/m/assignments
-    if (target_endpoints.is_empty() || stopped_during_provisioning || stopped_local_relay)
-        && (stopped_during_provisioning || stopped_local_relay)
-    {
-        let max_probes = if stopped_during_provisioning && target_endpoints.is_empty() {
-            3
-        } else {
-            1
-        };
-        for probe in 0..max_probes {
+    // Issue #77：仅在明确处于 provisioning（colab new）阶段被取消、尚未确认任何会话归属端点、且持有本次分配前有效快照时，
+    // 才探测取消分配期间刚诞生的残留孤儿；运行态或已锁定目标端点时严禁将其他项目的未登记端点判作残留误关！
+    if stopped_during_provisioning && target_endpoints.is_empty() && !pre_prov_snapshot_invalid {
+        for probe in 0..3 {
+            let refreshed_sess_ep = cli::read_sessions().get(name).and_then(session_endpoint);
+            push_unique_endpoint(
+                &mut target_endpoints,
+                &other_session_endpoints,
+                refreshed_sess_ep,
+            );
+            if let Ok(ref list) = initial_assignments {
+                if let Some(ep_found) = list
+                    .iter()
+                    .find(|a| matches_orphan_name(&a.endpoint, name))
+                    .map(|a| a.endpoint.clone())
+                {
+                    push_unique_endpoint(
+                        &mut target_endpoints,
+                        &other_session_endpoints,
+                        Some(ep_found),
+                    );
+                }
+            }
+            if !target_endpoints.is_empty() {
+                break;
+            }
             if let Ok(ref list) = initial_assignments {
                 let newly_leaked: Vec<String> = list
                     .iter()
@@ -2606,29 +2651,9 @@ pub async fn hard_terminate(
                     break;
                 }
             }
-            if probe + 1 < max_probes {
+            if probe + 1 < 3 {
                 tokio::time::sleep(Duration::from_millis(if cfg!(test) { 15 } else { 700 })).await;
                 initial_assignments = app.client.list_assignments().await;
-                let refreshed_sess_ep = cli::read_sessions().get(name).and_then(session_endpoint);
-                push_unique_endpoint(
-                    &mut target_endpoints,
-                    &other_session_endpoints,
-                    refreshed_sess_ep,
-                );
-                if let Ok(ref list) = initial_assignments {
-                    if let Some(ep_found) = list
-                        .iter()
-                        .find(|a| matches_orphan_name(&a.endpoint, name))
-                        .map(|a| a.endpoint.clone())
-                    {
-                        push_unique_endpoint(
-                            &mut target_endpoints,
-                            &other_session_endpoints,
-                            Some(ep_found),
-                        );
-                        break;
-                    }
-                }
             }
         }
     }
@@ -3476,13 +3501,14 @@ fn spawn_llm_deployment_task(
 }
 
 /// 归一化接力配置（保留 CPU 规格、自动按实例名隔离裸 `gdrive:colab_relay` 目录、校验单棒时长 0.1~23.5h，并拦截运行中目录冲突）
+/// 返回 `Ok(was_auto_isolated)`，供接力监工执行旧版根目录断点检测与迁移提示（#80）。
 pub(crate) fn prepare_relay_config_for_vm(
     app: &AppState,
     vm_name: &str,
     cfg: &mut RelayConfig,
     override_gpu: Option<&str>,
     override_high_mem: Option<bool>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let raw_gpu = override_gpu.unwrap_or(&cfg.gpu_type).trim();
     let gpu_upper = raw_gpu.to_ascii_uppercase();
     cfg.gpu_type = if gpu_upper.is_empty() || gpu_upper == "NONE" {
@@ -3491,6 +3517,8 @@ pub(crate) fn prepare_relay_config_for_vm(
         gpu_upper
     };
     cfg.high_mem = override_high_mem.unwrap_or(cfg.high_mem) && relay::supports_high_mem(&cfg.gpu_type);
+    let was_auto_isolated =
+        relay::normalize_gdrive_dir(&cfg.gdrive_dir) == relay::DEFAULT_BARE_GDRIVE_DIR;
     cfg.gdrive_dir = relay::resolve_isolated_gdrive_dir(&cfg.gdrive_dir, vm_name);
     relay::validate_relay_config(cfg).map_err(|e| e.to_string())?;
 
@@ -3506,7 +3534,7 @@ pub(crate) fn prepare_relay_config_for_vm(
             }
         }
     }
-    Ok(())
+    Ok(was_auto_isolated)
 }
 
 #[derive(Debug, Clone)]
@@ -3519,6 +3547,7 @@ pub(crate) struct PreparedCreateVm {
     pub ws_display_name: String,
     pub desc_clean: Option<String>,
     pub validated_relay_cfg: Option<RelayConfig>,
+    pub relay_auto_isolated: bool,
     pub validated_llm_cfg: Option<CreateVmLlmConfig>,
 }
 
@@ -3595,21 +3624,21 @@ pub(crate) fn validate_and_prepare_create_vm(
         }
     }
 
-    let validated_relay_cfg = if boot_mode == "relay" {
+    let (validated_relay_cfg, relay_auto_isolated) = if boot_mode == "relay" {
         if !cli::rclone_conf_path().exists() {
             return Err("未检测到 rclone.conf，请先完成 Google Drive 授权后再开启自动接力".into());
         }
         let mut cfg = req.relay_config.clone().unwrap_or_default();
-        prepare_relay_config_for_vm(
+        let was_iso = prepare_relay_config_for_vm(
             app,
             &name,
             &mut cfg,
             Some(&req.accelerator),
             Some(effective_high_mem),
         )?;
-        Some(cfg)
+        (Some(cfg), was_iso)
     } else {
-        None
+        (None, false)
     };
 
     let validated_llm_cfg = if boot_mode == "llm" {
@@ -3700,6 +3729,7 @@ pub(crate) fn validate_and_prepare_create_vm(
         ws_display_name,
         desc_clean,
         validated_relay_cfg,
+        relay_auto_isolated,
         validated_llm_cfg,
     })
 }
@@ -3815,6 +3845,8 @@ async fn create_vm(
             cfg,
             effective_ws_dir,
             prep.auth_mode.clone(),
+            prep.relay_auto_isolated,
+            None,
         );
     } else if let Some(llm_cfg) = prep.validated_llm_cfg {
         if let Err(e) = spawn_llm_deployment_task(
@@ -3939,6 +3971,8 @@ fn start_relay_inner(
     cfg: RelayConfig,
     ws_dir: PathBuf,
     auth_mode: Option<String>,
+    auto_isolated_gdrive: bool,
+    legacy_gdrive_action: Option<String>,
 ) -> RelayStatus {
     let h = {
         let mut map = app.relays.l();
@@ -3960,7 +3994,12 @@ fn start_relay_inner(
         .store(false, std::sync::atomic::Ordering::SeqCst);
     h.stopped_during_provisioning
         .store(false, std::sync::atomic::Ordering::SeqCst);
+    h.pre_provision_snapshot_invalid
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     h.pre_provision_endpoints.l().clear();
+    h.auto_isolated_gdrive
+        .store(auto_isolated_gdrive, std::sync::atomic::Ordering::SeqCst);
+    *h.legacy_gdrive_action.l() = legacy_gdrive_action;
     h.task_alive
         .store(true, std::sync::atomic::Ordering::SeqCst);
     h.gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3991,6 +4030,7 @@ async fn start_relay(
     name: String,
     mut config: RelayConfig,
     workspace_path: Option<String>,
+    legacy_gdrive_action: Option<String>,
 ) -> Result<RelayStatus, String> {
     let app = state.inner().clone();
     if !valid_name(&name) {
@@ -4012,7 +4052,7 @@ async fn start_relay(
         return Err(format!("接力工作区路径不是有效文件夹：`{}`", ws_dir.display()));
     }
 
-    prepare_relay_config_for_vm(&app, &name, &mut config, None, None)?;
+    let was_auto_isolated = prepare_relay_config_for_vm(&app, &name, &mut config, None, None)?;
     if !cli::rclone_conf_path().exists() {
         return Err("未检测到 rclone.conf，请先完成 Google Drive 授权".into());
     }
@@ -4038,7 +4078,15 @@ async fn start_relay(
     }
 
     let auth_mode = cli::get_session_auth_mode(&name);
-    let st = start_relay_inner(&app, &name, config, ws_dir, auth_mode);
+    let st = start_relay_inner(
+        &app,
+        &name,
+        config,
+        ws_dir,
+        auth_mode,
+        was_auto_isolated || legacy_gdrive_action.is_some(),
+        legacy_gdrive_action,
+    );
     spawn_refresh(&app, &handle);
     Ok(st)
 }
@@ -4289,6 +4337,36 @@ async fn read_workspace_files(
     .await
 }
 
+fn write_staged_temp_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+fn replace_target_from_staged(staged: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::rename(staged, target) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            // Windows 上若目标被只读或独占句柄占用，rename 与 write 均会失败并返回底层错误
+            let bytes = std::fs::read(staged)?;
+            match std::fs::write(target, &bytes) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(staged);
+                    Ok(())
+                }
+                Err(_) => {
+                    let _ = std::fs::remove_file(staged);
+                    Err(rename_err)
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn save_workspace_files_inner(
     app: &AppState,
     train_py: String,
@@ -4307,21 +4385,76 @@ pub(crate) async fn save_workspace_files_inner(
         return Err(format!("工作区路径不是有效文件夹：`{}`", ws.display()));
     }
 
-    for fname in ["train.py", "requirements.txt"] {
-        let target = ws.join(fname);
-        if let Ok(meta) = std::fs::symlink_metadata(&target) {
+    // Issue #84：两阶段预检 + 临时文件暂存 + 失败原子回滚，确保两份文件要么全部生效，要么保留一致的旧版本
+    let train_target = ws.join("train.py");
+    let req_target = ws.join("requirements.txt");
+    let mut orig_snapshots: [Option<Vec<u8>>; 2] = [None, None];
+
+    for (idx, (fname, target)) in [("train.py", &train_target), ("requirements.txt", &req_target)]
+        .into_iter()
+        .enumerate()
+    {
+        if let Ok(meta) = std::fs::symlink_metadata(target) {
             if meta.file_type().is_symlink() {
                 return Err(format!("拒绝写入符号链接文件: {fname}"));
             }
             if meta.is_dir() {
                 return Err(format!("无法写入 `{fname}`：目标路径是一个文件夹"));
             }
+            if meta.permissions().readonly() {
+                return Err(format!("无法写入 `{fname}`：文件处于只读状态，未修改任何工作区文件"));
+            }
+            // 在不截断旧文件的前提下探测可写句柄，提前拦截 ACL 拒绝或独占锁
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(target)
+                .map_err(|e| format!("无法写入 `{fname}`（未修改任何工作区文件）：{e}"))?;
+            let prev = std::fs::read(target)
+                .map_err(|e| format!("备份 `{fname}` 原始内容失败（未修改任何工作区文件）：{e}"))?;
+            orig_snapshots[idx] = Some(prev);
         }
     }
-    std::fs::write(ws.join("train.py"), train_py)
-        .map_err(|e| format!("写入 `train.py` 失败：{e}"))?;
-    std::fs::write(ws.join("requirements.txt"), requirements_txt)
-        .map_err(|e| format!("写入 `requirements.txt` 失败：{e}"))?;
+
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let staged_train = ws.join(format!(".train.py.{nonce}.saving.tmp"));
+    let staged_req = ws.join(format!(".requirements.txt.{nonce}.saving.tmp"));
+
+    if let Err(e) = write_staged_temp_file(&staged_train, train_py.as_bytes()) {
+        let _ = std::fs::remove_file(&staged_train);
+        return Err(format!("暂存 `train.py` 失败（未修改任何工作区文件）：{e}"));
+    }
+    if let Err(e) = write_staged_temp_file(&staged_req, requirements_txt.as_bytes()) {
+        let _ = std::fs::remove_file(&staged_train);
+        let _ = std::fs::remove_file(&staged_req);
+        return Err(format!("暂存 `requirements.txt` 失败（未修改任何工作区文件）：{e}"));
+    }
+
+    if let Err(e) = replace_target_from_staged(&staged_train, &train_target) {
+        let _ = std::fs::remove_file(&staged_train);
+        let _ = std::fs::remove_file(&staged_req);
+        return Err(format!("写入 `train.py` 失败（未修改任何工作区文件）：{e}"));
+    }
+
+    if let Err(e) = replace_target_from_staged(&staged_req, &req_target) {
+        let _ = std::fs::remove_file(&staged_req);
+        let rollback_res = match &orig_snapshots[0] {
+            Some(prev_bytes) => std::fs::write(&train_target, prev_bytes),
+            None => match std::fs::remove_file(&train_target) {
+                Ok(()) => Ok(()),
+                Err(rm_err) if rm_err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(rm_err) => Err(rm_err),
+            },
+        };
+        return match rollback_res {
+            Ok(()) => Err(format!(
+                "写入 `requirements.txt` 失败：{e}（已自动回滚 `train.py`，保留一致的旧版本）"
+            )),
+            Err(rb_err) => Err(format!(
+                "写入 `requirements.txt` 失败：{e}（注意：`train.py` 新内容已生效，但回滚旧版本失败：{rb_err}）"
+            )),
+        };
+    }
+
     Ok(())
 }
 
@@ -6480,6 +6613,33 @@ pub(crate) fn active_relay_vm_names(app: &AppState) -> Vec<String> {
     set.into_iter().collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowCloseInterception {
+    pub active_vms: Vec<String>,
+    pub unsaved_script: bool,
+}
+
+pub(crate) fn evaluate_window_close_interception(
+    app: &AppState,
+) -> Option<WindowCloseInterception> {
+    if app
+        .force_close_confirmed
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return None;
+    }
+    let active_vms = should_intercept_window_close(app).unwrap_or_default();
+    let unsaved_script = app.script_dirty.load(std::sync::atomic::Ordering::SeqCst);
+    if active_vms.is_empty() && !unsaved_script {
+        None
+    } else {
+        Some(WindowCloseInterception {
+            active_vms,
+            unsaved_script,
+        })
+    }
+}
+
 pub(crate) fn should_intercept_window_close(app: &AppState) -> Option<Vec<String>> {
     if app
         .force_close_confirmed
@@ -6493,6 +6653,14 @@ pub(crate) fn should_intercept_window_close(app: &AppState) -> Option<Vec<String
     } else {
         Some(active)
     }
+}
+
+#[tauri::command]
+fn set_script_dirty(state: AppStateRef<'_>, dirty: bool) {
+    state
+        .inner()
+        .script_dirty
+        .store(dirty, std::sync::atomic::Ordering::SeqCst);
 }
 
 pub(crate) async fn confirm_app_close_inner(
@@ -6517,6 +6685,8 @@ pub(crate) async fn confirm_app_close_inner(
             }
         }
         app.pending_close_vms.l().clear();
+        app.script_dirty
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         app.force_close_confirmed
             .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok((Vec::new(), true))
@@ -6524,6 +6694,8 @@ pub(crate) async fn confirm_app_close_inner(
         let targets = active_relay_vm_names(app);
         if targets.is_empty() {
             app.pending_close_vms.l().clear();
+            app.script_dirty
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             app.force_close_confirmed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             return Ok((Vec::new(), true));
@@ -6558,6 +6730,8 @@ pub(crate) async fn confirm_app_close_inner(
             }
         }
         if unverified.is_empty() {
+            app.script_dirty
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             app.force_close_confirmed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok((receipts, true))
@@ -6711,6 +6885,7 @@ pub fn run() {
             stop_relay,
             read_workspace_files,
             save_workspace_files,
+            set_script_dirty,
             stream_llm_chat,
             cancel_llm_chat,
             open_vm_ssh_terminal,
@@ -6741,14 +6916,26 @@ pub fn run() {
                                 record_window_state(&w, &tr, true);
                             }
                             if let Some(st) = handle.try_state::<Arc<AppState>>() {
-                                if let Some(active_names) =
-                                    should_intercept_window_close(st.inner())
+                                if let Some(intercept) =
+                                    evaluate_window_close_interception(st.inner())
                                 {
                                     api.prevent_close();
-                                    let _ = handle.emit(
-                                        "close-requested-with-relay",
-                                        serde_json::json!({ "active_vms": active_names }),
-                                    );
+                                    if intercept.unsaved_script {
+                                        let _ = handle.emit(
+                                            "close-requested-unsaved-script",
+                                            serde_json::json!({
+                                                "active_vms": intercept.active_vms,
+                                                "unsaved_script": true,
+                                            }),
+                                        );
+                                    } else {
+                                        let _ = handle.emit(
+                                            "close-requested-with-relay",
+                                            serde_json::json!({
+                                                "active_vms": intercept.active_vms,
+                                            }),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -8268,6 +8455,281 @@ sys.exit(rc)
         assert!(should_intercept_window_close(&app).is_none());
 
         shutdown_child_processes(&app);
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        *cli::TEST_RCLONE_CONF.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_77_hard_terminate_running_relay_never_unassigns_unrelated_endpoint() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_issue77_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(tmp.join("no_colab"));
+
+        let relay_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let other_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let unassigned_eps: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let r_alive = relay_alive.clone();
+        let o_alive = other_alive.clone();
+        let u_log = unassigned_eps.clone();
+        let srv = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let ra = r_alive.clone();
+                let oa = o_alive.clone();
+                let ul = u_log.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first = req.lines().next().unwrap_or("");
+                    let (status, body) = if first.starts_with("GET /tun/m/assignments") {
+                        let mut items = Vec::new();
+                        if ra.load(Ordering::SeqCst) {
+                            items.push(serde_json::json!({
+                                "endpoint": "m-s-relay001",
+                                "accelerator": "T4",
+                                "runtimeProxyInfo": { "token": "t", "url": "http://127.0.0.1:9" }
+                            }));
+                        }
+                        if oa.load(Ordering::SeqCst) {
+                            items.push(serde_json::json!({
+                                "endpoint": "m-s-other-project",
+                                "accelerator": "A100",
+                                "runtimeProxyInfo": { "token": "t", "url": "http://127.0.0.1:9" }
+                            }));
+                        }
+                        (
+                            "200 OK",
+                            format!(")]}}'\n{}", serde_json::json!({ "assignments": items })),
+                        )
+                    } else if first.starts_with("GET /tun/m/unassign/") {
+                        ("200 OK", r#"{"token":"xsrf"}"#.to_string())
+                    } else if let Some(rest) = first.strip_prefix("POST /tun/m/unassign/") {
+                        let ep = rest
+                            .split(['?', ' '])
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        ul.l().push(ep.clone());
+                        if ep == "m-s-relay001" {
+                            ra.store(false, Ordering::SeqCst);
+                        } else if ep == "m-s-other-project" {
+                            oa.store(false, Ordering::SeqCst);
+                        }
+                        ("200 OK", "{}".to_string())
+                    } else {
+                        ("200 OK", r#"{"currentBalance":50.0}"#.to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        // Register ONLY `managed-relay` in sessions.json; `m-s-other-project` is an unregistered endpoint from another project
+        std::fs::write(
+            cfg_dir.join("sessions.json"),
+            serde_json::json!({ "managed-relay": { "endpoint": "m-s-relay001" } }).to_string(),
+        )
+        .unwrap();
+        let tok_file = tmp.join("token.json");
+        std::fs::write(
+            &tok_file,
+            r#"{"token":"valid-token","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_file);
+        let app = AppState::new_with(client, ws_dir);
+
+        let h = Arc::new(RelayHandle::new("managed-relay"));
+        h.status.l().running = true;
+        h.status.l().phase = "training".into();
+        h.task_alive.store(true, Ordering::SeqCst);
+        app.relays.l().insert("managed-relay".into(), h);
+
+        let receipt = hard_terminate(&app, "managed-relay", None, true).await;
+        assert!(receipt.verified_unassigned);
+        assert_eq!(receipt.endpoint.as_deref(), Some("m-s-relay001"));
+        assert!(!relay_alive.load(Ordering::SeqCst));
+        assert!(
+            other_alive.load(Ordering::SeqCst),
+            "unregistered endpoint from another project must NOT be unassigned (#77)"
+        );
+        assert_eq!(
+            *unassigned_eps.l(),
+            vec!["m-s-relay001".to_string()],
+            "unassign must ONLY be called on the confirmed session endpoint"
+        );
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_78_83_84_unknown_billing_on_list_failure_unsaved_close_and_atomic_save_rollback() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_78_83_84_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(tmp.join("no_colab"));
+        *cli::TEST_RCLONE_CONF.l() = Some(tmp.join("no_rclone.conf"));
+
+        let fail_server = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fs_flag = fail_server.clone();
+        let srv = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let f = fs_flag.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let (status, body) = if f.load(Ordering::SeqCst) {
+                        ("503 Service Unavailable", r#"{"error":"down"}"#.to_string())
+                    } else {
+                        ("200 OK", ")]}'\n{\"assignments\":[]}".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tok_file = tmp.join("token.json");
+        std::fs::write(
+            &tok_file,
+            r#"{"token":"valid-token","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_file);
+        let app = AppState::new_with(client, ws_dir.clone());
+
+        // #78: Expired cache (>60s) + server list failure with local stopped relay record
+        *app.last_assignments.l() = Some((
+            vec![],
+            Instant::now() - Duration::from_secs(120),
+            1700000100,
+        ));
+        *app.last_ccu.l() = Some(Ccu {
+            balance: 99.0,
+            burn_rate_hourly: 0.0,
+            assignments_count: 0,
+        });
+        let stopped_h = Arc::new(RelayHandle::new("offline-relay"));
+        stopped_h.status.l().running = false;
+        stopped_h.status.l().phase = "error".into();
+        stopped_h.status.l().last_error = Some("failed".into());
+        app.relays.l().insert("offline-relay".into(), stopped_h);
+
+        let ov_unknown = refresh_overview(&app, true).await;
+        assert!(ov_unknown.error.is_some());
+        assert!(!ov_unknown.is_stale);
+        assert!(!ov_unknown.server_list_known, "expired cache query failure must set server_list_known=false");
+        assert!(ov_unknown.ccu.is_none(), "must not expose stale 0.0 CU/h when server_list_known is false");
+        let card_unknown = ov_unknown
+            .vms
+            .iter()
+            .find(|v| v.name == "offline-relay")
+            .expect("offline relay record retained");
+        assert!(card_unknown.server_state_unknown, "offline relay card must mark server_state_unknown=true");
+
+        // Server recovers and confirms 0 assignments -> server_list_known=true & server_state_unknown=false
+        fail_server.store(false, Ordering::SeqCst);
+        let ov_confirmed = refresh_overview(&app, true).await;
+        assert!(ov_confirmed.error.is_none());
+        assert!(ov_confirmed.server_list_known);
+        let card_confirmed = ov_confirmed
+            .vms
+            .iter()
+            .find(|v| v.name == "offline-relay")
+            .unwrap();
+        assert!(!card_confirmed.server_state_unknown);
+
+        // #84: Atomic workspace script save — read-only requirements.txt MUST preserve original train.py
+        let train_p = ws_dir.join("train.py");
+        let req_p = ws_dir.join("requirements.txt");
+        std::fs::write(&train_p, "# original train v1\n").unwrap();
+        std::fs::write(&req_p, "numpy==1.26.4\n").unwrap();
+        let mut perms = std::fs::metadata(&req_p).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&req_p, perms).unwrap();
+
+        let save_err = save_workspace_files_inner(
+            &app,
+            "# modified train v2\n".into(),
+            "torch==2.5.1\n".into(),
+            Some(&ws_dir.to_string_lossy()),
+            None,
+        )
+        .await
+        .expect_err("saving when requirements.txt is read-only must fail");
+        assert!(save_err.contains("requirements.txt"));
+        assert_eq!(
+            std::fs::read_to_string(&train_p).unwrap(),
+            "# original train v1\n",
+            "train.py must NOT be overwritten when requirements.txt write fails (#84)"
+        );
+        assert_eq!(std::fs::read_to_string(&req_p).unwrap(), "numpy==1.26.4\n");
+
+        // Restore write permission and verify both files update atomically
+        let mut perms_rw = std::fs::metadata(&req_p).unwrap().permissions();
+        perms_rw.set_readonly(false);
+        std::fs::set_permissions(&req_p, perms_rw).unwrap();
+        save_workspace_files_inner(
+            &app,
+            "# modified train v2\n".into(),
+            "torch==2.5.1\n".into(),
+            Some(&ws_dir.to_string_lossy()),
+            None,
+        )
+        .await
+        .expect("saving writable files must succeed");
+        assert_eq!(std::fs::read_to_string(&train_p).unwrap(), "# modified train v2\n");
+        assert_eq!(std::fs::read_to_string(&req_p).unwrap(), "torch==2.5.1\n");
+
+        // #83: System main window close intercepts unsaved script edits even with 0 active relays
+        assert!(evaluate_window_close_interception(&app).is_none());
+        app.script_dirty.store(true, Ordering::SeqCst);
+        assert_eq!(
+            evaluate_window_close_interception(&app),
+            Some(WindowCloseInterception {
+                active_vms: vec![],
+                unsaved_script: true,
+            })
+        );
+        let (_, exit_ok) = confirm_app_close_inner(&app, "force_exit").await.unwrap();
+        assert!(exit_ok);
+        assert!(!app.script_dirty.load(Ordering::SeqCst));
+        assert!(evaluate_window_close_interception(&app).is_none());
+
         *cli::TEST_CONFIG_DIR.l() = None;
         *cli::TEST_COLAB_BIN.l() = None;
         *cli::TEST_RCLONE_CONF.l() = None;

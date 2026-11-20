@@ -2044,16 +2044,102 @@ pub fn build_cmd(bin: &PathBuf, args: &[String]) -> Command {
     cmd
 }
 
-/// 按 PID 结束进程树（跨平台封装）
+#[cfg(windows)]
+fn terminate_process_tree_win32(root_pid: u32) -> bool {
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> isize;
+        fn Process32FirstW(h_snapshot: isize, lppe: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(h_snapshot: isize, lppe: *mut ProcessEntry32W) -> i32;
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
+        fn TerminateProcess(h_process: isize, u_exit_code: u32) -> i32;
+        fn CloseHandle(h_object: isize) -> i32;
+    }
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    let self_pid = std::process::id();
+    if root_pid == 0 || root_pid == self_pid {
+        return false;
+    }
+
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE || snap == 0 {
+            return false;
+        }
+        let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(256);
+        let mut entry: ProcessEntry32W = std::mem::zeroed();
+        entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                pairs.push((entry.th32_process_id, entry.th32_parent_process_id));
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+
+        let mut visited = std::collections::HashSet::new();
+        let mut order = Vec::new();
+        visited.insert(root_pid);
+        order.push(root_pid);
+        let mut idx = 0;
+        while idx < order.len() {
+            let cur = order[idx];
+            idx += 1;
+            for &(child_pid, parent_pid) in &pairs {
+                if parent_pid == cur
+                    && child_pid != 0
+                    && child_pid != self_pid
+                    && visited.insert(child_pid)
+                {
+                    order.push(child_pid);
+                }
+            }
+        }
+
+        // 先终止子孙进程，再终止根进程，防止父进程退出后子进程逃逸
+        for &pid in order.iter().rev() {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if h != 0 {
+                let _ = TerminateProcess(h, 1);
+                let _ = CloseHandle(h);
+            }
+        }
+        true
+    }
+}
+
+/// 按 PID 结束进程树（跨平台封装：Windows 优先采用毫秒级 Toolhelp32 + TerminateProcess，杜绝 taskkill 2s WMI 延迟）
 pub async fn kill_pid_tree(pid: u32) {
     #[cfg(windows)]
     {
-        let mut k = Command::new("taskkill");
-        k.args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        k.creation_flags(CREATE_NO_WINDOW);
-        let _ = k.status().await;
+        if !terminate_process_tree_win32(pid) {
+            let mut k = Command::new("taskkill");
+            k.args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            k.creation_flags(CREATE_NO_WINDOW);
+            let _ = k.status().await;
+        }
     }
     #[cfg(not(windows))]
     {
@@ -2175,14 +2261,18 @@ where
     if let Some(slot) = pid_slot {
         *slot.l() = child.id();
     }
+    let deadline_instant = tokio::time::Instant::now() + timeout;
 
-    if let Some(data) = stdin_data {
-        if let Some(mut si) = child.stdin.take() {
-            si.write_all(data.as_bytes()).await.ok();
-            si.shutdown().await.ok();
+    // Issue #85：stdin 管道写入放入独立异步任务并发推进，使总超时 deadline 与取消令牌完整覆盖输入管道阻塞期，
+    // 同时避免子进程先写大量 stdout/stderr 再读 stdin 造成双向管道死锁。
+    let stdin_task = match (stdin_data, child.stdin.take()) {
+        (Some(data), Some(mut si)) => Some(tokio::spawn(async move {
+            let _ = si.write_all(data.as_bytes()).await;
+            let _ = si.shutdown().await;
             drop(si);
-        }
-    }
+        })),
+        _ => None,
+    };
 
     let mut stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
     let mut stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
@@ -2195,7 +2285,6 @@ where
     let mut out_done = false;
     let mut err_done = false;
     let cancel = cancel.unwrap_or_default();
-    let deadline_instant = tokio::time::Instant::now() + timeout;
     let deadline = tokio::time::sleep_until(deadline_instant);
     tokio::pin!(deadline);
 
@@ -2241,9 +2330,31 @@ where
         }
     }
 
+    if (cancelled || timed_out) && !out_done {
+        if let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(5), stdout.read(&mut out_chunk)).await
+        {
+            if n > 0 {
+                out_buf.push_bytes(&out_chunk[..n], |l| {
+                    on_line(l);
+                    push_rolling_tail(&mut collected, l, MAX_COLLECTED_BYTES);
+                    push_rolling_tail(&mut stdout_collected, l, MAX_COLLECTED_BYTES);
+                });
+            }
+        }
+        out_buf.flush_remaining(|l| {
+            on_line(l);
+            push_rolling_tail(&mut collected, l, MAX_COLLECTED_BYTES);
+            push_rolling_tail(&mut stdout_collected, l, MAX_COLLECTED_BYTES);
+        });
+    }
+
     drop(stdout);
     drop(stderr);
     let status = if cancelled || timed_out {
+        if let Some(t) = stdin_task {
+            t.abort();
+        }
         kill_tree(&mut child).await;
         tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
@@ -2251,18 +2362,23 @@ where
             .and_then(|r| r.ok())
     } else {
         // 即使子进程提前关闭了 stdout/stderr 输出流并继续睡眠挂起，child.wait() 仍受总 deadline 与 cancel 约束
-        tokio::select! {
-            res = child.wait() => res.ok(),
+        let wait_res = tokio::select! {
+            res = child.wait() => Some(res.ok()),
             _ = cancel.cancelled() => {
                 cancelled = true;
-                kill_tree(&mut child).await;
-                tokio::time::timeout(Duration::from_secs(5), child.wait())
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
+                None
             }
             _ = tokio::time::timeout_at(deadline_instant, std::future::pending::<()>()) => {
                 timed_out = true;
+                None
+            }
+        };
+        if let Some(t) = stdin_task {
+            t.abort();
+        }
+        match wait_res {
+            Some(st) => st,
+            None => {
                 kill_tree(&mut child).await;
                 tokio::time::timeout(Duration::from_secs(5), child.wait())
                     .await
@@ -2879,5 +2995,59 @@ mod tests {
         *TEST_ADC_PATH.l() = prev_adc;
         *TEST_CONFIG_DIR.l() = prev_cfg;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_85_run_streaming_enforces_timeout_when_32mib_stdin_blocks() {
+        let py = colab_python_bin();
+        if !py.exists() {
+            return;
+        }
+        // Child sleeps 2.5s without reading a single byte of stdin; send 32 MiB with 150 ms timeout.
+        let payload_32mib = "A".repeat(32 * 1024 * 1024);
+        let pid_slot: Mutex<Option<u32>> = Mutex::new(None);
+        let started = Instant::now();
+        let out = run_streaming(
+            &py,
+            &s(&["-c", "import time; time.sleep(2.5)"]),
+            Some(payload_32mib),
+            Duration::from_millis(150),
+            None,
+            Some(&pid_slot),
+            |_| {},
+        )
+        .await
+        .expect("run_streaming must enforce timeout even when stdin pipe is blocked");
+
+        let elapsed = started.elapsed();
+        assert!(
+            out.timed_out,
+            "blocked 32 MiB stdin write must trigger timed_out=true (elapsed={elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "command timeout must cover stdin write time instead of waiting 2.5s; actual={elapsed:?}"
+        );
+        assert!(pid_slot.l().is_none());
+
+        // Bidirectional pipe sanity: child writes 128 KiB to stdout BEFORE reading 4 MiB from stdin within 6s
+        let payload_4mib = "B".repeat(4 * 1024 * 1024);
+        let out_bi = run_streaming(
+            &py,
+            &s(&[
+                "-c",
+                "import sys; sys.stdout.write('X' * 131072 + '\\n'); sys.stdout.flush(); n = len(sys.stdin.buffer.read()); print(f'READ_OK={n}')",
+            ]),
+            Some(payload_4mib),
+            Duration::from_secs(6),
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("bidirectional stdout + stdin should not deadlock");
+        assert!(!out_bi.timed_out);
+        assert_eq!(out_bi.code, 0);
+        assert!(out_bi.stdout.contains("READ_OK=4194304"));
     }
 }

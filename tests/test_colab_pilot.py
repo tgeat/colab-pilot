@@ -17,7 +17,7 @@ import types
 import unittest
 import urllib.error
 import urllib.request
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest import mock
@@ -1374,9 +1374,8 @@ class IssueRegressionTests(unittest.TestCase):
             self.assertIn('"RELAY_ROUND": "1"', captured_boot_scripts[0])
             self.assertIn('"RESET_DONE_FLAG": "1"', captured_boot_scripts[0])
 
-            # train.py: if RELAY_ROUND=2 is passed against a confirmed brand-new empty remote dir, diagnose & allow fresh start
+            # Issue #81: train.py with RELAY_ROUND=2 and an empty remote dir (no RESET_DONE_FLAG) MUST abort and raise RuntimeError
             missing_ckpt = os.path.join(td, "no_ckpt.pt")
-            diag_buf = io.StringIO()
             with (
                 mock.patch.dict(
                     os.environ,
@@ -1393,11 +1392,30 @@ class IssueRegressionTests(unittest.TestCase):
                     "run",
                     return_value=subprocess.CompletedProcess(["rclone", "lsf"], 0, stdout="", stderr=""),
                 ),
-                redirect_stdout(diag_buf),
             ):
-                pulled = train_mod.rclone_pull_checkpoint(missing_ckpt)
-            self.assertFalse(pulled)
-            self.assertIn("接力诊断", diag_buf.getvalue())
+                with self.assertRaises(RuntimeError) as ctx_empty:
+                    train_mod.rclone_pull_checkpoint(missing_ckpt)
+                self.assertIn("no_ckpt.pt", str(ctx_empty.exception))
+
+            # Explicit RESET_DONE_FLAG=1 allows starting fresh when intentionally reset
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "SMOKE_TEST": "0",
+                        "RELAY_ROUND": "2",
+                        "RESET_DONE_FLAG": "1",
+                        "RELAY_GDRIVE_DIR": "gdrive:colab_relay/empty_new",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    train_mod.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(["rclone", "lsf"], 0, stdout="", stderr=""),
+                ),
+            ):
+                self.assertFalse(train_mod.rclone_pull_checkpoint(missing_ckpt))
 
             # train.py: if remote HAS prior training artifacts (results/ or _prev.pt) but checkpoint.pt is missing, MUST fail fast
             with (
@@ -2486,6 +2504,281 @@ class IssueRegressionTests(unittest.TestCase):
 
             self.assertEqual(rc_cached, 0)
             self.assertEqual(hf_copy_calls["n"], 1, "Local hf_checkpoints already valid; should not re-download")
+
+    def test_issue_79_switchover_rejects_same_target_session_before_warmup_without_stopping_service(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(ws_dir, exist_ok=True)
+            cfg_dir = os.path.join(td, "colab-cli")
+            os.makedirs(cfg_dir, exist_ok=True)
+            bg_state_file = os.path.join(cfg_dir, "llm_bluegreen_state.json")
+            initial_state = {
+                "session_prefix": "llm",
+                "active_slot": "blue",
+                "active_session": "vm-shared",
+                "blue_session": "vm-shared",
+                "green_session": None,
+                "slots": {
+                    "blue": {"session_name": "vm-shared", "role": "active", "model_name": "Qwen/Qwen2.5-7B-Instruct"}
+                },
+                "phase": "serving",
+                "engine": "builtin",
+                "model_name": "builtin-mock",
+                "gpu": "T4",
+                "high_mem": True,
+            }
+            Path(bg_state_file).write_text(json.dumps(initial_state, ensure_ascii=False), encoding="utf-8")
+
+            invoked_cmds = []
+
+            def forbid_subproc(cmd, *args, **kwargs):
+                invoked_cmds.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            parser = manager_mod.build_arg_parser()
+            for candidate_argv in (
+                ["switchover", "--workspace", ws_dir, "--session-name", "vm-shared"],
+                ["switchover", "--workspace", ws_dir, "--session-name", "VM-SHARED"],
+                ["switchover", "--workspace", ws_dir, "--session-prefix", "other-cluster", "--session-name", "vm-shared"],
+            ):
+                args_sw = parser.parse_args(candidate_argv)
+                err_buf = io.StringIO()
+                with (
+                    mock.patch.object(manager_mod, "bg_state_path", return_value=bg_state_file),
+                    mock.patch.object(
+                        manager_mod,
+                        "provision_and_warmup_slot",
+                        side_effect=AssertionError("provision_and_warmup_slot must NOT be called"),
+                    ),
+                    mock.patch.object(manager_mod, "run_cmd", side_effect=forbid_subproc),
+                    redirect_stderr(err_buf),
+                ):
+                    rc = manager_mod.cmd_switchover(args_sw)
+
+                self.assertEqual(rc, 1, f"switchover must fail before warmup for {candidate_argv}")
+                self.assertIn("vm-shared", err_buf.getvalue().lower())
+                self.assertEqual(invoked_cmds, [], "must not invoke colab new/exec/stop when target matches active session")
+                after_st = json.loads(Path(bg_state_file).read_text(encoding="utf-8"))
+                self.assertEqual(after_st["phase"], "serving")
+                self.assertEqual(after_st["active_session"], "vm-shared")
+
+    def test_issue_80_legacy_bare_gdrive_checkpoint_detected_and_migrated_with_real_rclone(self):
+        rclone_exe = runner_mod.find_bin("rclone")
+        if not os.path.exists(rclone_exe) and not shutil.which(rclone_exe):
+            self.skipTest("rclone binary not available")
+
+        with tempfile.TemporaryDirectory() as td:
+            drive_root = os.path.join(td, "drive_storage")
+            legacy_dir = os.path.join(drive_root, "colab_relay")
+            os.makedirs(legacy_dir, exist_ok=True)
+
+            # Create valid Epoch 7 PyTorch checkpoint at legacy `gdrive:colab_relay/checkpoint.pt`
+            legacy_ckpt = os.path.join(legacy_dir, "checkpoint.pt")
+            import torch
+
+            torch.save({"epoch": 7, "loss": 0.1234}, legacy_ckpt)
+
+            rclone_conf_alias = os.path.join(td, "rclone_alias.conf")
+            drive_norm = drive_root.replace("\\", "/")
+            Path(rclone_conf_alias).write_text(
+                f"[gdrive]\ntype = alias\nremote = {drive_norm}\n",
+                encoding="utf-8",
+            )
+
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(ws_dir, exist_ok=True)
+            Path(ws_dir, "train.py").write_text("print('ok')\n", encoding="utf-8")
+            locks_file = os.path.join(td, "locks.json")
+            colab_calls = []
+
+            def fake_colab_only(cmd, timeout=300, stdin_text=None):
+                prog = os.path.basename(cmd[0]).lower()
+                if "rclone" in prog:
+                    return subprocess.run(
+                        cmd,
+                        input=stdin_text,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout,
+                    )
+                colab_calls.append(list(cmd))
+                if cmd[1] == "status":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No active session")
+                if cmd[1] == "exec":
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout="CLOUD_SMOKE_PASSED\nTRAINING_COMPLETED\nTRAIN_EXIT_CODE=0\n", stderr=""
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK", stderr="")
+
+            # 1) Default run without confirmation MUST stop before allocating VM and prompt about legacy migration
+            out_unconfirmed = io.StringIO()
+            with (
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf_alias),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_colab_only),
+                redirect_stdout(out_unconfirmed),
+            ):
+                rc1 = runner_mod.main(["--session", "legacy-run", "--workspace", ws_dir])
+
+            self.assertEqual(rc1, 1, "Must block silent from-scratch start when legacy root checkpoint exists")
+            self.assertEqual(colab_calls, [], "Must abort BEFORE calling colab new")
+            self.assertIn("gdrive:colab_relay", out_unconfirmed.getvalue())
+            self.assertIn("gdrive:colab_relay/legacy-run", out_unconfirmed.getvalue())
+            self.assertIn("--migrate-legacy-gdrive", out_unconfirmed.getvalue())
+            self.assertTrue(os.path.isfile(legacy_ckpt), "Legacy checkpoint must remain untouched before confirmation")
+
+            # 2) Passing --migrate-legacy-gdrive migrates checkpoint.pt via real rclone into gdrive:colab_relay/legacy-run
+            out_migrated = io.StringIO()
+            with (
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf_alias),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_colab_only),
+                redirect_stdout(out_migrated),
+            ):
+                rc2 = runner_mod.main(["--session", "legacy-run", "--workspace", ws_dir, "--migrate-legacy-gdrive"])
+
+            self.assertEqual(rc2, 0, f"Migrated run failed: {out_migrated.getvalue()}")
+            migrated_ckpt = os.path.join(drive_root, "colab_relay", "legacy-run", "checkpoint.pt")
+            self.assertTrue(os.path.isfile(migrated_ckpt), "Checkpoint must be migrated to isolated subdirectory")
+            self.assertFalse(os.path.exists(legacy_ckpt), "Legacy root checkpoint moved cleanly")
+
+            # Verify train.py pulls the Epoch 7 checkpoint from gdrive:colab_relay/legacy-run via real rclone
+            pulled_local = os.path.join(td, "pulled", "checkpoint.pt")
+            with (
+                mock.patch.object(train_mod, "SMOKE_TEST", False),
+                mock.patch.object(train_mod, "GDRIVE_DIR", "gdrive:colab_relay/legacy-run"),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "SMOKE_TEST": "0",
+                        "SMOKE_SKIP_RCLONE": "0",
+                        "RELAY_ROUND": "1",
+                        "RCLONE_CONFIG": rclone_conf_alias,
+                        "RELAY_GDRIVE_DIR": "gdrive:colab_relay/legacy-run",
+                        "PATH": os.path.dirname(rclone_exe) + os.pathsep + os.environ.get("PATH", ""),
+                    },
+                    clear=False,
+                ),
+            ):
+                ok_pull = train_mod.rclone_pull_checkpoint(pulled_local)
+            self.assertTrue(ok_pull)
+            loaded = train_mod.load_checkpoint_safely(pulled_local)
+            self.assertEqual(loaded["epoch"], 7)
+
+    def test_issue_81_round2_empty_remote_directory_aborts_with_real_rclone(self):
+        rclone_exe = runner_mod.find_bin("rclone")
+        if not os.path.exists(rclone_exe) and not shutil.which(rclone_exe):
+            self.skipTest("rclone binary not available")
+
+        with tempfile.TemporaryDirectory() as td:
+            drive_root = os.path.join(td, "drive_storage")
+            empty_job_dir = os.path.join(drive_root, "colab_relay", "wiped-round2")
+            os.makedirs(empty_job_dir, exist_ok=True)
+
+            rclone_conf_alias = os.path.join(td, "rclone_alias.conf")
+            drive_norm = drive_root.replace("\\", "/")
+            Path(rclone_conf_alias).write_text(
+                f"[gdrive]\ntype = alias\nremote = {drive_norm}\n",
+                encoding="utf-8",
+            )
+
+            run_cwd = os.path.join(td, "run_cwd")
+            os.makedirs(run_cwd, exist_ok=True)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "SMOKE_TEST": "0",
+                    "RELAY_ROUND": "2",
+                    "RESET_DONE_FLAG": "0",
+                    "GDRIVE_DIR": "gdrive:colab_relay/wiped-round2",
+                    "RELAY_GDRIVE_DIR": "gdrive:colab_relay/wiped-round2",
+                    "RCLONE_CONFIG": rclone_conf_alias,
+                    "PATH": os.path.dirname(rclone_exe) + os.pathsep + env.get("PATH", ""),
+                }
+            )
+            res = subprocess.run(
+                [sys.executable, "-B", str(REPO_ROOT / "train.py")],
+                cwd=run_cwd,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            self.assertNotEqual(res.returncode, 0, "train.py must abort when RELAY_ROUND=2 finds empty cloud directory")
+            combined = (res.stdout or "") + "\n" + (res.stderr or "")
+            self.assertIn("checkpoint.pt", combined)
+            self.assertFalse(os.path.exists(os.path.join(run_cwd, "checkpoint.pt")), "Must not train from epoch 0")
+
+    def test_issue_86_detached_relay_resolves_relative_workspace_and_reports_invalid_workspace(self):
+        rclone_exe = runner_mod.find_bin("rclone")
+        if not os.path.exists(rclone_exe) and not shutil.which(rclone_exe):
+            self.skipTest("rclone binary not available")
+
+        with tempfile.TemporaryDirectory() as td:
+            parent_dir = os.path.join(td, "parent")
+            proj_dir = os.path.join(parent_dir, "project")
+            os.makedirs(proj_dir, exist_ok=True)
+            Path(proj_dir, "train.py").write_text("print('TRAINING_COMPLETED')\n", encoding="utf-8")
+            Path(proj_dir, "checkpoint_final.pt").write_bytes(b"READY_WEIGHTS")
+
+            drive_root = os.path.join(td, "drive_storage")
+            job_drive = os.path.join(drive_root, "colab_relay", "det-rel")
+            os.makedirs(job_drive, exist_ok=True)
+            Path(job_drive, "training_done.flag").write_text("done\n", encoding="utf-8")
+
+            rclone_conf_alias = os.path.join(td, "rclone_alias.conf")
+            drive_norm = drive_root.replace("\\", "/")
+            Path(rclone_conf_alias).write_text(
+                f"[gdrive]\ntype = alias\nremote = {drive_norm}\n",
+                encoding="utf-8",
+            )
+
+            home_dir = os.path.join(td, "fake_home")
+            os.makedirs(home_dir, exist_ok=True)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "RCLONE_CONFIG": rclone_conf_alias,
+                    "USERPROFILE": home_dir,
+                    "HOME": home_dir,
+                    "PATH": os.path.dirname(rclone_exe) + os.pathsep + env.get("PATH", ""),
+                }
+            )
+            runner_script = str(REPO_ROOT / ".agents" / "skills" / "colab-dl-relay" / "scripts" / "dl_relay_runner.py")
+
+            res = subprocess.run(
+                [sys.executable, runner_script, "--session", "det-rel", "--workspace", "project", "--detach"],
+                cwd=parent_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+            self.assertEqual(res.returncode, 0, f"Detach parent failed: {res.stdout}\n{res.stderr}")
+            self.assertIn("已在后台启动", res.stdout)
+
+            # Wait up to 5s for the detached child to write `.colab_dl_relay_status.json` inside `parent/project/`
+            receipt_file = os.path.join(proj_dir, ".colab_dl_relay_status.json")
+            deadline = time.time() + 5.0
+            while time.time() < deadline and not os.path.exists(receipt_file):
+                time.sleep(0.1)
+
+            log_path = os.path.join(proj_dir, ".colab_dl_relay.log")
+            log_text = Path(log_path).read_text(encoding="utf-8", errors="replace") if os.path.exists(log_path) else ""
+            self.assertNotIn("找不到训练脚本", log_text, f"Detached child resolved wrong path:\n{log_text}")
+            self.assertNotIn(os.path.join("project", "project"), log_text)
+            self.assertTrue(os.path.isfile(receipt_file), f"Detached child did not complete; log:\n{log_text}")
+            receipt = json.loads(Path(receipt_file).read_text(encoding="utf-8"))
+            self.assertTrue(receipt["training_completed"])
+            self.assertTrue(receipt["weights_downloaded"])
 
 
 if __name__ == "__main__":

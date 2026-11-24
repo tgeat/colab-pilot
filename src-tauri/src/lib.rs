@@ -84,6 +84,145 @@ pub struct GdriveStatus {
     pub files: Vec<GdriveFile>,
 }
 
+pub const DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS: u64 = 90;
+pub const MIN_KEEP_ALIVE_INTERVAL_SECONDS: u64 = 30;
+pub const MAX_KEEP_ALIVE_INTERVAL_SECONDS: u64 = 600;
+
+fn default_keep_alive_true() -> bool {
+    true
+}
+
+fn default_keep_alive_interval() -> u64 {
+    DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct KeepAliveConfig {
+    /// 是否启用实例保活（创建任何实例默认开启）
+    #[serde(default = "default_keep_alive_true")]
+    pub enabled: bool,
+    /// 保活心跳间隔（秒），范围 30..=600，默认 90 秒
+    #[serde(default = "default_keep_alive_interval")]
+    pub interval_seconds: u64,
+    /// 空闲时是否发送轻量 Jupyter Kernel `pass` 脉冲心跳（忙时自动避让，不阻塞正在执行的任务）
+    #[serde(default = "default_keep_alive_true")]
+    pub kernel_ping: bool,
+}
+
+impl Default for KeepAliveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
+            kernel_ping: true,
+        }
+    }
+}
+
+impl KeepAliveConfig {
+    pub fn validate(&self) -> Result<Self, String> {
+        if self.interval_seconds < MIN_KEEP_ALIVE_INTERVAL_SECONDS
+            || self.interval_seconds > MAX_KEEP_ALIVE_INTERVAL_SECONDS
+        {
+            return Err(format!(
+                "实例保活心跳间隔必须在 {} ~ {} 秒之间（当前 {} 秒）",
+                MIN_KEEP_ALIVE_INTERVAL_SECONDS,
+                MAX_KEEP_ALIVE_INTERVAL_SECONDS,
+                self.interval_seconds
+            ));
+        }
+        Ok(self.clone())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct KeepAliveStatus {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub kernel_ping: bool,
+    /// "active" | "paused" | "error" | "idle"
+    pub state: String,
+    pub last_ok_at: Option<i64>,
+    pub last_attempt_at: Option<i64>,
+    pub tunnel_ok: bool,
+    /// "ok" | "skipped_busy" | "disabled" | "error" | "pending"
+    pub kernel_ping_state: String,
+    pub success_count: u64,
+    pub consecutive_failures: u32,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct VmKeepAliveRuntime {
+    config: KeepAliveConfig,
+    endpoint: Option<String>,
+    last_attempt_instant: Option<Instant>,
+    last_ok_at: Option<i64>,
+    last_attempt_at: Option<i64>,
+    tunnel_ok: bool,
+    kernel_ping_state: String,
+    success_count: u64,
+    consecutive_failures: u32,
+    last_error: Option<String>,
+    in_flight: bool,
+}
+
+impl VmKeepAliveRuntime {
+    fn from_config(config: KeepAliveConfig, endpoint: Option<String>) -> Self {
+        let k_state = if !config.enabled || !config.kernel_ping {
+            "disabled".to_string()
+        } else {
+            "pending".to_string()
+        };
+        Self {
+            config,
+            endpoint,
+            last_attempt_instant: None,
+            last_ok_at: None,
+            last_attempt_at: None,
+            tunnel_ok: false,
+            kernel_ping_state: k_state,
+            success_count: 0,
+            consecutive_failures: 0,
+            last_error: None,
+            in_flight: false,
+        }
+    }
+
+    fn to_status(&self) -> KeepAliveStatus {
+        let state = if !self.config.enabled {
+            "paused"
+        } else if self.consecutive_failures > 0 {
+            "error"
+        } else if self.last_ok_at.is_some() {
+            "active"
+        } else {
+            "idle"
+        };
+        KeepAliveStatus {
+            enabled: self.config.enabled,
+            interval_seconds: self.config.interval_seconds,
+            kernel_ping: self.config.kernel_ping,
+            state: state.to_string(),
+            last_ok_at: self.last_ok_at,
+            last_attempt_at: self.last_attempt_at,
+            tunnel_ok: self.tunnel_ok,
+            kernel_ping_state: if !self.config.enabled || !self.config.kernel_ping {
+                "disabled".to_string()
+            } else {
+                self.kernel_ping_state.clone()
+            },
+            success_count: self.success_count,
+            consecutive_failures: self.consecutive_failures,
+            last_error: if self.config.enabled {
+                self.last_error.clone()
+            } else {
+                None
+            },
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct VmView {
     pub name: String,
@@ -107,6 +246,8 @@ pub struct VmView {
     pub busy: Option<String>,
     pub ssh: Option<VmSshInfo>,
     pub llm_api: Option<LlmApiAccessInfo>,
+    #[serde(default)]
+    pub keep_alive: Option<KeepAliveStatus>,
     #[serde(default)]
     pub deploy_error: Option<String>,
     #[serde(default)]
@@ -304,6 +445,7 @@ pub struct AppState {
     active_chats: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
     busy: Mutex<HashMap<String, String>>,
     probe_cooldown: Mutex<HashMap<String, Instant>>,
+    keep_alive: Mutex<HashMap<String, VmKeepAliveRuntime>>,
     gdrive: tokio::sync::Mutex<GdriveCache>,
     refresh_lock: tokio::sync::Mutex<()>,
     overview_seq: std::sync::atomic::AtomicU64,
@@ -364,6 +506,7 @@ impl AppState {
             active_chats: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
             probe_cooldown: Mutex::new(HashMap::new()),
+            keep_alive: Mutex::new(HashMap::new()),
             gdrive: tokio::sync::Mutex::new(GdriveCache::default()),
             refresh_lock: tokio::sync::Mutex::new(()),
             overview_seq: std::sync::atomic::AtomicU64::new(0),
@@ -1966,12 +2109,13 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
     let creating_names_bg = creating_names.clone();
     let sync_sessions_allowed = ov.auth_ok && ov.error.is_none();
 
-    let (vm_extra, gap_extra, creating_extra, recent, live_bg) =
+    let (vm_extra, gap_extra, creating_extra, recent, live_bg, saved_profiles) =
         tokio::task::spawn_blocking(move || {
             if sync_sessions_allowed {
                 cli::sync_sessions_with_assignments(&sync_items, !creating_names_bg.is_empty());
                 cli::sync_ssh_config_hosts(&ssh_entries);
             }
+            let saved_profiles = cli::read_session_profiles();
             let bg_raw = parse_llm_bluegreen_state(cli::read_llm_bluegreen_state());
             let live_bg = filter_live_bluegreen_state(
                 bg_raw,
@@ -2122,7 +2266,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
                 .collect();
 
             let recent = cli::read_recent_sessions(&seen_bg, 8);
-            (vm_extra, gap_extra, creating_extra, recent, live_bg)
+            (vm_extra, gap_extra, creating_extra, recent, live_bg, saved_profiles)
         })
         .await
         .unwrap_or_default();
@@ -2155,6 +2299,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
         let cur_busy = app.busy.l().get(&d.name).cloned();
         let sess = d.sess.as_ref();
         let a = &d.a;
+        let ka_status = snapshot_keep_alive_for_vm(app, &d.name, Some(&a.endpoint), &saved_profiles);
 
         ov.vms.push(VmView {
             name: d.name.clone(),
@@ -2190,6 +2335,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             busy: cur_busy,
             ssh: Some(ssh_info),
             llm_api,
+            keep_alive: Some(ka_status),
             deploy_error: deploy_errs.get(&d.name).cloned(),
             server_state_unknown: false,
         });
@@ -2271,6 +2417,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             .get(&name)
             .cloned()
             .or_else(|| Some("creating".into()));
+        let ka_creating = app.keep_alive.l().get(&name).map(|rt| rt.to_status());
         ov.vms.push(VmView {
             name: name.clone(),
             workspace,
@@ -2284,6 +2431,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             managed: true,
             cli_events,
             busy: cur_busy,
+            keep_alive: ka_creating,
             deploy_error: deploy_errs.get(&name).cloned(),
             ..Default::default()
         });
@@ -2494,6 +2642,7 @@ fn cleanup_llm_bluegreen_after_terminate(
 fn cleanup_local_vm_artifacts(app: &AppState, name: &str) {
     app.set_deploy_error(name, None);
     app.creating_vms.l().remove(name);
+    app.keep_alive.l().remove(name);
     let remaining_ssh: Option<Vec<(String, u16)>> = {
         let mut bridges = app.ssh_bridges.l();
         if let Some(b) = bridges.remove(name) {
@@ -2926,6 +3075,408 @@ pub struct CreateVmEnvConfig {
     pub env_vars: Option<String>,
 }
 
+// ───────────────────────────── 通用每实例保活引擎 ─────────────────────────────
+// 覆盖所有在线实例（通用算力 / 终端 SSH / 大模型 / 接力训练）：
+// 1. 隧道租约续期：GET /tun/m/keep-alive/{endpoint}（带 X-Colab-Tunnel: Google）
+// 2. 代理令牌实时保鲜：始终从最新 Assignment 获取有效 1h runtimeProxyInfo.token，401/403 自动刷新重试
+// 3. 忙时避让的 Jupyter Kernel 脉冲心跳：先查本地忙态与 GET /api/kernels，若存在 busy/starting 内核则主动跳过（不抢占、不阻塞）；
+//    仅当空闲时通过独立 ZMQ session_id=None 执行毫秒级 `pass` 刷新 last_activity，复用已有空闲 kernel_id 不产生多余内核。
+
+const REMOTE_KERNEL_KEEPALIVE_PY: &str = r#"
+import sys
+from colab_cli.runtime import ColabRuntime
+url, tok, kid = sys.argv[1], sys.argv[2], (sys.argv[3] or None)
+rt = ColabRuntime(url, tok, kernel_id=kid, session_id=None)
+try:
+    rt.execute_code("pass", timeout=15)
+    print(f"KA_KERNEL_OK:{rt.kernel_id or ''}", flush=True)
+finally:
+    rt.stop()
+"#;
+
+fn snapshot_keep_alive_for_vm(
+    app: &AppState,
+    vm_name: &str,
+    endpoint: Option<&str>,
+    saved_profiles: &HashMap<String, cli::SessionProfile>,
+) -> KeepAliveStatus {
+    let mut map = app.keep_alive.l();
+    if let Some(rt) = map.get_mut(vm_name) {
+        if let Some(ep) = endpoint {
+            if rt.endpoint.as_deref() != Some(ep) {
+                rt.endpoint = Some(ep.to_string());
+                rt.last_attempt_instant = None;
+                rt.consecutive_failures = 0;
+                rt.last_error = None;
+            }
+        }
+        return rt.to_status();
+    }
+    if let Some(cfg) = saved_profiles
+        .get(vm_name)
+        .and_then(|p| p.keep_alive.clone())
+    {
+        let rt = VmKeepAliveRuntime::from_config(cfg, endpoint.map(|s| s.to_string()));
+        let status = rt.to_status();
+        map.insert(vm_name.to_string(), rt);
+        return status;
+    }
+    // 外部/历史未配置过保活的在线实例：默认展示为“未开启”，用户可在卡片上一键开启
+    KeepAliveStatus {
+        enabled: false,
+        interval_seconds: DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
+        kernel_ping: true,
+        state: "paused".into(),
+        last_ok_at: None,
+        last_attempt_at: None,
+        tunnel_ok: false,
+        kernel_ping_state: "disabled".into(),
+        success_count: 0,
+        consecutive_failures: 0,
+        last_error: None,
+    }
+}
+
+async fn execute_remote_kernel_ping(a: &Assignment, kernel_id: Option<&str>) -> Result<(), String> {
+    let py = cli::colab_python_bin();
+    let args = vec![
+        "-u".to_string(),
+        "-c".to_string(),
+        REMOTE_KERNEL_KEEPALIVE_PY.to_string(),
+        a.runtime_proxy_info.url.clone(),
+        a.runtime_proxy_info.token.clone(),
+        kernel_id.unwrap_or("").to_string(),
+    ];
+    let out = cli::run_simple(&py, &args, Duration::from_secs(20))
+        .await
+        .map_err(|e| format!("启动 Kernel 心跳子进程失败: {e:#}"))?;
+    if out.timed_out {
+        return Err("Jupyter Kernel `pass` 心跳超时 (20s)".into());
+    }
+    if out.code != 0 || !out.stdout.contains("KA_KERNEL_OK:") {
+        let detail = out
+            .output
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("未知异常")
+            .trim();
+        return Err(format!("Kernel 心跳失败 (code={}): {detail}", out.code));
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_keep_alive_tick_for_vm(
+    app: &Arc<AppState>,
+    vm_name: &str,
+    a: &Assignment,
+    kernel_hint: Option<String>,
+    force: bool,
+) -> Option<KeepAliveStatus> {
+    let cfg = {
+        let mut map = app.keep_alive.l();
+        let rt = map.entry(vm_name.to_string()).or_insert_with(|| {
+            let persisted = cli::get_session_profile(vm_name)
+                .and_then(|p| p.keep_alive)
+                .unwrap_or(KeepAliveConfig {
+                    enabled: false,
+                    ..KeepAliveConfig::default()
+                });
+            VmKeepAliveRuntime::from_config(persisted, Some(a.endpoint.clone()))
+        });
+        if rt.endpoint.as_deref() != Some(a.endpoint.as_str()) {
+            rt.endpoint = Some(a.endpoint.clone());
+            rt.last_attempt_instant = None;
+        }
+        if !force && !rt.config.enabled {
+            return None;
+        }
+        if rt.in_flight {
+            return None;
+        }
+        if !force {
+            if let Some(prev) = rt.last_attempt_instant {
+                if prev.elapsed() < Duration::from_secs(rt.config.interval_seconds) {
+                    return None;
+                }
+            }
+        }
+        rt.in_flight = true;
+        rt.last_attempt_instant = Some(Instant::now());
+        rt.config.clone()
+    };
+
+    let mut cur_assignment = a.clone();
+    let now_ts = chrono::Utc::now().timestamp();
+
+    // 1. 隧道租约续期：GET /tun/m/keep-alive/{endpoint}
+    let tunnel_res = app.client.keep_alive(&cur_assignment.endpoint).await;
+    let (tunnel_ok, mut err_parts): (bool, Vec<String>) = match tunnel_res {
+        Ok(()) => (true, Vec::new()),
+        Err(e) => (false, vec![format!("隧道保活失败: {e:#}")]),
+    };
+
+    // 2. 忙时避让的 Jupyter Kernel 轻量 `pass` 心跳
+    let kernel_ping_state = if !cfg.kernel_ping {
+        "disabled".to_string()
+    } else {
+        let local_busy = app.relay(vm_name).map(|h| h.is_running()).unwrap_or(false)
+            || app.busy.l().contains_key(vm_name)
+            || !app.active_chats.l().is_empty();
+        if local_busy {
+            "skipped_busy".to_string()
+        } else {
+            let mut kernels_res = app.client.list_kernels(&cur_assignment).await;
+            if let Err(ref e) = kernels_res {
+                let s = format!("{e:#}");
+                if s.contains("401") || s.contains("403") {
+                    if let Ok(fresh_list) = app.client.list_assignments().await {
+                        if let Some(fresh_a) = fresh_list
+                            .into_iter()
+                            .find(|x| x.endpoint == cur_assignment.endpoint)
+                        {
+                            cur_assignment = fresh_a;
+                            kernels_res = app.client.list_kernels(&cur_assignment).await;
+                        }
+                    }
+                }
+            }
+            match kernels_res {
+                Ok(kernels) => {
+                    let any_busy = kernels.iter().any(|k| {
+                        let st = k.execution_state.trim().to_ascii_lowercase();
+                        st == "busy" || st == "starting"
+                    });
+                    if any_busy {
+                        "skipped_busy".to_string()
+                    } else {
+                        let idle_kid = kernels
+                            .iter()
+                            .find(|k| !k.id.trim().is_empty())
+                            .map(|k| k.id.clone())
+                            .or(kernel_hint);
+                        match execute_remote_kernel_ping(&cur_assignment, idle_kid.as_deref()).await {
+                            Ok(()) => "ok".to_string(),
+                            Err(e) => {
+                                err_parts.push(e);
+                                "error".to_string()
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    err_parts.push(format!("查询 Kernel 忙闲状态失败: {e:#}"));
+                    "error".to_string()
+                }
+            }
+        }
+    };
+
+    let overall_ok = tunnel_ok && kernel_ping_state != "error";
+    let status = {
+        let mut map = app.keep_alive.l();
+        let rt = map
+            .entry(vm_name.to_string())
+            .or_insert_with(|| VmKeepAliveRuntime::from_config(cfg, Some(cur_assignment.endpoint.clone())));
+        rt.in_flight = false;
+        rt.last_attempt_at = Some(now_ts);
+        rt.tunnel_ok = tunnel_ok;
+        rt.kernel_ping_state = kernel_ping_state;
+        if overall_ok {
+            rt.last_ok_at = Some(now_ts);
+            rt.success_count = rt.success_count.saturating_add(1);
+            rt.consecutive_failures = 0;
+            rt.last_error = None;
+        } else {
+            rt.consecutive_failures = rt.consecutive_failures.saturating_add(1);
+            rt.last_error = Some(err_parts.join("；"));
+        }
+        rt.to_status()
+    };
+    Some(status)
+}
+
+async fn run_keep_alive_scheduler_pass(app: &Arc<AppState>) -> bool {
+    let ov_vms = {
+        let ov = app.overview.read().await;
+        ov.vms
+            .iter()
+            .filter(|v| v.on_server && v.endpoint.is_some())
+            .map(|v| (v.name.clone(), v.endpoint.clone().unwrap(), v.kernel_id.clone()))
+            .collect::<Vec<_>>()
+    };
+    if ov_vms.is_empty() {
+        return false;
+    }
+
+    let cached_assignments = app
+        .last_assignments
+        .l()
+        .as_ref()
+        .map(|(list, _, _)| list.clone())
+        .unwrap_or_default();
+    let assign_map: HashMap<String, Assignment> = cached_assignments
+        .into_iter()
+        .map(|a| (a.endpoint.clone(), a))
+        .collect();
+    if assign_map.is_empty() {
+        return false;
+    }
+
+    let mut tasks = Vec::new();
+    for (vm_name, ep, kid) in ov_vms {
+        let Some(a) = assign_map.get(&ep).cloned() else {
+            continue;
+        };
+        let should_run = {
+            let map = app.keep_alive.l();
+            match map.get(&vm_name) {
+                Some(rt) => {
+                    rt.config.enabled
+                        && !rt.in_flight
+                        && rt
+                            .last_attempt_instant
+                            .map(|t| t.elapsed() >= Duration::from_secs(rt.config.interval_seconds))
+                            .unwrap_or(true)
+                }
+                None => false,
+            }
+        };
+        if should_run {
+            let app_c = app.clone();
+            tasks.push(tokio::spawn(async move {
+                run_keep_alive_tick_for_vm(&app_c, &vm_name, &a, kid, false).await
+            }));
+        }
+    }
+
+    if tasks.is_empty() {
+        return false;
+    }
+    let mut ran_any = false;
+    for t in tasks {
+        if let Ok(Some(_)) = t.await {
+            ran_any = true;
+        }
+    }
+    ran_any
+}
+
+pub(crate) async fn set_vm_keep_alive_inner(
+    app: &Arc<AppState>,
+    name: &str,
+    config: KeepAliveConfig,
+) -> Result<KeepAliveStatus, String> {
+    let clean_name = name.trim();
+    if clean_name.is_empty() {
+        return Err("实例名称不能为空".into());
+    }
+    let validated = config.validate()?;
+    cli::save_session_keep_alive(clean_name, &validated)
+        .map_err(|e| format!("保存实例 [{clean_name}] 保活配置失败: {e:#}"))?;
+
+    let status = {
+        let mut map = app.keep_alive.l();
+        let entry = map
+            .entry(clean_name.to_string())
+            .or_insert_with(|| VmKeepAliveRuntime::from_config(validated.clone(), None));
+        entry.config = validated.clone();
+        if !validated.enabled {
+            entry.consecutive_failures = 0;
+            entry.last_error = None;
+            entry.kernel_ping_state = "disabled".into();
+        } else {
+            // 开启或修改保活策略后，重置间隔计时使下一次/本次立即生效
+            entry.last_attempt_instant = None;
+            if !validated.kernel_ping {
+                entry.kernel_ping_state = "disabled".into();
+            } else if entry.kernel_ping_state == "disabled" {
+                entry.kernel_ping_state = "pending".into();
+            }
+        }
+        entry.to_status()
+    };
+    Ok(status)
+}
+
+#[tauri::command]
+async fn set_vm_keep_alive(
+    handle: AppHandle,
+    state: AppStateRef<'_>,
+    name: String,
+    config: KeepAliveConfig,
+) -> Result<KeepAliveStatus, String> {
+    let app = state.inner().clone();
+    let status = set_vm_keep_alive_inner(&app, &name, config.clone()).await?;
+    if config.enabled {
+        if let Some(a) = app.find_assignment_by_name(&name).await {
+            let kid = app
+                .overview
+                .read()
+                .await
+                .vms
+                .iter()
+                .find(|v| v.name == name)
+                .and_then(|v| v.kernel_id.clone());
+            let app_bg = app.clone();
+            let handle_bg = handle.clone();
+            let name_bg = name.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = run_keep_alive_tick_for_vm(&app_bg, &name_bg, &a, kid, true).await;
+                let ov = refresh_overview_opts(&app_bg, false, true).await;
+                emit_overview(&handle_bg, &ov);
+            });
+        }
+    }
+    spawn_refresh(&app, &handle);
+    Ok(status)
+}
+
+#[tauri::command]
+async fn ping_vm_keep_alive(
+    handle: AppHandle,
+    state: AppStateRef<'_>,
+    name: String,
+) -> Result<KeepAliveStatus, String> {
+    let app = state.inner().clone();
+    let a = app
+        .find_assignment_by_name(&name)
+        .await
+        .ok_or_else(|| format!("服务端未找到在线实例 [{name}]"))?;
+    let kid = app
+        .overview
+        .read()
+        .await
+        .vms
+        .iter()
+        .find(|v| v.name == name)
+        .and_then(|v| v.kernel_id.clone());
+    // 若该实例此前未启用保活，点击“立即保活”时自动记录为开启并执行一次保活脉冲
+    let needs_enable = app
+        .keep_alive
+        .l()
+        .get(&name)
+        .map(|rt| !rt.config.enabled)
+        .unwrap_or(true);
+    if needs_enable {
+        let cfg = app
+            .keep_alive
+            .l()
+            .get(&name)
+            .map(|rt| KeepAliveConfig {
+                enabled: true,
+                ..rt.config.clone()
+            })
+            .unwrap_or_default();
+        let _ = set_vm_keep_alive_inner(&app, &name, cfg).await;
+    }
+    let status = run_keep_alive_tick_for_vm(&app, &name, &a, kid, true)
+        .await
+        .ok_or_else(|| format!("实例 [{name}] 正在执行保活心跳中，请稍候"))?;
+    spawn_refresh(&app, &handle);
+    Ok(status)
+}
+
 #[derive(Deserialize, Clone, Default, Debug)]
 pub struct CreateVmRequest {
     pub name: Option<String>,
@@ -2948,6 +3499,8 @@ pub struct CreateVmRequest {
     pub llm_config: Option<CreateVmLlmConfig>,
     #[serde(default)]
     pub env_config: Option<CreateVmEnvConfig>,
+    #[serde(default)]
+    pub keep_alive: Option<KeepAliveConfig>,
 }
 
 fn valid_name(n: &str) -> bool {
@@ -3570,6 +4123,7 @@ pub(crate) struct PreparedCreateVm {
     pub validated_relay_cfg: Option<RelayConfig>,
     pub relay_auto_isolated: bool,
     pub validated_llm_cfg: Option<CreateVmLlmConfig>,
+    pub validated_keep_alive: KeepAliveConfig,
 }
 
 pub(crate) fn validate_and_prepare_create_vm(
@@ -3741,6 +4295,13 @@ pub(crate) fn validate_and_prepare_create_vm(
         return Err("未找到 colab-cli，可执行文件应位于 ~/.local/bin/colab".into());
     }
 
+    // 只要创建实例，统一校验并配置实例保活策略（缺省默认开启：每 90 秒隧道保活 + 忙时避让 Kernel 心跳）
+    let validated_keep_alive = req
+        .keep_alive
+        .clone()
+        .unwrap_or_default()
+        .validate()?;
+
     Ok(PreparedCreateVm {
         name,
         boot_mode,
@@ -3752,6 +4313,7 @@ pub(crate) fn validate_and_prepare_create_vm(
         validated_relay_cfg,
         relay_auto_isolated,
         validated_llm_cfg,
+        validated_keep_alive,
     })
 }
 
@@ -3773,6 +4335,10 @@ async fn create_vm(
         return Err(format!("名称 [{name}] 已被占用"));
     }
     app.set_deploy_error(&name, None);
+    app.keep_alive.l().insert(
+        name.clone(),
+        VmKeepAliveRuntime::from_config(prep.validated_keep_alive.clone(), None),
+    );
     app.creating_vms.l().insert(
         name.clone(),
         CreatingVmMeta {
@@ -3809,12 +4375,13 @@ async fn create_vm(
         if !had_ws_entry && !cli::read_sessions().contains_key(&name) {
             cli::remove_workspace_entry(&name);
         }
+        app.keep_alive.l().remove(&name);
         app.set_busy(&name, None);
         spawn_refresh(&app, &handle);
         return Err(format!("{e:#}"));
     }
 
-    // 持久化会话工作模式、认证方式与硬件/模式参数（#74 + #43），确保后续命令自动携带 --auth adc 且历史开机准确恢复
+    // 持久化会话工作模式、认证方式、保活策略与硬件/模式参数（#74 + #43），确保后续命令自动携带 --auth adc 且重启后自动续跑保活
     let norm_acc = {
         let u = req.accelerator.trim().to_ascii_uppercase();
         if u.is_empty() || u == "NONE" {
@@ -3831,6 +4398,7 @@ async fn create_vm(
         auth_mode: prep.auth_mode.clone(),
         llm_config: prep.validated_llm_cfg.clone(),
         relay_config: prep.validated_relay_cfg.clone(),
+        keep_alive: Some(prep.validated_keep_alive.clone()),
         updated_at: None,
     };
     let _ = cli::save_session_profile(&name, &session_profile);
@@ -3881,6 +4449,19 @@ async fn create_vm(
         ) {
             app.set_deploy_error(&name, Some(e));
         }
+    }
+
+    if prep.validated_keep_alive.enabled {
+        let app_ka = app.clone();
+        let handle_ka = handle.clone();
+        let name_ka = name.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Some(a) = app_ka.find_assignment_by_name(&name_ka).await {
+                let _ = run_keep_alive_tick_for_vm(&app_ka, &name_ka, &a, None, true).await;
+                let ov = refresh_overview_opts(&app_ka, false, true).await;
+                emit_overview(&handle_ka, &ov);
+            }
+        });
     }
 
     spawn_refresh(&app, &handle);
@@ -4040,6 +4621,17 @@ fn start_relay_inner(
         st.download_error = None;
         st.local_weights_path = None;
         st.last_error = None;
+    }
+    if cli::get_session_profile(name)
+        .and_then(|p| p.keep_alive)
+        .is_none()
+    {
+        let default_ka = KeepAliveConfig::default();
+        let _ = cli::save_session_keep_alive(name, &default_ka);
+        app.keep_alive
+            .l()
+            .entry(name.to_string())
+            .or_insert_with(|| VmKeepAliveRuntime::from_config(default_ka, None));
     }
     h.log("▶ 接力训练已开启");
     tauri::async_runtime::spawn(relay::run_relay(app.clone(), h.clone()));
@@ -6939,6 +7531,32 @@ pub fn run() {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
             });
+
+            // 后台每实例保活调度器：每 10 秒检查一次各在线实例是否到达保活周期（默认 90s），
+            // 自动发送 `/tun/m/keep-alive/{endpoint}` 与忙时避让的轻量 Jupyter Kernel `pass` 心跳
+            let ka_state = app.state::<Arc<AppState>>().inner().clone();
+            let ka_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    let st = ka_state.clone();
+                    let h = ka_handle.clone();
+                    let res = tauri::async_runtime::spawn(async move {
+                        let ran = run_keep_alive_scheduler_pass(&st).await;
+                        if ran {
+                            let ov = refresh_overview_opts(&st, false, false).await;
+                            emit_overview(&h, &ov);
+                        }
+                    })
+                    .await;
+                    if let Err(e) = res {
+                        append_crash_log(&format!(
+                            "[{}] 后台实例保活调度任务异常（已自动恢复）: {e}\n",
+                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                        ));
+                    }
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -6958,7 +7576,9 @@ pub fn run() {
             rotate_llm_api_key,
             deploy_llm_on_vm,
             confirm_app_close,
-            dismiss_relay_status
+            dismiss_relay_status,
+            set_vm_keep_alive,
+            ping_vm_keep_alive
         ])
         .build(tauri::generate_context!());
     match built {
@@ -7729,6 +8349,7 @@ sys.exit(rc)
                 auth_mode: Some("adc".into()),
                 llm_config: None,
                 relay_config: None,
+                keep_alive: None,
                 updated_at: None,
             },
         )
@@ -8868,6 +9489,180 @@ sys.exit(rc)
         assert_eq!(
             should_intercept_window_close(&app),
             Some(vec!["live-relay".to_string()])
+        );
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        *cli::TEST_RCLONE_CONF.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn keep_alive_engine_defaults_on_create_skips_busy_kernel_and_persists_toggle() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _env_guard = cli::TEST_ENV_LOCK.lock().await;
+
+        let ka_hits = Arc::new(AtomicUsize::new(0));
+        let kernel_state_busy = Arc::new(AtomicBool::new(true));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ka_hits_srv = ka_hits.clone();
+        let busy_srv = kernel_state_busy.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = ka_hits_srv.clone();
+                let is_busy = busy_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let req_low = req.to_ascii_lowercase();
+                    let first = req.lines().next().unwrap_or("");
+                    let (status, body) = if first.starts_with("GET /tun/m/keep-alive/m-s-ka-vm1") {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        if req_low.contains("x-colab-tunnel: google") {
+                            ("200 OK", ")]}'\n{}")
+                        } else {
+                            ("400 Bad Request", "missing X-Colab-Tunnel")
+                        }
+                    } else if first.starts_with("GET /api/kernels") {
+                        let kstate = if is_busy.load(Ordering::SeqCst) {
+                            "busy"
+                        } else {
+                            "idle"
+                        };
+                        (
+                            "200 OK",
+                            if kstate == "busy" {
+                                r#"[{"id":"k-busy-1","name":"python3","execution_state":"busy","connections":1}]"#
+                            } else {
+                                r#"[{"id":"k-idle-1","name":"python3","execution_state":"idle","connections":0}]"#
+                            },
+                        )
+                    } else {
+                        ("404 Not Found", "{}")
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!("pilot_ka_engine_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("cfg");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let tok_path = cfg_dir.join("token.json");
+        std::fs::write(
+            &tok_path,
+            r#"{"token":"ka-oauth","refresh_token":"rt","client_id":"c","client_secret":"s","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let fake_colab = tmp.join("fake_colab.cmd");
+        std::fs::write(&fake_colab, "@echo off\r\nexit /b 0\r\n").unwrap();
+
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(fake_colab);
+        *cli::TEST_RCLONE_CONF.l() = Some(tmp.join("missing_rclone.conf"));
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_path);
+        let app = AppState::new_with(client, ws_dir);
+
+        // 1. Any CreateVmRequest with keep_alive: None defaults to enabled=true, 90s, kernel_ping=true
+        let req_default = CreateVmRequest {
+            name: Some("ka-general-vm".into()),
+            accelerator: "A100".into(),
+            high_mem: true,
+            boot_mode: Some("general".into()),
+            ..Default::default()
+        };
+        let prep = validate_and_prepare_create_vm(&app, &req_default)
+            .expect("general VM creation should default keep_alive to enabled");
+        assert!(prep.validated_keep_alive.enabled);
+        assert_eq!(prep.validated_keep_alive.interval_seconds, 90);
+        assert!(prep.validated_keep_alive.kernel_ping);
+
+        // 2. Out-of-range keep_alive interval is rejected before allocation
+        let req_bad_ka = CreateVmRequest {
+            name: Some("ka-bad-vm".into()),
+            accelerator: "T4".into(),
+            boot_mode: Some("general".into()),
+            keep_alive: Some(KeepAliveConfig {
+                enabled: true,
+                interval_seconds: 10,
+                kernel_ping: true,
+            }),
+            ..Default::default()
+        };
+        let err = validate_and_prepare_create_vm(&app, &req_bad_ka)
+            .expect_err("interval < 30s must be rejected");
+        assert!(err.contains("30 ~ 600"));
+
+        // 3. Persist keep-alive config and run a tick while Kernel is busy -> tunnel ok + skipped_busy (zero blocking!)
+        let cfg_on = KeepAliveConfig {
+            enabled: true,
+            interval_seconds: 60,
+            kernel_ping: true,
+        };
+        let st_init = set_vm_keep_alive_inner(&app, "ka-vm1", cfg_on.clone())
+            .await
+            .expect("set_vm_keep_alive_inner should persist");
+        assert!(st_init.enabled);
+        assert_eq!(st_init.interval_seconds, 60);
+        assert_eq!(
+            cli::get_session_profile("ka-vm1").and_then(|p| p.keep_alive),
+            Some(cfg_on)
+        );
+
+        let a = Assignment {
+            accelerator: "A100".into(),
+            endpoint: "m-s-ka-vm1".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("HIGH_RAM".into()),
+            runtime_proxy_info: crate::colab::RuntimeProxyInfo {
+                token: "proxy-tok".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+        let st_tick = run_keep_alive_tick_for_vm(&app, "ka-vm1", &a, None, true)
+            .await
+            .expect("forced keep-alive tick should run");
+        assert_eq!(ka_hits.load(Ordering::SeqCst), 1);
+        assert!(st_tick.tunnel_ok);
+        assert_eq!(st_tick.kernel_ping_state, "skipped_busy");
+        assert_eq!(st_tick.state, "active");
+        assert_eq!(st_tick.success_count, 1);
+        assert!(st_tick.last_ok_at.is_some());
+
+        // 4. Disabling keep-alive persists enabled=false and transitions to paused
+        let st_off = set_vm_keep_alive_inner(
+            &app,
+            "ka-vm1",
+            KeepAliveConfig {
+                enabled: false,
+                interval_seconds: 60,
+                kernel_ping: true,
+            },
+        )
+        .await
+        .expect("disabling keep-alive should succeed");
+        assert!(!st_off.enabled);
+        assert_eq!(st_off.state, "paused");
+        assert!(
+            run_keep_alive_tick_for_vm(&app, "ka-vm1", &a, None, false)
+                .await
+                .is_none(),
+            "scheduled tick must skip paused keep-alive VM"
         );
 
         *cli::TEST_CONFIG_DIR.l() = None;

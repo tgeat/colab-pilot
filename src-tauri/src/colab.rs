@@ -2,10 +2,11 @@
 //!
 //! 实现了：
 //! - OAuth2 双源凭证读取（优先 `token.json`，回退 OS Keyring `google-colab-cli/oauth_token`）与 `refresh_token` 自动续期回写
-//! - `/tun/m/ccu-info`      账户计算单元余额与计费速率
-//! - `/tun/m/assignments`   服务端真实计费实例列表（删除核验的唯一可信来源）
-//! - `/tun/m/unassign/{ep}` 服务端释放实例（停止计费）
-//! - Jupyter Contents API  读写云端 /content 文件（携带 `X-Colab-Runtime-Proxy-Token` 请求头与瞬态重试）
+//! - `/tun/m/ccu-info`        账户计算单元余额与计费速率
+//! - `/tun/m/assignments`     服务端真实计费实例列表（删除核验的唯一可信来源）
+//! - `/tun/m/keep-alive/{ep}` 服务端隧道保活续租（`X-Colab-Tunnel: Google`）
+//! - `/tun/m/unassign/{ep}`   服务端释放实例（停止计费）
+//! - Jupyter Contents / Kernels API 读写云端文件与查询 Kernel 忙闲态（携带 `X-Colab-Runtime-Proxy-Token` 请求头与瞬态重试）
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
@@ -210,6 +211,19 @@ impl Assignment {
 struct AssignmentList {
     #[serde(default)]
     assignments: Vec<Assignment>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct JupyterKernelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub execution_state: String,
+    #[serde(default)]
+    pub last_activity: Option<String>,
+    #[serde(default)]
+    pub connections: u64,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -596,6 +610,16 @@ impl ColabClient {
     }
 
     async fn tun_request(&self, method: Method, path: &str, xsrf: Option<&str>) -> Result<String> {
+        self.tun_request_with_headers(method, path, xsrf, &[]).await
+    }
+
+    async fn tun_request_with_headers(
+        &self,
+        method: Method,
+        path: &str,
+        xsrf: Option<&str>,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<String> {
         let mut token = self.access_token().await?;
         let url = format!("{}{path}", self.base_url);
         let mut last_err = None;
@@ -610,6 +634,9 @@ impl ColabClient {
                 .bearer_auth(&token)
                 .header("Accept", "application/json")
                 .header("X-Colab-Client-Agent", "colab-cli");
+            for &(hk, hv) in extra_headers {
+                rb = rb.header(hk, hv);
+            }
             if let Some(x) = xsrf {
                 rb = rb.header("X-Goog-Colab-Token", x);
             }
@@ -658,6 +685,14 @@ impl ColabClient {
         Ok(list.assignments)
     }
 
+    /// 服务端隧道保活续租：GET /tun/m/keep-alive/{endpoint}（带 X-Colab-Tunnel: Google）
+    pub async fn keep_alive(&self, endpoint: &str) -> Result<()> {
+        let path = format!("/tun/m/keep-alive/{endpoint}");
+        self.tun_request_with_headers(Method::GET, &path, None, &[("X-Colab-Tunnel", "Google")])
+            .await?;
+        Ok(())
+    }
+
     /// 服务端释放实例：GET 取 XSRF token，再 POST 真正 unassign
     pub async fn unassign(&self, endpoint: &str) -> Result<()> {
         let path = format!("/tun/m/unassign/{endpoint}");
@@ -665,6 +700,40 @@ impl ColabClient {
         let t: UnassignToken = serde_json::from_str(&body).context("解析 unassign token 失败")?;
         self.tun_request(Method::POST, &path, Some(&t.token)).await?;
         Ok(())
+    }
+
+    /// 查询云端 Jupyter Server 活跃内核状态（用于保活忙时避让与复用空闲 kernel_id）
+    pub async fn list_kernels(&self, a: &Assignment) -> Result<Vec<JupyterKernelInfo>> {
+        let url = format!("{}/api/kernels", a.runtime_proxy_info.url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .get(&url)
+            .header(
+                "X-Colab-Runtime-Proxy-Token",
+                a.runtime_proxy_info.token.as_str(),
+            )
+            .header("X-Colab-Client-Agent", "colab-cli")
+            .query(&[
+                ("authuser", "0"),
+                ("colab-runtime-proxy-token", a.runtime_proxy_info.token.as_str()),
+            ])
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .context("查询 /api/kernels 失败")?;
+        let st = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !st.is_success() {
+            return Err(anyhow!(
+                "查询 /api/kernels 失败 HTTP {st}: {}",
+                truncate(&text, 200)
+            ));
+        }
+        let body = text.strip_prefix(XSSI_PREFIX).unwrap_or(&text);
+        if body.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        serde_json::from_str(body).context("解析 /api/kernels 列表失败")
     }
 
     fn contents_url(a: &Assignment, path: &str) -> String {
@@ -1124,6 +1193,93 @@ mod tests {
             .await
             .expect("contents_upload should send X-Colab-Runtime-Proxy-Token and recover from 503");
         assert_eq!(put_hits.load(Ordering::SeqCst), 2);
+
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn keep_alive_sends_tunnel_header_and_list_kernels_parses_states() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ka_hits = Arc::new(AtomicUsize::new(0));
+        let ka_hits_srv = ka_hits.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = ka_hits_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let req_low = req.to_ascii_lowercase();
+                    let first = req.lines().next().unwrap_or("");
+                    let (status, body) = if first.starts_with("GET /tun/m/keep-alive/m-s-ka01") {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        if req_low.contains("x-colab-tunnel: google")
+                            && req_low.contains("authorization: bearer ka-tok")
+                        {
+                            ("200 OK", ")]}'\n{}")
+                        } else {
+                            ("400 Bad Request", "missing X-Colab-Tunnel header")
+                        }
+                    } else if first.starts_with("GET /api/kernels") {
+                        if req_low.contains("x-colab-runtime-proxy-token: proxy-ka-tok") {
+                            (
+                                "200 OK",
+                                r#"[{"id":"kern-01","name":"python3","execution_state":"idle","connections":0},{"id":"kern-02","name":"python3","execution_state":"busy","connections":1}]"#,
+                            )
+                        } else {
+                            ("403 Forbidden", "missing proxy token")
+                        }
+                    } else {
+                        ("404 Not Found", "nope")
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!("pilot_ka_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let tok_path = tmp_dir.join("token.json");
+        std::fs::write(
+            &tok_path,
+            r#"{"token":"ka-tok","refresh_token":"rt","client_id":"cid","client_secret":"csec","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_path);
+        client
+            .keep_alive("m-s-ka01")
+            .await
+            .expect("keep_alive should succeed with X-Colab-Tunnel: Google");
+        assert_eq!(ka_hits.load(Ordering::SeqCst), 1);
+
+        let a = Assignment {
+            accelerator: "A100".into(),
+            endpoint: "m-s-ka01".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("HIGH_RAM".into()),
+            runtime_proxy_info: RuntimeProxyInfo {
+                token: "proxy-ka-tok".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+        let kernels = client.list_kernels(&a).await.expect("list_kernels should parse");
+        assert_eq!(kernels.len(), 2);
+        assert_eq!(kernels[0].id, "kern-01");
+        assert_eq!(kernels[0].execution_state, "idle");
+        assert_eq!(kernels[1].execution_state, "busy");
 
         srv.abort();
         let _ = std::fs::remove_dir_all(&tmp_dir);

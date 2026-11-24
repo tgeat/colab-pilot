@@ -262,8 +262,54 @@ def write_bg_state(data: Dict[str, Any]) -> None:
     os.replace(tmp, p)
 
 
+def ensure_session_keep_alive_profile(
+    session_name: str,
+    enabled: bool = True,
+    interval_seconds: int = 90,
+    kernel_ping: bool = True,
+) -> None:
+    """在 pilot_session_profiles.json 中为新建大模型实例默认登记保活策略（不覆盖用户已有自定义）。"""
+    clean_name = (session_name or "").strip()
+    if not clean_name:
+        return
+    cfg_dir = colab_cfg_dir()
+    os.makedirs(cfg_dir, exist_ok=True)
+    prof_file = os.path.join(cfg_dir, "pilot_session_profiles.json")
+    data: Dict[str, Any] = {}
+    if os.path.exists(prof_file):
+        try:
+            with open(prof_file, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                data = raw
+        except Exception:
+            data = {}
+    entry = data.get(clean_name)
+    if not isinstance(entry, dict):
+        entry = {}
+    if not isinstance(entry.get("keep_alive"), dict):
+        entry["keep_alive"] = {
+            "enabled": bool(enabled),
+            "interval_seconds": max(30, min(600, int(interval_seconds))),
+            "kernel_ping": bool(kernel_ping),
+        }
+        entry["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        data[clean_name] = entry
+        tmp = f"{prof_file}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, prof_file)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+
 def register_workspace(session_name: str, workspace_dir: str, description: str) -> None:
-    cfg_dir = os.path.expanduser("~/.config/colab-cli")
+    cfg_dir = colab_cfg_dir()
     os.makedirs(cfg_dir, exist_ok=True)
     reg_file = os.path.join(cfg_dir, "workspaces.json")
     data = {}
@@ -285,6 +331,7 @@ def register_workspace(session_name: str, workspace_dir: str, description: str) 
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, reg_file)
+    ensure_session_keep_alive_profile(session_name)
 
 
 def has_colab_oauth_credentials() -> Tuple[bool, str]:

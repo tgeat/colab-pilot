@@ -840,6 +840,7 @@ export interface RestoredSessionPreset {
   llm_engine?: string;
   llm_config?: CreateVmLlmConfig | null;
   relay_config?: RelayConfig | null;
+  keep_alive?: import("./types").KeepAliveConfig | null;
   unverified_history_profile?: boolean;
 }
 
@@ -874,6 +875,7 @@ export function buildPresetFromRecentSession(r: RecentSessionView): RestoredSess
       llm_engine: r.llm_config?.engine || undefined,
       llm_config: r.llm_config ?? null,
       relay_config: r.relay_config ?? null,
+      keep_alive: r.keep_alive ?? null,
       unverified_history_profile: false,
     };
   }
@@ -884,6 +886,7 @@ export function buildPresetFromRecentSession(r: RecentSessionView): RestoredSess
     high_mem: highMem,
     boot_mode: "general",
     workspace_path: r.workspace_path ?? undefined,
+    keep_alive: r.keep_alive ?? null,
     unverified_history_profile: true,
   };
 }
@@ -1087,4 +1090,81 @@ export function resolveVmStatusPillSpec(
     return { cls: "pill-green", pulse: false, text: "空闲" };
   }
   return { cls: "pill-gray", pulse: false, text: "离线" };
+}
+
+export const MIN_KEEP_ALIVE_INTERVAL_SECONDS = 30;
+export const MAX_KEEP_ALIVE_INTERVAL_SECONDS = 600;
+export const DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS = 90;
+
+export function isValidKeepAliveInterval(seconds: number): boolean {
+  return (
+    Number.isFinite(seconds) &&
+    seconds >= MIN_KEEP_ALIVE_INTERVAL_SECONDS &&
+    seconds <= MAX_KEEP_ALIVE_INTERVAL_SECONDS
+  );
+}
+
+export function describeKeepAliveKernelState(state?: string | null): string {
+  switch ((state ?? "").trim().toLowerCase()) {
+    case "ok":
+      return "Kernel 脉冲正常";
+    case "skipped_busy":
+      return "Kernel 忙时已自动避让";
+    case "disabled":
+      return "仅隧道保活";
+    case "error":
+      return "Kernel 心跳异常";
+    default:
+      return "等待首轮脉冲";
+  }
+}
+
+export function resolveKeepAliveBadge(ka?: {
+  enabled: boolean;
+  state?: string;
+  interval_seconds?: number;
+  kernel_ping?: boolean;
+  kernel_ping_state?: string;
+  last_ok_at?: number | null;
+  success_count?: number;
+  last_error?: string | null;
+} | null): {
+  tone: "ok" | "warn" | "bad" | "muted";
+  label: string;
+  detail: string;
+} {
+  if (!ka || !ka.enabled) {
+    return {
+      tone: "muted",
+      label: "保活未开启",
+      detail: "开启后将按周期续租 Colab 隧道并发送空闲 Kernel 脉冲心跳",
+    };
+  }
+  const interval = ka.interval_seconds ?? DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS;
+  const kDesc = ka.kernel_ping
+    ? describeKeepAliveKernelState(ka.kernel_ping_state)
+    : "仅隧道保活";
+  if (ka.state === "error") {
+    return {
+      tone: "bad",
+      label: "保活异常",
+      detail: ka.last_error || `每 ${interval}s · ${kDesc}`,
+    };
+  }
+  if (ka.last_ok_at) {
+    const countText =
+      typeof ka.success_count === "number" && ka.success_count > 0
+        ? ` · 累计 ${ka.success_count} 次`
+        : "";
+    return {
+      tone: "ok",
+      label: `保活运行中 (${interval}s)`,
+      detail: `隧道正常 · ${kDesc}${countText}`,
+    };
+  }
+  return {
+    tone: "warn",
+    label: `保活已启用 (${interval}s)`,
+    detail: `即将发送首轮保活 · ${kDesc}`,
+  };
 }

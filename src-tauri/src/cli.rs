@@ -805,6 +805,8 @@ pub struct SessionProfile {
     #[serde(default)]
     pub relay_config: Option<crate::relay::RelayConfig>,
     #[serde(default)]
+    pub keep_alive: Option<crate::KeepAliveConfig>,
+    #[serde(default)]
     pub updated_at: Option<String>,
 }
 
@@ -845,6 +847,27 @@ pub fn save_session_profile(session_name: &str, profile: &SessionProfile) -> Res
         entry.updated_at = Some(iso_utc_now());
     }
     map.insert(session_name.to_string(), entry);
+    let raw = serde_json::to_string_pretty(&map)?;
+    atomic_write_file(&path, &raw)?;
+    invalidate_recent_sessions_cache();
+    Ok(())
+}
+
+/// 独立更新某个实例的持久化保活策略（不覆盖既有的 boot_mode / 硬件 / 认证记录）
+pub fn save_session_keep_alive(session_name: &str, cfg: &crate::KeepAliveConfig) -> Result<()> {
+    let name = session_name.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+    let _lock = PROFILES_IO_LOCK.l();
+    let path = session_profiles_path();
+    let mut map: HashMap<String, SessionProfile> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let entry = map.entry(name.to_string()).or_default();
+    entry.keep_alive = Some(cfg.clone());
+    entry.updated_at = Some(iso_utc_now());
     let raw = serde_json::to_string_pretty(&map)?;
     atomic_write_file(&path, &raw)?;
     invalidate_recent_sessions_cache();
@@ -1330,6 +1353,8 @@ pub struct RecentSessionView {
     pub llm_config: Option<crate::CreateVmLlmConfig>,
     #[serde(default)]
     pub relay_config: Option<crate::relay::RelayConfig>,
+    #[serde(default)]
+    pub keep_alive: Option<crate::KeepAliveConfig>,
     #[serde(default)]
     pub profile_saved: bool,
 }
@@ -1972,8 +1997,9 @@ fn read_recent_sessions_uncached(active_names: &[String], limit: usize) -> Vec<R
             .map(|e| e.summary.clone())
             .unwrap_or_else(|| "会话已结束".into());
         let mut ws = resolve_workspace_for_vm(stem, ep.as_deref(), None, None, &discovered_paths);
-        let (boot_mode, llm_config, relay_config, profile_saved) =
+        let (boot_mode, llm_config, relay_config, keep_alive, profile_saved) =
             if let Some(prof) = saved_profiles.get(stem) {
+                let has_boot_profile = !prof.boot_mode.trim().is_empty();
                 if ws.path.is_none() && prof.workspace_path.is_some() {
                     ws.path = prof.workspace_path.clone();
                     if let Some(ref wp) = ws.path {
@@ -1996,13 +2022,14 @@ fn read_recent_sessions_uncached(active_names: &[String], limit: usize) -> Vec<R
                     };
                 }
                 (
-                    Some(prof.boot_mode.clone()),
+                    has_boot_profile.then(|| prof.boot_mode.clone()),
                     prof.llm_config.clone(),
                     prof.relay_config.clone(),
-                    true,
+                    prof.keep_alive.clone(),
+                    has_boot_profile,
                 )
             } else {
-                (None, None, None, false)
+                (None, None, None, None, false)
             };
         list.push(RecentSessionView {
             session_name: stem.to_string(),
@@ -2020,6 +2047,7 @@ fn read_recent_sessions_uncached(active_names: &[String], limit: usize) -> Vec<R
             boot_mode,
             llm_config,
             relay_config,
+            keep_alive,
             profile_saved,
         });
     }
@@ -2965,6 +2993,7 @@ mod tests {
                 auth_mode: Some("adc".into()),
                 llm_config: Some(saved_llm),
                 relay_config: None,
+                keep_alive: Some(crate::KeepAliveConfig::default()),
                 updated_at: None,
             },
         )

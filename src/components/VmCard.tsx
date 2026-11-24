@@ -16,6 +16,7 @@ import {
   FolderGit2,
   Gauge,
   GitCompare,
+  HeartPulse,
   KeyRound,
   Link2,
   Loader2,
@@ -30,6 +31,8 @@ import {
   Trash2,
 } from "lucide-react";
 import type {
+  KeepAliveConfig,
+  KeepAliveStatus,
   LlmApiAccessInfo,
   LlmTelemetry,
   ProcInfo,
@@ -38,10 +41,12 @@ import type {
   VmSshInfo,
   VmView,
 } from "../types";
-import { fmtDuration, formatRealtimeTps, num, numOrNull, pct, shortEndpoint, str } from "../format";
+import { fmtDuration, fmtSnapshotTime, formatRealtimeTps, num, numOrNull, pct, shortEndpoint, str } from "../format";
 import {
+  DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
   isLlmVm,
   isLlmVmReady,
+  resolveKeepAliveBadge,
   resolveRelayCompletionView,
   resolveVmStatusPillSpec,
 } from "../chatUtils";
@@ -628,6 +633,145 @@ function LlmSupervisionBox({
   );
 }
 
+function KeepAliveBar({
+  vmName,
+  keepAlive,
+  disabled,
+  onSetKeepAlive,
+  onPingKeepAlive,
+}: {
+  vmName: string;
+  keepAlive?: KeepAliveStatus | null;
+  disabled: boolean;
+  onSetKeepAlive?: (name: string, cfg: KeepAliveConfig) => Promise<void>;
+  onPingKeepAlive?: (name: string) => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [pinging, setPinging] = useState(false);
+  const badge = resolveKeepAliveBadge(keepAlive);
+  const enabled = Boolean(keepAlive?.enabled);
+  const interval = keepAlive?.interval_seconds ?? DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS;
+  const kernelPing = keepAlive?.kernel_ping ?? true;
+
+  const applyCfg = async (next: KeepAliveConfig) => {
+    if (!onSetKeepAlive || busy || disabled) return;
+    setBusy(true);
+    try {
+      await onSetKeepAlive(vmName, next);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handlePing = async () => {
+    if (!onPingKeepAlive || pinging || disabled) return;
+    setPinging(true);
+    try {
+      await onPingKeepAlive(vmName);
+    } finally {
+      setPinging(false);
+    }
+  };
+
+  const intervalOptions = [60, 90, 180, 300];
+  if (!intervalOptions.includes(interval)) {
+    intervalOptions.push(interval);
+    intervalOptions.sort((a, b) => a - b);
+  }
+
+  return (
+    <div className={`ka-bar ka-bar-${badge.tone}`}>
+      <div className="ka-bar-left">
+        <span className={`ka-pill ka-pill-${badge.tone}`}>
+          <HeartPulse size={12} />
+          <span>{badge.label}</span>
+        </span>
+        <span className="ka-bar-detail" title={badge.detail}>
+          {badge.detail}
+          {keepAlive?.last_ok_at ? ` · 上次 ${fmtSnapshotTime(keepAlive.last_ok_at)}` : ""}
+        </span>
+      </div>
+
+      <div className="ka-bar-controls">
+        {onSetKeepAlive && (
+          <>
+            <select
+              className="ka-select"
+              aria-label="保活心跳间隔"
+              value={interval}
+              disabled={busy || disabled || !enabled}
+              onChange={(e) =>
+                applyCfg({
+                  enabled,
+                  interval_seconds: Number(e.target.value) || DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
+                  kernel_ping: kernelPing,
+                })
+              }
+              title="调整隧道与 Kernel 保活心跳间隔"
+            >
+              {intervalOptions.map((sec) => (
+                <option key={sec} value={sec}>
+                  每 {sec}s
+                </option>
+              ))}
+            </select>
+
+            <label
+              className="ka-mini-check"
+              title="仅在 Jupyter Kernel 空闲时发送毫秒级 pass 心跳；任务忙时自动避让，绝不阻塞"
+            >
+              <input
+                type="checkbox"
+                checked={kernelPing}
+                disabled={busy || disabled || !enabled}
+                onChange={(e) =>
+                  applyCfg({
+                    enabled,
+                    interval_seconds: interval,
+                    kernel_ping: e.target.checked,
+                  })
+                }
+              />
+              <span>Kernel脉冲</span>
+            </label>
+          </>
+        )}
+
+        {onPingKeepAlive && (
+          <button
+            type="button"
+            className="btn btn-sm ka-btn"
+            disabled={pinging || busy || disabled}
+            onClick={handlePing}
+            title="立即执行一次隧道续租与忙时避让 Kernel 心跳"
+          >
+            {pinging ? <Loader2 size={12} className="spin" /> : <HeartPulse size={12} />}
+            <span>{pinging ? "保活中…" : "立即保活"}</span>
+          </button>
+        )}
+
+        {onSetKeepAlive && (
+          <button
+            type="button"
+            className={`btn btn-sm ka-btn ${enabled ? "" : "btn-primary"}`}
+            disabled={busy || pinging || disabled}
+            onClick={() =>
+              applyCfg({
+                enabled: !enabled,
+                interval_seconds: interval,
+                kernel_ping: kernelPing,
+              })
+            }
+            title={enabled ? "关闭该实例的自动保活心跳" : "开启该实例的自动保活心跳"}
+          >
+            <span>{busy ? "更新中…" : enabled ? "关闭保活" : "开启保活"}</span>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function VmCard({
   vm,
   allVms,
@@ -642,6 +786,8 @@ export function VmCard({
   onRequestStopRelay,
   onDismissRelay,
   onOpenScriptDialog,
+  onSetKeepAlive,
+  onPingKeepAlive,
 }: {
   vm: VmView;
   allVms?: VmView[];
@@ -661,6 +807,8 @@ export function VmCard({
   onRequestStopRelay?: (vm: VmView) => void;
   onDismissRelay?: (name: string) => Promise<void>;
   onOpenScriptDialog?: (vm: VmView) => void;
+  onSetKeepAlive?: (name: string, config: KeepAliveConfig) => Promise<void>;
+  onPingKeepAlive?: (name: string) => Promise<void>;
 }) {
   const [probingLocal, setProbingLocal] = useState(false);
   const [relayPending, setRelayPending] = useState(false);
@@ -879,7 +1027,7 @@ export function VmCard({
         )}
       </div>
 
-      {/* 每台在线虚拟机均提供免密 SSH 连接栏 */}
+      {/* 每台在线虚拟机均提供免密 SSH 连接栏与实例保活策略状态栏 */}
       {vm.on_server && (
         <SshAccessBar
           vmName={vm.name}
@@ -887,6 +1035,15 @@ export function VmCard({
           orphan={vm.orphan}
           onServer={vm.on_server}
           onOpenSshTerminal={onOpenSshTerminal}
+        />
+      )}
+      {vm.on_server && (
+        <KeepAliveBar
+          vmName={vm.name}
+          keepAlive={vm.keep_alive}
+          disabled={isDeleting || isCreating}
+          onSetKeepAlive={onSetKeepAlive}
+          onPingKeepAlive={onPingKeepAlive}
         />
       )}
 

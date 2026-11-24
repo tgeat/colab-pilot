@@ -19,6 +19,7 @@ import type {
   CloseRequestedRelayPayload,
   CreateVmLlmConfig,
   CreateVmRequest,
+  KeepAliveConfig,
   LlmBlueGreenState,
   Overview,
   RelayConfig,
@@ -546,6 +547,38 @@ function Dashboard() {
     }
   };
 
+  const handleSetKeepAlive = async (name: string, config: KeepAliveConfig) => {
+    try {
+      await api.setVmKeepAlive(name, config);
+      toast(
+        config.enabled
+          ? `已开启 [${name}] 实例保活（每 ${config.interval_seconds}s${config.kernel_ping ? " · 含忙时避让 Kernel 脉冲" : " · 仅隧道续租"}）`
+          : `已关闭 [${name}] 的自动保活`,
+        config.enabled ? "success" : "info",
+      );
+      await refresh(false);
+    } catch (e) {
+      toast(`更新实例保活失败：${errText(e)}`, "error");
+    }
+  };
+
+  const handlePingKeepAlive = async (name: string) => {
+    try {
+      const st = await api.pingVmKeepAlive(name);
+      if (st.state === "error") {
+        toast(`[${name}] 保活心跳异常：${st.last_error || "请检查网络连接"}`, "error");
+      } else {
+        toast(
+          `[${name}] 保活心跳成功（隧道正常 · ${st.kernel_ping_state === "skipped_busy" ? "Kernel 忙时已自动避让" : st.kernel_ping ? "Kernel 脉冲正常" : "仅隧道续租"}）`,
+          "success",
+        );
+      }
+      await refresh(false);
+    } catch (e) {
+      toast(`触发立即保活失败：${errText(e)}`, "error");
+    }
+  };
+
   const env = ov?.env;
   // #73：保留 on_server === false && relay !== null 的离线接力记录卡片，绝不过滤隐藏
   const vms = ov?.vms ?? [];
@@ -736,6 +769,8 @@ function Dashboard() {
                   onStartRelay={handleStartRelay}
                   onRequestStopRelay={(v) => setStopRelayVm(v)}
                   onDismissRelay={handleDismissRelay}
+                  onSetKeepAlive={handleSetKeepAlive}
+                  onPingKeepAlive={handlePingKeepAlive}
                   onOpenScriptDialog={(v) =>
                     setScriptTarget({
                       open: true,

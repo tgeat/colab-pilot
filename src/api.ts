@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   CreateVmLlmConfig,
   CreateVmRequest,
+  KeepAliveConfig,
+  KeepAliveStatus,
   LlmApiAccessInfo,
   LlmChatRequest,
   LlmChatResponse,
@@ -65,6 +67,10 @@ export const api = {
   confirmAppClose: (mode: "keep_vms" | "shutdown_vms" | "force_exit") =>
     invoke<TerminateReceipt[]>("confirm_app_close", { mode }),
   dismissRelayStatus: (name: string) => invoke<void>("dismiss_relay_status", { name }),
+  setVmKeepAlive: (name: string, config: KeepAliveConfig) =>
+    invoke<KeepAliveStatus>("set_vm_keep_alive", { name, config }),
+  pingVmKeepAlive: (name: string) =>
+    invoke<KeepAliveStatus>("ping_vm_keep_alive", { name }),
 };
 
 /**

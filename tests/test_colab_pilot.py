@@ -2828,6 +2828,45 @@ class IssueRegressionTests(unittest.TestCase):
             self.assertIn("sess-live", res_locked.stdout + res_locked.stderr)
             self.assertEqual(Path(pid_file).read_text(encoding="utf-8"), "999999", "Must not overwrite .colab_dl_relay.pid")
 
+    def test_instance_keep_alive_profile_registered_by_cli_scripts(self):
+        runner_mod = load_module(
+            "dl_relay_runner_ka_test",
+            REPO_ROOT / ".agents" / "skills" / "colab-dl-relay" / "scripts" / "dl_relay_runner.py",
+        )
+        mgr_mod = load_module(
+            "llm_bluegreen_manager_ka_test",
+            REPO_ROOT / ".agents" / "skills" / "colab-llm-bluegreen" / "scripts" / "llm_bluegreen_manager.py",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            cfg_dir = os.path.join(td, "cfg")
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(cfg_dir, exist_ok=True)
+            os.makedirs(ws_dir, exist_ok=True)
+            with (
+                mock.patch.object(runner_mod, "colab_cfg_dir", return_value=cfg_dir),
+                mock.patch.object(mgr_mod, "colab_cfg_dir", return_value=cfg_dir),
+            ):
+                runner_mod.register_workspace("dl-vm-1", ws_dir, "train.py", "DL training")
+                mgr_mod.register_workspace("llm-vm-1", ws_dir, "LLM deploy")
+                prof_file = os.path.join(cfg_dir, "pilot_session_profiles.json")
+                data = json.loads(Path(prof_file).read_text(encoding="utf-8"))
+                self.assertEqual(
+                    data["dl-vm-1"]["keep_alive"],
+                    {"enabled": True, "interval_seconds": 90, "kernel_ping": True},
+                )
+                self.assertEqual(
+                    data["llm-vm-1"]["keep_alive"],
+                    {"enabled": True, "interval_seconds": 90, "kernel_ping": True},
+                )
+                # User customization must NOT be overwritten by subsequent register_workspace calls
+                data["dl-vm-1"]["keep_alive"]["interval_seconds"] = 300
+                data["dl-vm-1"]["keep_alive"]["enabled"] = False
+                Path(prof_file).write_text(json.dumps(data), encoding="utf-8")
+                runner_mod.register_workspace("dl-vm-1", ws_dir, "train.py", "DL training")
+                after = json.loads(Path(prof_file).read_text(encoding="utf-8"))
+                self.assertEqual(after["dl-vm-1"]["keep_alive"]["interval_seconds"], 300)
+                self.assertEqual(after["dl-vm-1"]["keep_alive"]["enabled"], False)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ import {
   Cpu,
   FolderGit2,
   HardDrive,
+  HeartPulse,
   History,
   KeyRound,
   Loader2,
@@ -21,7 +22,10 @@ import {
 } from "lucide-react";
 import { errText } from "../api";
 import {
+  DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
+  MAX_KEEP_ALIVE_INTERVAL_SECONDS,
   MAX_RELAY_SESSION_HOURS,
+  MIN_KEEP_ALIVE_INTERVAL_SECONDS,
   MIN_RELAY_SESSION_HOURS,
   checkCreateVmAuthGuard,
   findConflictingRelayVm,
@@ -29,6 +33,7 @@ import {
   isLlmEngineCompatibleWithAccelerator,
   isNvidiaCudaAccelerator,
   isSingleShapeAccelerator,
+  isValidKeepAliveInterval,
   isValidRelaySessionHours,
   requiresGdriveConfig,
   resolveEffectiveHighMem,
@@ -37,10 +42,12 @@ import {
 } from "../chatUtils";
 import { ColabIcon, Modal } from "./ui";
 import {
+  DEFAULT_KEEP_ALIVE,
   DEFAULT_RELAY,
   type CreateVmLlmConfig,
   type CreateVmRequest,
   type EnvStatus,
+  type KeepAliveConfig,
   type RelayConfig,
   type VmView,
 } from "../types";
@@ -58,6 +65,7 @@ export interface CreateVmPreset {
   llm_engine?: string;
   llm_config?: CreateVmLlmConfig | null;
   relay_config?: RelayConfig | null;
+  keep_alive?: KeepAliveConfig | null;
   workspace_path?: string;
   /** 历史记录无持久化配置时提示用户确认工作模式与参数 (#74) */
   unverified_history_profile?: boolean;
@@ -121,6 +129,9 @@ export function CreateVmDialog(props: {
   // 24h+ 接力训练配置
   const [relayCfg, setRelayCfg] = useState<RelayConfig>({ ...DEFAULT_RELAY });
   const [confirmReuseRelayGdrive, setConfirmReuseRelayGdrive] = useState(false);
+
+  // 实例保活策略（只要创建实例，默认启用每 90s 隧道保活 + 忙时避让 Kernel 脉冲）
+  const [keepAliveCfg, setKeepAliveCfg] = useState<KeepAliveConfig>({ ...DEFAULT_KEEP_ALIVE });
 
   // Colab 高级运行时环境配置（#67：通用模式下 syncRclone 默认 false）
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -206,6 +217,11 @@ export function CreateVmDialog(props: {
         : { ...DEFAULT_RELAY, gpu_type: validAcc },
     );
     setConfirmReuseRelayGdrive(false);
+    setKeepAliveCfg(
+      p?.keep_alive
+        ? { ...DEFAULT_KEEP_ALIVE, ...p.keep_alive }
+        : { ...DEFAULT_KEEP_ALIVE },
+    );
 
     setShowAdvanced(false);
     // #67：通用算力模式下默认不要求/不同步 rclone.conf；仅接力或显式填写 Google Drive 权重路径时默认开启
@@ -273,6 +289,11 @@ export function CreateVmDialog(props: {
     needsGdrive && props.env && (!props.env.rclone_ok || !props.env.rclone_conf_ok),
   );
 
+  const keepAliveIntervalOk =
+    isDeployExisting ||
+    !keepAliveCfg.enabled ||
+    isValidKeepAliveInterval(keepAliveCfg.interval_seconds);
+
   const canSubmit =
     !busy &&
     nameOk &&
@@ -281,7 +302,8 @@ export function CreateVmDialog(props: {
     !authGuard.blocked &&
     relayHoursOk &&
     relayGdriveFormatOk &&
-    !relayConflictBlocked;
+    !relayConflictBlocked &&
+    keepAliveIntervalOk;
 
   const copyError = async () => {
     if (!submitError) return;
@@ -315,6 +337,12 @@ export function CreateVmDialog(props: {
     if (relayConflictBlocked && relayConflictVm) {
       setSubmitError(
         `云盘目录 ${effectiveRelayGdrive} 正被运行中的接力任务 [${relayConflictVm.name}] 占用，请更换目录或勾选显式确认续训。`,
+      );
+      return;
+    }
+    if (!keepAliveIntervalOk) {
+      setSubmitError(
+        `实例保活心跳间隔必须在 ${MIN_KEEP_ALIVE_INTERVAL_SECONDS} ~ ${MAX_KEEP_ALIVE_INTERVAL_SECONDS} 秒之间。`,
       );
       return;
     }
@@ -374,6 +402,13 @@ export function CreateVmDialog(props: {
           install_workspace_requirements: installReqTxt,
           startup_script: startupScript.trim() || null,
           env_vars: envVars.trim() || null,
+        },
+        keep_alive: {
+          enabled: keepAliveCfg.enabled,
+          interval_seconds: Number.isFinite(keepAliveCfg.interval_seconds)
+            ? Math.round(keepAliveCfg.interval_seconds)
+            : DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
+          kernel_ping: keepAliveCfg.kernel_ping,
         },
       };
       await props.onCreate(req);
@@ -944,6 +979,99 @@ export function CreateVmDialog(props: {
             />
             <span>启动前清除云盘上的完成标记（从头训练）</span>
           </label>
+        </div>
+      )}
+
+      {!isDeployExisting && (
+        /* 4.5 实例保活策略（只要创建实例，统一配置保活策略） */
+        <div className={`cfg-panel cfg-panel-keepalive ${keepAliveCfg.enabled ? "is-on" : "is-off"}`}>
+          <div className="cfg-panel-head">
+            <span className="cfg-panel-title">
+              <HeartPulse size={14} color={keepAliveCfg.enabled ? "var(--success)" : "var(--muted)"} />
+              实例保活策略（防止空闲 60–90 分钟被提前回收）
+            </span>
+            <label className="ka-inline-switch">
+              <input
+                type="checkbox"
+                checked={keepAliveCfg.enabled}
+                onChange={(e) =>
+                  setKeepAliveCfg((prev) => ({ ...prev, enabled: e.target.checked }))
+                }
+                style={{ accentColor: "var(--success)" }}
+              />
+              <span>{keepAliveCfg.enabled ? "开机后自动开启保活" : "暂不开启（手动控制）"}</span>
+            </label>
+          </div>
+
+          <div className="ka-create-row">
+            <div className="field" style={{ minWidth: 165 }}>
+              <label>保活心跳间隔 ({MIN_KEEP_ALIVE_INTERVAL_SECONDS}~{MAX_KEEP_ALIVE_INTERVAL_SECONDS}s)</label>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <input
+                  type="number"
+                  min={MIN_KEEP_ALIVE_INTERVAL_SECONDS}
+                  max={MAX_KEEP_ALIVE_INTERVAL_SECONDS}
+                  step={10}
+                  disabled={!keepAliveCfg.enabled}
+                  value={Number.isFinite(keepAliveCfg.interval_seconds) ? keepAliveCfg.interval_seconds : ""}
+                  style={!keepAliveIntervalOk ? { borderColor: "var(--danger)", width: 88 } : { width: 88 }}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    const v = raw === "" ? Number.NaN : Number(raw);
+                    setKeepAliveCfg((prev) => ({ ...prev, interval_seconds: v }));
+                  }}
+                />
+                <div className="preset-pills">
+                  {[60, 90, 180, 300].map((sec) => (
+                    <button
+                      type="button"
+                      key={sec}
+                      disabled={!keepAliveCfg.enabled}
+                      className={`preset-pill ${keepAliveCfg.interval_seconds === sec ? "active" : ""}`}
+                      onClick={() =>
+                        setKeepAliveCfg((prev) => ({ ...prev, interval_seconds: sec }))
+                      }
+                    >
+                      {sec}s
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <label
+              className="ka-kernel-opt"
+              style={{ opacity: keepAliveCfg.enabled ? 1 : 0.55 }}
+            >
+              <input
+                type="checkbox"
+                disabled={!keepAliveCfg.enabled}
+                checked={keepAliveCfg.kernel_ping}
+                onChange={(e) =>
+                  setKeepAliveCfg((prev) => ({ ...prev, kernel_ping: e.target.checked }))
+                }
+                style={{ accentColor: "var(--primary)" }}
+              />
+              <div>
+                <div className="t">启用轻量 Jupyter Kernel 脉冲心跳（<code>pass</code>）</div>
+                <div className="d">
+                  仅在 Kernel 空闲时毫秒级刷新 <code>last_activity</code>，检测到任务运行中自动避让、绝不阻塞队列
+                </div>
+              </div>
+            </label>
+          </div>
+
+          {!keepAliveIntervalOk && (
+            <div className="field-err">
+              实例保活心跳间隔必须在 {MIN_KEEP_ALIVE_INTERVAL_SECONDS} ~ {MAX_KEEP_ALIVE_INTERVAL_SECONDS} 秒之间。
+            </div>
+          )}
+
+          <div className="field-hint" style={{ marginTop: 2 }}>
+            {keepAliveCfg.enabled
+              ? `开机后将每 ${Number.isFinite(keepAliveCfg.interval_seconds) ? Math.round(keepAliveCfg.interval_seconds) : DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS} 秒自动续租 /tun/m/keep-alive 隧道并自动刷新 1h 代理令牌${keepAliveCfg.kernel_ping ? " + 忙时避让 Kernel 脉冲" : ""}；创建后可随时在实例卡片一键关闭。`
+              : "未开启保活时，若仅通过 SSH / 交互终端后台运行任务且 Jupyter Kernel 空闲，约 60–90 分钟可能触发 Colab 空闲回收。"}
+          </div>
         </div>
       )}
 

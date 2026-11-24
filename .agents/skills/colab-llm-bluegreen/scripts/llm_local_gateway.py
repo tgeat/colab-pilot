@@ -467,15 +467,23 @@ def refresh_tokens_and_keepalive(send_kernel_ping: bool = True) -> bool:
         with _ACTIVE_LOCK:
             busy = _ACTIVE_STREAMS > 0
         if not busy:
-            _, _, active_sess = resolve_slot_session(None)
-            if active_sess and active_sess.get("url") and active_sess.get("token"):
+            pinged_eps = set()
+            candidates: List[Dict[str, Any]] = []
+            for sl in (None, "blue", "green"):
+                _, _, sess = resolve_slot_session(sl)
+                if sess and sess.get("url") and sess.get("token"):
+                    ep_k = sess.get("endpoint") or sess.get("url")
+                    if ep_k not in pinged_eps:
+                        pinged_eps.add(ep_k)
+                        candidates.append(sess)
+            for target_sess in candidates:
                 try:
                     from colab_cli.runtime import ColabRuntime
 
                     rt = ColabRuntime(
-                        active_sess["url"],
-                        active_sess["token"],
-                        kernel_id=active_sess.get("kernel_id"),
+                        target_sess["url"],
+                        target_sess["token"],
+                        kernel_id=target_sess.get("kernel_id"),
                         session_id=None,
                     )
                     try:

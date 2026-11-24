@@ -1264,3 +1264,102 @@ test("Issues #80, #83, #87: setScriptDirty IPC, legacy GDrive confirmation UI, a
   assert.match(relayPanelSrc, /忽略旧断点全新开始/);
   assert.match(relayPanelSrc, /legacyConfirmPending/);
 });
+
+test("Per-instance Keep-Alive: default creation config, interval validation, badge states, and IPC wiring", async () => {
+  assert.equal(chatUtils.isValidKeepAliveInterval(30), true);
+  assert.equal(chatUtils.isValidKeepAliveInterval(90), true);
+  assert.equal(chatUtils.isValidKeepAliveInterval(600), true);
+  assert.equal(chatUtils.isValidKeepAliveInterval(29), false);
+  assert.equal(chatUtils.isValidKeepAliveInterval(601), false);
+  assert.equal(chatUtils.isValidKeepAliveInterval(Number.NaN), false);
+
+  const badgeOff = chatUtils.resolveKeepAliveBadge(null);
+  assert.equal(badgeOff.tone, "muted");
+  assert.equal(badgeOff.label, "保活未开启");
+
+  const badgeBusy = chatUtils.resolveKeepAliveBadge({
+    enabled: true,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "active",
+    last_ok_at: 1795400000,
+    kernel_ping_state: "skipped_busy",
+    success_count: 5,
+    last_error: null,
+  });
+  assert.equal(badgeBusy.tone, "ok");
+  assert.match(badgeBusy.label, /保活运行中 \(90s\)/);
+  assert.match(badgeBusy.detail, /忙时已自动避让/);
+  assert.match(badgeBusy.detail, /累计 5 次/);
+
+  const badgeErr = chatUtils.resolveKeepAliveBadge({
+    enabled: true,
+    interval_seconds: 60,
+    kernel_ping: true,
+    state: "error",
+    last_ok_at: null,
+    kernel_ping_state: "error",
+    success_count: 0,
+    last_error: "隧道保活失败: HTTP 503",
+  });
+  assert.equal(badgeErr.tone, "bad");
+  assert.equal(badgeErr.label, "保活异常");
+  assert.match(badgeErr.detail, /HTTP 503/);
+
+  const restored = chatUtils.buildPresetFromRecentSession({
+    session_name: "a100-work",
+    workspace_name: "proj",
+    workspace_path: "C:/proj",
+    endpoint: "m-s-ka01",
+    accelerator: "A100",
+    machine_shape: "HIGH_RAM",
+    created_at: null,
+    terminated_at: null,
+    last_event_at: "2026-11-24T00:00:00Z",
+    exec_count: 1,
+    file_op_count: 0,
+    last_summary: "done",
+    boot_mode: "general",
+    keep_alive: { enabled: true, interval_seconds: 180, kernel_ping: false },
+    profile_saved: true,
+  });
+  assert.deepEqual(restored.keep_alive, {
+    enabled: true,
+    interval_seconds: 180,
+    kernel_ping: false,
+  });
+
+  mockTauriCore.invokeCalls.length = 0;
+  await apiMod.api.setVmKeepAlive("vm-a100", {
+    enabled: true,
+    interval_seconds: 90,
+    kernel_ping: true,
+  });
+  await apiMod.api.pingVmKeepAlive("vm-a100");
+  assert.deepEqual(mockTauriCore.invokeCalls[0], {
+    cmd: "set_vm_keep_alive",
+    args: {
+      name: "vm-a100",
+      config: { enabled: true, interval_seconds: 90, kernel_ping: true },
+    },
+  });
+  assert.deepEqual(mockTauriCore.invokeCalls[1], {
+    cmd: "ping_vm_keep_alive",
+    args: { name: "vm-a100" },
+  });
+
+  const createDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "CreateVmDialog.tsx"),
+    "utf8",
+  );
+  assert.match(createDlgSrc, /DEFAULT_KEEP_ALIVE/);
+  assert.match(createDlgSrc, /实例保活策略/);
+  assert.match(createDlgSrc, /keep_alive:\s*\{/);
+
+  const vmCardSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "VmCard.tsx"),
+    "utf8",
+  );
+  assert.match(vmCardSrc, /function KeepAliveBar/);
+  assert.match(vmCardSrc, /立即保活/);
+});

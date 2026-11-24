@@ -99,6 +99,7 @@ export interface RecentSessionView {
   boot_mode?: "general" | "llm" | "relay" | null;
   llm_config?: CreateVmLlmConfig | null;
   relay_config?: RelayConfig | null;
+  keep_alive?: KeepAliveConfig | null;
   profile_saved?: boolean;
 }
 
@@ -293,6 +294,26 @@ export interface CreateVmEnvConfig {
   env_vars?: string | null;
 }
 
+export interface KeepAliveConfig {
+  enabled: boolean;
+  interval_seconds: number;
+  kernel_ping: boolean;
+}
+
+export interface KeepAliveStatus {
+  enabled: boolean;
+  interval_seconds: number;
+  kernel_ping: boolean;
+  state: "active" | "paused" | "error" | "idle" | string;
+  last_ok_at: number | null;
+  last_attempt_at: number | null;
+  tunnel_ok: boolean;
+  kernel_ping_state: "ok" | "skipped_busy" | "disabled" | "error" | "pending" | string;
+  success_count: number;
+  consecutive_failures: number;
+  last_error: string | null;
+}
+
 export interface CreateVmRequest {
   name: string | null;
   accelerator: string;
@@ -305,6 +326,7 @@ export interface CreateVmRequest {
   relay_config: RelayConfig | null;
   llm_config?: CreateVmLlmConfig | null;
   env_config?: CreateVmEnvConfig | null;
+  keep_alive?: KeepAliveConfig | null;
 }
 
 export interface VmView {
@@ -331,6 +353,7 @@ export interface VmView {
   busy: string | null;
   ssh?: VmSshInfo | null;
   llm_api?: LlmApiAccessInfo | null;
+  keep_alive?: KeepAliveStatus | null;
 }
 
 export interface Overview {
@@ -431,4 +454,10 @@ export const DEFAULT_RELAY: RelayConfig = {
   backup_interval_minutes: 30,
   total_epochs: 500,
   reset_done_flag: false,
+};
+
+export const DEFAULT_KEEP_ALIVE: KeepAliveConfig = {
+  enabled: true,
+  interval_seconds: 90,
+  kernel_ping: true,
 };

@@ -36,6 +36,26 @@ export interface GdriveStatus {
   files: GdriveFile[];
 }
 
+export interface GrabConfig {
+  mode: "fast" | "standard" | "persistent" | string;
+  retry_seconds: number;
+  fallback_gpus?: string[];
+}
+
+export interface GrabStatus {
+  active: boolean;
+  mode: string;
+  attempt: number;
+  max_attempts: number | null;
+  budget_minutes: number | null;
+  retry_seconds: number;
+  started_at: number;
+  next_retry_at: number | null;
+  target_gpu: string;
+  phase: "requesting" | "waiting_retry" | "allocated" | "cancelled" | "failed" | string;
+  last_error: string | null;
+}
+
 export interface RelayConfig {
   gpu_type: string;
   high_mem: boolean;
@@ -44,6 +64,10 @@ export interface RelayConfig {
   backup_interval_minutes: number;
   total_epochs: number;
   reset_done_flag: boolean;
+  grab_mode?: "budget" | "persistent" | "fast" | "standard" | string;
+  grab_timeout_minutes?: number;
+  grab_retry_seconds?: number;
+  fallback_gpus?: string[];
 }
 
 export interface RelayStatus {
@@ -62,6 +86,7 @@ export interface RelayStatus {
   download_error?: string | null;
   local_weights_path?: string | null;
   last_error?: string | null;
+  grab_status?: GrabStatus | null;
 }
 
 export interface WorkspaceInfo {
@@ -100,6 +125,7 @@ export interface RecentSessionView {
   llm_config?: CreateVmLlmConfig | null;
   relay_config?: RelayConfig | null;
   keep_alive?: KeepAliveConfig | null;
+  grab_config?: GrabConfig | null;
   profile_saved?: boolean;
 }
 
@@ -327,6 +353,7 @@ export interface CreateVmRequest {
   llm_config?: CreateVmLlmConfig | null;
   env_config?: CreateVmEnvConfig | null;
   keep_alive?: KeepAliveConfig | null;
+  grab_config?: GrabConfig | null;
 }
 
 export interface VmView {
@@ -354,6 +381,7 @@ export interface VmView {
   ssh?: VmSshInfo | null;
   llm_api?: LlmApiAccessInfo | null;
   keep_alive?: KeepAliveStatus | null;
+  grab_status?: GrabStatus | null;
 }
 
 export interface Overview {
@@ -454,10 +482,20 @@ export const DEFAULT_RELAY: RelayConfig = {
   backup_interval_minutes: 30,
   total_epochs: 500,
   reset_done_flag: false,
+  grab_mode: "budget",
+  grab_timeout_minutes: 60,
+  grab_retry_seconds: 20,
+  fallback_gpus: [],
 };
 
 export const DEFAULT_KEEP_ALIVE: KeepAliveConfig = {
   enabled: true,
   interval_seconds: 90,
   kernel_ping: true,
+};
+
+export const DEFAULT_GRAB_CONFIG: GrabConfig = {
+  mode: "fast",
+  retry_seconds: 15,
+  fallback_gpus: [],
 };

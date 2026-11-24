@@ -9,6 +9,121 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+pub fn default_vm_grab_mode() -> String {
+    "fast".into()
+}
+
+pub fn default_vm_grab_retry_seconds() -> u64 {
+    15
+}
+
+pub fn default_relay_grab_mode() -> String {
+    "budget".into()
+}
+
+pub fn default_relay_grab_timeout_minutes() -> u32 {
+    60
+}
+
+pub fn default_relay_grab_retry_seconds() -> u64 {
+    20
+}
+
+/// 实例创建时的抢卡策略配置
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct GrabConfig {
+    /// "fast"（单次探卡·没卡立报）| "standard"（标准重试 3 次）| "persistent"（一直抢卡·蹲守直到成功或放弃）
+    #[serde(default = "default_vm_grab_mode")]
+    pub mode: String,
+    /// 重试冷却秒数（5..=300，默认 15）
+    #[serde(default = "default_vm_grab_retry_seconds")]
+    pub retry_seconds: u64,
+    /// 可选备选加速器列表（默认空，绝不静默篡改用户指定卡型）
+    #[serde(default)]
+    pub fallback_gpus: Vec<String>,
+}
+
+impl Default for GrabConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_vm_grab_mode(),
+            retry_seconds: default_vm_grab_retry_seconds(),
+            fallback_gpus: Vec::new(),
+        }
+    }
+}
+
+/// 实时抢卡状态（供创建弹窗、实例卡片与接力面板统一展示）
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct GrabStatus {
+    pub active: bool,
+    pub mode: String,
+    pub attempt: u32,
+    pub max_attempts: Option<u32>,
+    pub budget_minutes: Option<u32>,
+    pub retry_seconds: u64,
+    pub started_at: i64,
+    pub next_retry_at: Option<i64>,
+    pub target_gpu: String,
+    /// "requesting" | "waiting_retry" | "allocated" | "cancelled" | "failed"
+    pub phase: String,
+    pub last_error: Option<String>,
+}
+
+pub fn is_valid_accelerator_code(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_uppercase().as_str(),
+        "CPU" | "T4" | "L4" | "G4" | "A100" | "H100" | "V5E1" | "V6E1"
+    )
+}
+
+pub fn validate_grab_config(cfg: &GrabConfig) -> Result<GrabConfig> {
+    let mode_norm = {
+        let m = cfg.mode.trim().to_lowercase();
+        if m.is_empty() {
+            default_vm_grab_mode()
+        } else {
+            m
+        }
+    };
+    if !matches!(mode_norm.as_str(), "fast" | "standard" | "persistent") {
+        return Err(anyhow!(
+            "不支持的开机抢卡模式 `{}`（仅支持 fast / standard / persistent）",
+            cfg.mode
+        ));
+    }
+    let retry_secs = if mode_norm == "fast" && cfg.retry_seconds == 0 {
+        default_vm_grab_retry_seconds()
+    } else {
+        cfg.retry_seconds
+    };
+    if !(5..=300).contains(&retry_secs) {
+        return Err(anyhow!("抢卡重试间隔必须在 5 ~ 300 秒之间"));
+    }
+    if cfg.fallback_gpus.len() > 8 {
+        return Err(anyhow!("备选卡型最多配置 8 个"));
+    }
+    let mut clean_fb = Vec::new();
+    for g in &cfg.fallback_gpus {
+        let trimmed = g.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !is_valid_accelerator_code(trimmed) {
+            return Err(anyhow!("不支持的备选硬件加速器型号：{trimmed}"));
+        }
+        let u = trimmed.to_uppercase();
+        if !clean_fb.contains(&u) {
+            clean_fb.push(u);
+        }
+    }
+    Ok(GrabConfig {
+        mode: mode_norm,
+        retry_seconds: retry_secs,
+        fallback_gpus: clean_fb,
+    })
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct RelayConfig {
     pub gpu_type: String,
@@ -18,6 +133,18 @@ pub struct RelayConfig {
     pub backup_interval_minutes: f64,
     pub total_epochs: u32,
     pub reset_done_flag: bool,
+    /// 换棒/首棒抢卡策略："budget"（按时间预算蹲守，默认 60 分钟）| "persistent"（一直抢卡直到有卡或手动停止）| "fast"（单次尝试）| "standard"（标准 3 次）
+    #[serde(default = "default_relay_grab_mode")]
+    pub grab_mode: String,
+    /// 当 grab_mode == "budget" 时每棒最长抢卡等待时间（分钟，1..=1440，默认 60 分钟；排队期间旧实例已销毁，0 CU 计费）
+    #[serde(default = "default_relay_grab_timeout_minutes")]
+    pub grab_timeout_minutes: u32,
+    /// 每次抢卡失败后的冷却重试秒数（5..=300，默认 20 秒）
+    #[serde(default = "default_relay_grab_retry_seconds")]
+    pub grab_retry_seconds: u64,
+    /// 可选换棒备选加速器列表（默认空，绝不擅自换卡 #52；仅在用户显式配置时轮询）
+    #[serde(default)]
+    pub fallback_gpus: Vec<String>,
 }
 
 impl Default for RelayConfig {
@@ -30,6 +157,10 @@ impl Default for RelayConfig {
             backup_interval_minutes: 30.0,
             total_epochs: 500,
             reset_done_flag: false,
+            grab_mode: default_relay_grab_mode(),
+            grab_timeout_minutes: default_relay_grab_timeout_minutes(),
+            grab_retry_seconds: default_relay_grab_retry_seconds(),
+            fallback_gpus: Vec::new(),
         }
     }
 }
@@ -82,11 +213,7 @@ pub(crate) fn compute_relay_timeouts(max_session_hours: f64) -> (u64, Duration) 
 
 /// 严格校验接力配置：杜绝 rclone `--flag` 参数注入、Windows 盘符误传、路径穿越与非法数值
 pub fn validate_relay_config(cfg: &RelayConfig) -> Result<()> {
-    let gpu = cfg.gpu_type.trim().to_uppercase();
-    if !matches!(
-        gpu.as_str(),
-        "CPU" | "T4" | "L4" | "G4" | "A100" | "H100" | "V5E1" | "V6E1"
-    ) {
+    if !is_valid_accelerator_code(&cfg.gpu_type) {
         return Err(anyhow!("不支持的硬件加速器型号：{}", cfg.gpu_type));
     }
 
@@ -136,6 +263,38 @@ pub fn validate_relay_config(cfg: &RelayConfig) -> Result<()> {
     }
     if cfg.total_epochs == 0 || cfg.total_epochs > 1_000_000 {
         return Err(anyhow!("总训练轮次必须在 1 ~ 1,000,000 之间"));
+    }
+
+    let gm = {
+        let m = cfg.grab_mode.trim().to_lowercase();
+        if m.is_empty() {
+            "budget".to_string()
+        } else {
+            m
+        }
+    };
+    if !matches!(gm.as_str(), "budget" | "persistent" | "fast" | "standard") {
+        return Err(anyhow!(
+            "不支持的接力抢卡模式 `{}`（支持 budget / persistent / fast / standard）",
+            cfg.grab_mode
+        ));
+    }
+    if gm == "budget" && (cfg.grab_timeout_minutes == 0 || cfg.grab_timeout_minutes > 1440) {
+        return Err(anyhow!(
+            "接力抢卡等待上限必须在 1 ~ 1440 分钟（24 小时）之间"
+        ));
+    }
+    if gm != "fast" && !(5..=300).contains(&cfg.grab_retry_seconds) {
+        return Err(anyhow!("抢卡重试间隔必须在 5 ~ 300 秒之间"));
+    }
+    if cfg.fallback_gpus.len() > 8 {
+        return Err(anyhow!("备选加速器列表最多配置 8 个"));
+    }
+    for fb in &cfg.fallback_gpus {
+        let t = fb.trim();
+        if !t.is_empty() && !is_valid_accelerator_code(t) {
+            return Err(anyhow!("不支持的备选硬件加速器型号：{t}"));
+        }
     }
     Ok(())
 }
@@ -229,6 +388,8 @@ pub struct RelayStatus {
     pub local_weights_path: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub grab_status: Option<GrabStatus>,
 }
 
 pub struct RelayHandle {
@@ -331,6 +492,11 @@ impl RelayHandle {
         st.running = false;
         st.phase = "stopped".into();
         st.phase_label = "已手动停止接力".into();
+        if let Some(ref mut gs) = st.grab_status {
+            gs.active = false;
+            gs.phase = "cancelled".into();
+            gs.next_retry_at = None;
+        }
     }
 }
 
@@ -363,18 +529,30 @@ pub(crate) fn gpu_args(gpu: &str, high_mem: bool) -> Vec<String> {
     v
 }
 
+pub(crate) fn normalize_hw_label(gpu: &str) -> String {
+    let u = gpu.trim().to_uppercase();
+    if u.is_empty() || u == "NONE" {
+        "CPU".to_string()
+    } else {
+        u
+    }
+}
+
+/// 根据硬件类型返回 `(COLAB_CLI_REQUEST_TIMEOUT 秒字符串, 单次子进程总超时)`：
+/// - TPU (`V5E1`/`V6E1`) 切片冷启动可能需要 3~5 分钟，设置 300s 避免被默认 120s 误杀为 ReadTimeout；
+/// - GPU / CPU 正常 5~35s 返回 200 或 503，设置 60s 单次 HTTP 超时并配合 `COLAB_CLI_ASSIGN_RETRIES=0` 消除 3 分 15 秒静默退避。
+pub fn colab_assign_env_for_gpu(gpu: &str) -> (&'static str, Duration) {
+    match normalize_hw_label(gpu).as_str() {
+        "V5E1" | "V6E1" => ("300", Duration::from_secs(360)),
+        _ => ("60", Duration::from_secs(150)),
+    }
+}
+
 pub(crate) fn format_colab_new_failure(gpu: &str, raw_output: &str) -> String {
     let cleaned = cli::strip_colab_cli_banners(raw_output);
     let tail = cli::last_meaningful_cli_line(&cleaned, "未知错误");
     let lower = cleaned.to_ascii_lowercase();
-    let hw = {
-        let u = gpu.trim().to_uppercase();
-        if u.is_empty() || u == "NONE" {
-            "CPU".to_string()
-        } else {
-            u
-        }
-    };
+    let hw = normalize_hw_label(gpu);
     if lower.contains("503")
         || lower.contains("service unavailable")
         || lower.contains("allocation refused")
@@ -389,9 +567,23 @@ pub(crate) fn format_colab_new_failure(gpu: &str, raw_output: &str) -> String {
         || lower.contains("not logged in")
     {
         format!("Colab 授权凭证已过期或无效（{tail}），请在终端执行 `colab auth`（或 `colab status`）重新授权")
+    } else if lower.contains("readtimeout")
+        || lower.contains("read timed out")
+        || lower.contains("connecttimeout")
+    {
+        format!("连接云端 [{hw}] 分配接口响应超时（{tail}），通常表示该卡型当前排队拥堵或冷启动较慢")
     } else {
         format!("创建实例失败：{tail}")
     }
+}
+
+pub(crate) fn is_fatal_colab_new_error(raw_output: &str) -> bool {
+    let lower = cli::strip_colab_cli_banners(raw_output).to_ascii_lowercase();
+    lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("not logged in")
+        || lower.contains("invalid_grant")
+        || lower.contains("no such option")
 }
 
 /// 构造 `colab [--auth <mode>] new -s <name> [--gpu <G> | --tpu <t>] [--high-mem]` 参数序列：
@@ -414,8 +606,15 @@ pub(crate) fn build_colab_new_args(
     args
 }
 
-/// 通过 colab-cli 创建实例（支持硬件内存形态自适配、400 自动降级重试、取消与 PID 树跟踪）
-pub async fn colab_new_with_opts(
+#[derive(Debug, Clone)]
+pub struct SingleAttemptError {
+    pub message: String,
+    pub fatal: bool,
+    pub cancelled: bool,
+}
+
+/// 执行单次受控 `colab new`（`COLAB_CLI_ASSIGN_RETRIES=0`，不含 Python 内部静默指数退避，保留 HTTP 400 High-RAM 自动降级）
+pub async fn colab_new_single_attempt(
     name: &str,
     gpu: &str,
     high_mem: bool,
@@ -423,11 +622,15 @@ pub async fn colab_new_with_opts(
     cancel: Option<CancellationToken>,
     pid_slot: Option<&Mutex<Option<u32>>>,
     log: &(dyn Fn(&str) + Send + Sync),
-) -> Result<()> {
+) -> std::result::Result<(), SingleAttemptError> {
     let mut validated_auth: Option<String> = None;
     if let Some(m) = auth_mode.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()) {
         if m != "oauth2" && m != "adc" {
-            return Err(anyhow!("非法的授权模式 `{m}`（仅支持 oauth2 或 adc）"));
+            return Err(SingleAttemptError {
+                message: format!("非法的授权模式 `{m}`（仅支持 oauth2 或 adc）"),
+                fatal: true,
+                cancelled: false,
+            });
         }
         validated_auth = Some(m);
     }
@@ -436,28 +639,52 @@ pub async fn colab_new_with_opts(
     if high_mem && !effective_hm {
         log(&format!(
             "ℹ️ 加速器 {} 采用云端固定内存形态，已自动省略 --high-mem（防止服务端 HTTP 400）",
-            gpu.trim().to_uppercase()
+            normalize_hw_label(gpu)
         ));
     }
+
+    let (req_timeout_str, proc_timeout) = colab_assign_env_for_gpu(gpu);
+    let extra_env = [
+        ("COLAB_CLI_ASSIGN_RETRIES", "0"),
+        ("COLAB_CLI_REQUEST_TIMEOUT", req_timeout_str),
+    ];
 
     let mut cur_hm = effective_hm;
     for attempt in 0..2usize {
         let args = build_colab_new_args(name, gpu, cur_hm, validated_auth.as_deref());
-        let out = cli::run_streaming(
+        let out = cli::run_streaming_with_env(
             &cli::colab_bin(),
             &args,
+            &extra_env,
             None,
-            Duration::from_secs(600),
+            proc_timeout,
             cancel.clone(),
             pid_slot,
             |l| log(l),
         )
-        .await?;
+        .await
+        .map_err(|e| SingleAttemptError {
+            message: format!("{e:#}"),
+            fatal: true,
+            cancelled: false,
+        })?;
         if out.cancelled {
-            return Err(anyhow!("创建实例已取消"));
+            return Err(SingleAttemptError {
+                message: "已放弃抢卡".into(),
+                fatal: true,
+                cancelled: true,
+            });
         }
         if out.timed_out {
-            return Err(anyhow!("创建实例超时 (600s)"));
+            return Err(SingleAttemptError {
+                message: format!(
+                    "请求云端 [{}] 分配响应超时 ({}s)，当前算力池可能拥堵",
+                    normalize_hw_label(gpu),
+                    proc_timeout.as_secs()
+                ),
+                fatal: false,
+                cancelled: false,
+            });
         }
         if out.code == 0 && out.output.contains("Session READY") {
             return Ok(());
@@ -472,9 +699,327 @@ pub async fn colab_new_with_opts(
             cur_hm = false;
             continue;
         }
-        return Err(anyhow!("{}", format_colab_new_failure(gpu, &out.output)));
+        return Err(SingleAttemptError {
+            message: format_colab_new_failure(gpu, &out.output),
+            fatal: is_fatal_colab_new_error(&out.output),
+            cancelled: false,
+        });
     }
-    Err(anyhow!("创建实例失败"))
+    Err(SingleAttemptError {
+        message: "创建实例失败".into(),
+        fatal: false,
+        cancelled: false,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct GrabLoopOptions {
+    pub name: String,
+    pub primary_gpu: String,
+    pub fallback_gpus: Vec<String>,
+    pub high_mem: bool,
+    pub auth_mode: Option<String>,
+    /// "fast" | "standard" | "budget" | "persistent"
+    pub mode: String,
+    pub budget_minutes: Option<u32>,
+    pub retry_seconds: u64,
+    pub cancel: Option<CancellationToken>,
+}
+
+/// 统一抢卡主循环：支持单次探卡 (`fast`)、标准 3 轮 (`standard`)、限时预算蹲守 (`budget`) 与一直抢卡 (`persistent`)，
+/// 支持备选卡型轮询、每次尝试前刷新服务端已有端点快照（防误删孤儿 #77）及毫秒级取消响应。
+pub async fn grab_colab_vm_loop(
+    opts: &GrabLoopOptions,
+    snapshot_guard: Option<(
+        &AppState,
+        &Mutex<std::collections::HashSet<String>>,
+        &AtomicBool,
+    )>,
+    pid_slot: Option<&Mutex<Option<u32>>>,
+    on_status: &(dyn Fn(&GrabStatus) + Send + Sync),
+    log: &(dyn Fn(&str) + Send + Sync),
+) -> Result<String> {
+    let mode = {
+        let m = opts.mode.trim().to_lowercase();
+        if m.is_empty() {
+            "fast".to_string()
+        } else {
+            m
+        }
+    };
+    let primary = normalize_hw_label(&opts.primary_gpu);
+    let mut candidates = vec![primary.clone()];
+    for fb in &opts.fallback_gpus {
+        let norm = normalize_hw_label(fb);
+        if is_valid_accelerator_code(&norm) && !candidates.contains(&norm) {
+            candidates.push(norm);
+        }
+    }
+
+    let max_attempts: Option<u32> = match mode.as_str() {
+        "fast" => Some(candidates.len() as u32),
+        "standard" => Some(3u32.max(candidates.len() as u32)),
+        _ => None,
+    };
+    let budget_minutes = if mode == "budget" {
+        Some(opts.budget_minutes.unwrap_or(60).max(1))
+    } else {
+        None
+    };
+    let retry_secs = opts.retry_seconds.clamp(5, 300);
+    let cancel = opts.cancel.clone().unwrap_or_default();
+    let started_at = chrono::Utc::now().timestamp();
+    let started_instant = std::time::Instant::now();
+    let mut attempt: u32 = 0;
+    let mut last_error: Option<String> = None;
+
+    loop {
+        if cancel.is_cancelled() {
+            on_status(&GrabStatus {
+                active: false,
+                mode: mode.clone(),
+                attempt,
+                max_attempts,
+                budget_minutes,
+                retry_seconds: retry_secs,
+                started_at,
+                next_retry_at: None,
+                target_gpu: primary.clone(),
+                phase: "cancelled".into(),
+                last_error: last_error.clone(),
+            });
+            return Err(anyhow!("已放弃抢卡"));
+        }
+
+        attempt += 1;
+        let target_gpu = candidates[((attempt - 1) as usize) % candidates.len()].clone();
+
+        if let Some((app, ep_set, invalid_flag)) = snapshot_guard {
+            match app.client.list_assignments().await {
+                Ok(existing) => {
+                    *ep_set.l() = existing.into_iter().map(|a| a.endpoint).collect();
+                    invalid_flag.store(false, Ordering::SeqCst);
+                }
+                Err(_) => {
+                    ep_set.l().clear();
+                    invalid_flag.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        on_status(&GrabStatus {
+            active: true,
+            mode: mode.clone(),
+            attempt,
+            max_attempts,
+            budget_minutes,
+            retry_seconds: retry_secs,
+            started_at,
+            next_retry_at: None,
+            target_gpu: target_gpu.clone(),
+            phase: "requesting".into(),
+            last_error: last_error.clone(),
+        });
+
+        match max_attempts {
+            Some(max) if max > 1 => log(&format!(
+                "🎯 第 {attempt}/{max} 次抢卡：正在向 Google Colab 请求 [{target_gpu}] 实例…"
+            )),
+            None if attempt > 1 => log(&format!(
+                "🎯 第 {attempt} 次抢卡（已蹲守 {:.1} 分钟）：正在请求 [{target_gpu}] 实例…",
+                started_instant.elapsed().as_secs_f64() / 60.0
+            )),
+            _ => {}
+        }
+
+        let res = colab_new_single_attempt(
+            &opts.name,
+            &target_gpu,
+            opts.high_mem,
+            opts.auth_mode.as_deref(),
+            Some(cancel.clone()),
+            pid_slot,
+            log,
+        )
+        .await;
+
+        if let Some((_, _, invalid_flag)) = snapshot_guard {
+            if res.is_ok() {
+                invalid_flag.store(true, Ordering::SeqCst);
+            }
+        }
+
+        match res {
+            Ok(()) => {
+                on_status(&GrabStatus {
+                    active: false,
+                    mode: mode.clone(),
+                    attempt,
+                    max_attempts,
+                    budget_minutes,
+                    retry_seconds: retry_secs,
+                    started_at,
+                    next_retry_at: None,
+                    target_gpu: target_gpu.clone(),
+                    phase: "allocated".into(),
+                    last_error: None,
+                });
+                return Ok(target_gpu);
+            }
+            Err(err) => {
+                if err.cancelled || cancel.is_cancelled() {
+                    on_status(&GrabStatus {
+                        active: false,
+                        mode: mode.clone(),
+                        attempt,
+                        max_attempts,
+                        budget_minutes,
+                        retry_seconds: retry_secs,
+                        started_at,
+                        next_retry_at: None,
+                        target_gpu,
+                        phase: "cancelled".into(),
+                        last_error: Some("已放弃抢卡".into()),
+                    });
+                    return Err(anyhow!("已放弃抢卡"));
+                }
+
+                last_error = Some(err.message.clone());
+
+                if err.fatal {
+                    if let Some((_, _, invalid_flag)) = snapshot_guard {
+                        invalid_flag.store(true, Ordering::SeqCst);
+                    }
+                    on_status(&GrabStatus {
+                        active: false,
+                        mode: mode.clone(),
+                        attempt,
+                        max_attempts,
+                        budget_minutes,
+                        retry_seconds: retry_secs,
+                        started_at,
+                        next_retry_at: None,
+                        target_gpu,
+                        phase: "failed".into(),
+                        last_error,
+                    });
+                    return Err(anyhow!("{}", err.message));
+                }
+
+                if let Some(max) = max_attempts {
+                    if attempt >= max {
+                        if let Some((_, _, invalid_flag)) = snapshot_guard {
+                            invalid_flag.store(true, Ordering::SeqCst);
+                        }
+                        on_status(&GrabStatus {
+                            active: false,
+                            mode: mode.clone(),
+                            attempt,
+                            max_attempts,
+                            budget_minutes,
+                            retry_seconds: retry_secs,
+                            started_at,
+                            next_retry_at: None,
+                            target_gpu,
+                            phase: "failed".into(),
+                            last_error,
+                        });
+                        return Err(anyhow!("{}", err.message));
+                    }
+                }
+
+                let mut wait_secs = if mode == "fast" { 0 } else { retry_secs };
+                if let Some(mins) = budget_minutes {
+                    let budget_dur = Duration::from_secs(mins as u64 * 60);
+                    let elapsed = started_instant.elapsed();
+                    if elapsed >= budget_dur {
+                        if let Some((_, _, invalid_flag)) = snapshot_guard {
+                            invalid_flag.store(true, Ordering::SeqCst);
+                        }
+                        let msg = format!(
+                            "在设定的 {mins} 分钟抢卡时间窗口内未能分配到云端实例（共尝试 {attempt} 次）：{}",
+                            err.message
+                        );
+                        on_status(&GrabStatus {
+                            active: false,
+                            mode: mode.clone(),
+                            attempt,
+                            max_attempts,
+                            budget_minutes,
+                            retry_seconds: retry_secs,
+                            started_at,
+                            next_retry_at: None,
+                            target_gpu,
+                            phase: "failed".into(),
+                            last_error: Some(msg.clone()),
+                        });
+                        return Err(anyhow!("{msg}"));
+                    }
+                    let rem_secs = (budget_dur - elapsed).as_secs();
+                    if wait_secs > rem_secs {
+                        wait_secs = rem_secs.max(1);
+                    }
+                }
+
+                let next_gpu = candidates[(attempt as usize) % candidates.len()].clone();
+                if wait_secs > 0 {
+                    let next_at = chrono::Utc::now().timestamp() + wait_secs as i64;
+                    on_status(&GrabStatus {
+                        active: true,
+                        mode: mode.clone(),
+                        attempt,
+                        max_attempts,
+                        budget_minutes,
+                        retry_seconds: retry_secs,
+                        started_at,
+                        next_retry_at: Some(next_at),
+                        target_gpu: next_gpu.clone(),
+                        phase: "waiting_retry".into(),
+                        last_error: last_error.clone(),
+                    });
+                    log(&format!(
+                        "⏳ 第 {attempt} 次未抢到卡（{}），{wait_secs}s 后自动尝试 [{next_gpu}]…",
+                        err.message
+                    ));
+                    if !sleep_cancellable(wait_secs, &cancel).await {
+                        on_status(&GrabStatus {
+                            active: false,
+                            mode: mode.clone(),
+                            attempt,
+                            max_attempts,
+                            budget_minutes,
+                            retry_seconds: retry_secs,
+                            started_at,
+                            next_retry_at: None,
+                            target_gpu: next_gpu,
+                            phase: "cancelled".into(),
+                            last_error: Some("已放弃抢卡".into()),
+                        });
+                        return Err(anyhow!("已放弃抢卡"));
+                    }
+                } else {
+                    log(&format!(
+                        "🔄 [{target_gpu}] 当前无卡，立即尝试备选 [{next_gpu}]…"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// 通过 colab-cli 创建实例（默认单次快速探卡，支持硬件内存形态自适配、400 自动降级重试、取消与 PID 树跟踪）
+pub async fn colab_new_with_opts(
+    name: &str,
+    gpu: &str,
+    high_mem: bool,
+    auth_mode: Option<&str>,
+    cancel: Option<CancellationToken>,
+    pid_slot: Option<&Mutex<Option<u32>>>,
+    log: &(dyn Fn(&str) + Send + Sync),
+) -> Result<()> {
+    colab_new_single_attempt(name, gpu, high_mem, auth_mode, cancel, pid_slot, log)
+        .await
+        .map_err(|e| anyhow!("{}", e.message))
 }
 
 pub async fn colab_new(
@@ -492,6 +1037,37 @@ pub(crate) fn is_done_flag_filename(name: &str) -> bool {
     let t = name.trim();
     t.eq_ignore_ascii_case("training_done.flag")
         || t.eq_ignore_ascii_case("training_completed.flag")
+}
+
+pub(crate) fn is_checkpoint_entry(line: &str) -> bool {
+    let t = line.trim();
+    t == "checkpoint.pt"
+        || t == "checkpoint_prev.pt"
+        || t.trim_end_matches('/') == "hf_checkpoints"
+}
+
+/// 检查网盘接力目录下是否已存在有效断点（用于换棒销毁前核验与应急抢救）
+pub(crate) async fn gdrive_has_checkpoint_with_conf(
+    rclone_bin: &std::path::PathBuf,
+    rclone_conf: &std::path::Path,
+    gdrive_dir: &str,
+) -> bool {
+    let mut args = Vec::new();
+    if rclone_conf.exists() {
+        args.push("--config".into());
+        args.push(rclone_conf.to_string_lossy().to_string());
+    }
+    args.extend(s(&[
+        "lsf",
+        "--retries=3",
+        "--low-level-retries=10",
+        "--",
+    ]));
+    args.push(gdrive_dir.trim_end_matches('/').to_string());
+    match cli::run_simple(rclone_bin, &args, Duration::from_secs(45)).await {
+        Ok(o) => o.code == 0 && o.stdout.lines().any(is_checkpoint_entry),
+        Err(_) => false,
+    }
 }
 
 pub(crate) async fn done_flag_exists_with_conf(
@@ -998,6 +1574,88 @@ pub(crate) async fn check_or_migrate_legacy_bare_gdrive_with_conf(
     Ok(())
 }
 
+/// 换棒停机前断点保护：若训练脚本因触发换棒或超时退出，在销毁实例前核验网盘断点；
+/// 若网盘尚无断点或训练因超时被截断，尝试在 90 秒窗口内将云端 `/content` 下的本地断点紧急同步至 Google Drive。
+async fn verify_or_rescue_checkpoint_before_terminate(
+    h: &RelayHandle,
+    colab_bin: &std::path::PathBuf,
+    rclone_bin: &std::path::PathBuf,
+    rclone_conf: &std::path::Path,
+    vm_name: &str,
+    eff_auth: Option<&str>,
+    gdrive: &str,
+    train_out: &cli::RunOutput,
+    cancel: &CancellationToken,
+) {
+    let clean = strip_ansi_codes(&train_out.output);
+    let is_handover = train_out.code == 0 && clean.contains("HANDOVER_REQUESTED");
+    if !is_handover && !train_out.timed_out {
+        return;
+    }
+    let has_remote_ckpt = gdrive_has_checkpoint_with_conf(rclone_bin, rclone_conf, gdrive).await;
+    if has_remote_ckpt && !train_out.timed_out {
+        h.log("✅ 换棒前准备核验通过：网盘已存在最新训练断点，安全进入停机换棒");
+        return;
+    }
+
+    h.set_phase("syncing_checkpoint", "换棒保护：正在停机前抢救同步云端本地断点");
+    h.log("🛡️ 换棒前保护：检测到网盘尚无断点或训练超时截断，正在销毁实例前尝试抢救同步 `/content` 本地断点…");
+    let rescue_py = r#"import os, subprocess
+gd = os.environ.get("GDRIVE_DIR", "").rstrip("/")
+conf = "/content/rclone.conf"
+synced = []
+if gd and os.path.exists(conf):
+    for fn in ("checkpoint.pt", "checkpoint_prev.pt"):
+        for base in ("/content", "."):
+            p = os.path.join(base, fn)
+            if os.path.isfile(p) and os.path.getsize(p) > 0:
+                r = subprocess.run(["rclone", "--config", conf, "copyto", "--retries=3", "--", p, f"{gd}/{fn}"])
+                if r.returncode == 0:
+                    synced.append(fn)
+                    break
+    for base in ("/content", "."):
+        hf = os.path.join(base, "hf_checkpoints")
+        if os.path.isdir(hf) and os.listdir(hf):
+            r = subprocess.run(["rclone", "--config", conf, "copy", "--retries=3", "--", hf, f"{gd}/hf_checkpoints"])
+            if r.returncode == 0:
+                synced.append("hf_checkpoints/")
+                break
+print("EMERGENCY_SYNC_OK:" + ",".join(synced) if synced else "EMERGENCY_SYNC_NONE")
+"#;
+    let raw_args = vec![
+        "exec".into(),
+        "-s".into(),
+        vm_name.to_string(),
+        "--timeout".into(),
+        "90".into(),
+        "--env".into(),
+        format!("GDRIVE_DIR={gdrive}"),
+    ];
+    let exec_args = cli::build_colab_subcommand_args(eff_auth, &raw_args);
+    if let Ok(res_out) = cli::run_streaming(
+        colab_bin,
+        &exec_args,
+        Some(rescue_py.to_string()),
+        Duration::from_secs(110),
+        Some(cancel.clone()),
+        Some(&h.child_pid),
+        |_| {},
+    )
+    .await
+    {
+        if let Some(line) = res_out
+            .output
+            .lines()
+            .find(|l| l.contains("EMERGENCY_SYNC_OK:"))
+        {
+            h.log(format!(
+                "✅ 停机前断点抢救成功（{}），已同步至 {gdrive}",
+                line.trim_start_matches("EMERGENCY_SYNC_OK:").trim()
+            ));
+        }
+    }
+}
+
 async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: CancellationToken) -> Result<()> {
     let name = h.status.l().vm_name.clone();
     let mut cfg = h.status.l().config.clone();
@@ -1031,6 +1689,30 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
     h.set_phase("preparing_gdrive", "准备 Google Drive 接力目录");
     h.log(format!("📂 绑定工作区目录：{}", ws_dir.display()));
     h.log(format!("🔑 使用本机 Rclone 授权文件：{}", conf.display()));
+    if cfg.max_session_hours > 22.5 {
+        h.log(format!(
+            "⚠️ 换棒准备提示：当前单棒上限 {:.1}h 较接近 Colab 24h 强制回收线，推荐设为 ≤22.5h 以预留充足的断点落盘与网盘上传缓冲时间",
+            cfg.max_session_hours
+        ));
+    }
+    {
+        let gm = cfg.grab_mode.trim().to_lowercase();
+        let mode_desc = match gm.as_str() {
+            "persistent" => format!("一直抢卡（每 {}s 重试，直到成功或手动放弃）", cfg.grab_retry_seconds),
+            "fast" => "单次快速探卡（无卡立即报错）".to_string(),
+            "standard" => format!("标准重试 3 轮（间隔 {}s）", cfg.grab_retry_seconds),
+            _ => format!(
+                "限时蹲守 {} 分钟（每 {}s 重试，换棒排队期间旧实例已停机 0 CU 计费）",
+                cfg.grab_timeout_minutes, cfg.grab_retry_seconds
+            ),
+        };
+        let fb_desc = if cfg.fallback_gpus.is_empty() {
+            String::new()
+        } else {
+            format!(" | 备选卡型：[{}]", cfg.fallback_gpus.join(", "))
+        };
+        h.log(format!("🛡️ 接力抢卡策略：{mode_desc}{fb_desc}"));
+    }
     if !conf.exists() {
         return Err(anyhow!("未找到 rclone.conf，请先完成 rclone 授权"));
     }
@@ -1130,37 +1812,86 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            match app.client.list_assignments().await {
-                Ok(existing) => {
-                    *h.pre_provision_endpoints.l() =
-                        existing.into_iter().map(|a| a.endpoint).collect();
-                    h.pre_provision_snapshot_invalid.store(false, Ordering::SeqCst);
-                }
-                Err(_) => {
-                    h.pre_provision_endpoints.l().clear();
-                    h.pre_provision_snapshot_invalid.store(true, Ordering::SeqCst);
-                }
-            }
             h.cloud_unassign_verified.store(false, Ordering::SeqCst);
             h.set_phase("provisioning", format!("第 {round} 棒：申请云端 {} 实例", cfg.gpu_type));
-            h.log(format!("☁️ 正在向 Google Colab 申请实例 [{name}]…"));
-            let hh = h.clone();
-            let prov_res = colab_new_with_opts(
-                &name,
-                &cfg.gpu_type,
-                cfg.high_mem,
-                eff_auth.as_deref(),
-                Some(cancel.clone()),
+            h.log(format!(
+                "☁️ 正在向 Google Colab 申请第 {round} 棒实例 [{name}]{}…",
+                if round > 1 { "（换棒等待期间无运行实例，0 CU 计费）" } else { "" }
+            ));
+            let grab_opts = GrabLoopOptions {
+                name: name.clone(),
+                primary_gpu: cfg.gpu_type.clone(),
+                fallback_gpus: cfg.fallback_gpus.clone(),
+                high_mem: cfg.high_mem,
+                auth_mode: eff_auth.clone(),
+                mode: cfg.grab_mode.clone(),
+                budget_minutes: Some(cfg.grab_timeout_minutes),
+                retry_seconds: cfg.grab_retry_seconds,
+                cancel: Some(cancel.clone()),
+            };
+            let hh_status = h.clone();
+            let hh_log = h.clone();
+            let prov_res = grab_colab_vm_loop(
+                &grab_opts,
+                Some((
+                    &app,
+                    &h.pre_provision_endpoints,
+                    &h.pre_provision_snapshot_invalid,
+                )),
                 Some(&h.child_pid),
-                &move |l: &str| hh.log(l),
+                &move |gs: &GrabStatus| {
+                    let mut st = hh_status.status.l();
+                    st.grab_status = Some(gs.clone());
+                    if gs.active {
+                        let q_note = if round > 1 { " · 排队0计费" } else { "" };
+                        let label = if gs.phase == "waiting_retry" {
+                            format!(
+                                "第 {round} 棒：[{}] 暂无卡，{}s 后第 {} 次重试{}",
+                                gs.target_gpu,
+                                gs.retry_seconds,
+                                gs.attempt + 1,
+                                q_note
+                            )
+                        } else if let Some(max) = gs.max_attempts {
+                            if max > 1 {
+                                format!(
+                                    "第 {round} 棒：第 {}/{} 次抢卡 [{}]{}",
+                                    gs.attempt, max, gs.target_gpu, q_note
+                                )
+                            } else {
+                                format!("第 {round} 棒：申请云端 [{}] 实例{}", gs.target_gpu, q_note)
+                            }
+                        } else {
+                            format!(
+                                "第 {round} 棒：第 {} 次蹲守抢卡 [{}]{}",
+                                gs.attempt, gs.target_gpu, q_note
+                            )
+                        };
+                        st.phase = "provisioning".into();
+                        st.phase_label = label;
+                    }
+                },
+                &move |l: &str| hh_log.log(l),
             )
             .await;
-            if prov_res.is_ok() {
-                h.pre_provision_snapshot_invalid.store(true, Ordering::SeqCst);
-                h.set_phase("connecting", format!("第 {round} 棒：连接已分配实例"));
-            } else if !cancel.is_cancelled() {
-                h.pre_provision_snapshot_invalid.store(true, Ordering::SeqCst);
-                h.set_phase("alloc_failed", format!("第 {round} 棒：实例申请失败"));
+            match prov_res {
+                Ok(ref allocated_gpu) => {
+                    h.pre_provision_snapshot_invalid.store(true, Ordering::SeqCst);
+                    h.status.l().grab_status = None;
+                    if !allocated_gpu.eq_ignore_ascii_case(&cfg.gpu_type) {
+                        h.log(format!(
+                            "🔄 主选 [{}] 暂无库存，本棒已通过备选卡型成功分配 [{}] 实例！",
+                            cfg.gpu_type, allocated_gpu
+                        ));
+                    }
+                    h.set_phase("connecting", format!("第 {round} 棒：连接已分配 [{allocated_gpu}] 实例"));
+                }
+                Err(_) => {
+                    if !cancel.is_cancelled() {
+                        h.pre_provision_snapshot_invalid.store(true, Ordering::SeqCst);
+                        h.set_phase("alloc_failed", format!("第 {round} 棒：实例抢卡失败"));
+                    }
+                }
             }
             prov_res?;
         }
@@ -1321,6 +2052,23 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             return Ok(());
         }
 
+        // 4.5 换棒销毁前核验与应急抢救：确保在停机释放前最新训练断点已落入网盘
+        verify_or_rescue_checkpoint_before_terminate(
+            &h,
+            &colab,
+            &rclone,
+            &conf,
+            &name,
+            eff_auth.as_deref(),
+            &gdrive,
+            &out,
+            &cancel,
+        )
+        .await;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
         // 5. 本棒结束，无论成功或失败均先彻底销毁实例停止计费
         h.set_phase("destroying", format!("第 {round} 棒结束：销毁实例并核验停费"));
         h.log("🧹 本棒结束，正在 unassign 并核验服务端计费列表…");
@@ -1392,6 +2140,7 @@ mod tests {
             backup_interval_minutes: 15.0,
             total_epochs: 100,
             reset_done_flag: false,
+            ..Default::default()
         };
         assert!(validate_relay_config(&valid).is_ok());
 
@@ -1637,6 +2386,7 @@ assert caught, "parser should reject trailing --auth after subcommand 'new'"
             backup_interval_minutes: 15.0,
             total_epochs: 20,
             reset_done_flag: false,
+            ..Default::default()
         };
         assert!(validate_relay_config(&cpu_cfg).is_ok());
 
@@ -1838,6 +2588,7 @@ sys.exit(0)
             backup_interval_minutes: 15.0,
             total_epochs: 10,
             reset_done_flag: false,
+            ..Default::default()
         };
         relay_inner(app, h_rerun.clone(), CancellationToken::new())
             .await

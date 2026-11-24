@@ -2,6 +2,8 @@ import type {
   ChatMessage,
   CreateVmLlmConfig,
   EnvStatus,
+  GrabConfig,
+  GrabStatus,
   LlmBlueGreenState,
   Overview,
   RecentSessionView,
@@ -841,6 +843,7 @@ export interface RestoredSessionPreset {
   llm_config?: CreateVmLlmConfig | null;
   relay_config?: RelayConfig | null;
   keep_alive?: import("./types").KeepAliveConfig | null;
+  grab_config?: GrabConfig | null;
   unverified_history_profile?: boolean;
 }
 
@@ -876,6 +879,7 @@ export function buildPresetFromRecentSession(r: RecentSessionView): RestoredSess
       llm_config: r.llm_config ?? null,
       relay_config: r.relay_config ?? null,
       keep_alive: r.keep_alive ?? null,
+      grab_config: r.grab_config ?? null,
       unverified_history_profile: false,
     };
   }
@@ -887,6 +891,7 @@ export function buildPresetFromRecentSession(r: RecentSessionView): RestoredSess
     boot_mode: "general",
     workspace_path: r.workspace_path ?? undefined,
     keep_alive: r.keep_alive ?? null,
+    grab_config: r.grab_config ?? null,
     unverified_history_profile: true,
   };
 }
@@ -1003,7 +1008,35 @@ export function resolveVmStatusPillSpec(
   const billingUnknown = Boolean(vm.server_state_unknown || serverStateUnknown);
 
   if (vm.busy === "creating") {
+    const gs = vm.grab_status;
+    if (gs && gs.active) {
+      if (gs.phase === "waiting_retry") {
+        return {
+          cls: "pill-amber",
+          pulse: true,
+          text: `抢卡等待重试 · 第 ${gs.attempt} 次`,
+          title: gs.last_error ?? undefined,
+        };
+      }
+      if (gs.mode === "persistent") {
+        return {
+          cls: "pill-amber",
+          pulse: true,
+          text: `一直抢卡中 · 第 ${gs.attempt} 次`,
+        };
+      }
+      if (gs.max_attempts && gs.max_attempts > 1) {
+        return {
+          cls: "pill-amber",
+          pulse: true,
+          text: `抢卡中 · 第 ${gs.attempt}/${gs.max_attempts} 次`,
+        };
+      }
+    }
     return { cls: "pill-amber", pulse: true, text: "开机分配中…" };
+  }
+  if (vm.busy === "initializing_env") {
+    return { cls: "pill-blue", pulse: true, text: "初始化环境中…" };
   }
   if (vm.busy === "deploying_llm") {
     return { cls: "pill-amber", pulse: true, text: "部署大模型中…" };
@@ -1166,5 +1199,112 @@ export function resolveKeepAliveBadge(ka?: {
     tone: "warn",
     label: `保活已启用 (${interval}s)`,
     detail: `即将发送首轮保活 · ${kDesc}`,
+  };
+}
+
+export const MIN_GRAB_RETRY_SECONDS = 5;
+export const MAX_GRAB_RETRY_SECONDS = 300;
+export const DEFAULT_VM_GRAB_RETRY_SECONDS = 15;
+export const DEFAULT_RELAY_GRAB_RETRY_SECONDS = 20;
+export const RECOMMENDED_MAX_RELAY_SESSION_HOURS = 22.5;
+export const VALID_ACCELERATOR_CODES: ReadonlySet<string> = new Set([
+  "CPU",
+  "T4",
+  "L4",
+  "G4",
+  "A100",
+  "H100",
+  "V5E1",
+  "V6E1",
+]);
+
+export function isValidGrabRetrySeconds(seconds: number): boolean {
+  return (
+    Number.isFinite(seconds) &&
+    seconds >= MIN_GRAB_RETRY_SECONDS &&
+    seconds <= MAX_GRAB_RETRY_SECONDS
+  );
+}
+
+export function isValidRelayGrabTimeoutMinutes(minutes: number): boolean {
+  return Number.isFinite(minutes) && minutes >= 1 && minutes <= 1440;
+}
+
+export function parseFallbackGpuInput(
+  raw: string,
+  primaryGpu?: string | null,
+): { gpus: string[]; invalid: string[] } {
+  const prim = String(primaryGpu ?? "")
+    .trim()
+    .toUpperCase();
+  const gpus: string[] = [];
+  const invalid: string[] = [];
+  for (const part of String(raw ?? "").split(/[\s,，;/|]+/)) {
+    const code = part.trim().toUpperCase();
+    if (!code) continue;
+    if (!VALID_ACCELERATOR_CODES.has(code)) {
+      if (!invalid.includes(part.trim())) invalid.push(part.trim());
+      continue;
+    }
+    if (code === prim) continue;
+    if (!gpus.includes(code)) gpus.push(code);
+  }
+  return { gpus, invalid };
+}
+
+export function describeGrabStatus(
+  gs?: GrabStatus | null,
+  nowSec = Math.floor(Date.now() / 1000),
+): {
+  headline: string;
+  subline: string;
+  countdownSec: number | null;
+  elapsedSec: number;
+} | null {
+  if (!gs || !gs.active) return null;
+  const elapsedSec = Math.max(0, Math.floor(nowSec - (gs.started_at || nowSec)));
+  const countdownSec =
+    gs.phase === "waiting_retry" && typeof gs.next_retry_at === "number"
+      ? Math.max(0, Math.ceil(gs.next_retry_at - nowSec))
+      : null;
+  const gpu = gs.target_gpu || "GPU";
+  const modeLabel =
+    gs.mode === "persistent"
+      ? "一直抢卡模式"
+      : gs.mode === "budget"
+        ? `限时蹲守 (${gs.budget_minutes ?? 60}m 预算)`
+        : gs.mode === "standard"
+          ? `标准重试 (${gs.max_attempts ?? 3} 轮)`
+          : "快速探卡模式";
+  const elapsedText =
+    elapsedSec >= 60
+      ? `已等待 ${Math.floor(elapsedSec / 60)}分${elapsedSec % 60}秒`
+      : `已等待 ${elapsedSec}秒`;
+
+  if (gs.phase === "waiting_retry") {
+    return {
+      headline: `[${gpu}] 暂无空闲库存，${countdownSec ?? gs.retry_seconds} 秒后自动发起第 ${gs.attempt + 1} 次抢卡…`,
+      subline: gs.last_error
+        ? `${modeLabel} · ${elapsedText} · 上次反馈：${gs.last_error}`
+        : `${modeLabel} · ${elapsedText}`,
+      countdownSec,
+      elapsedSec,
+    };
+  }
+
+  const attemptTag =
+    gs.max_attempts && gs.max_attempts > 1
+      ? `第 ${gs.attempt}/${gs.max_attempts} 次`
+      : gs.attempt > 1 || gs.mode === "persistent" || gs.mode === "budget"
+        ? `第 ${gs.attempt} 次`
+        : "正在";
+
+  return {
+    headline: `${attemptTag}向 Google Colab 请求分配 [${gpu}] 算力实例…`,
+    subline: gs.last_error
+      ? `${modeLabel} · ${elapsedText} · 上轮原因：${gs.last_error}`
+      : `${modeLabel} · ${elapsedText}（已关闭静默长退避，支持随时点击「放弃抢卡」）`,
+    countdownSec: null,
+    elapsedSec,
   };
 }

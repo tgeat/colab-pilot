@@ -1,15 +1,23 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Download, Repeat2 } from "lucide-react";
+import { AlertTriangle, Download, Loader2, Repeat2 } from "lucide-react";
 import type { RelayConfig, VmView } from "../types";
 import { DEFAULT_RELAY } from "../types";
 import { fmtDuration, pct } from "../format";
 import {
+  DEFAULT_RELAY_GRAB_RETRY_SECONDS,
+  MAX_GRAB_RETRY_SECONDS,
   MAX_RELAY_SESSION_HOURS,
+  MIN_GRAB_RETRY_SECONDS,
   MIN_RELAY_SESSION_HOURS,
+  RECOMMENDED_MAX_RELAY_SESSION_HOURS,
+  describeGrabStatus,
   findConflictingRelayVm,
   isDefaultBareGdriveDir,
   isSingleShapeAccelerator,
+  isValidGrabRetrySeconds,
+  isValidRelayGrabTimeoutMinutes,
   isValidRelaySessionHours,
+  parseFallbackGpuInput,
   resolveEffectiveHighMem,
   resolveEffectiveRelayGdriveDir,
   resolveRelayCompletionView,
@@ -52,13 +60,28 @@ export function RelayPanel(props: {
     };
   });
   const [confirmReuseGdrive, setConfirmReuseGdrive] = useState(false);
+  const [fallbacksRaw, setFallbacksRaw] = useState<string>(() =>
+    (relay?.config?.fallback_gpus ?? []).join(", "),
+  );
+  const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000));
 
   // 运行中或后端已有配置时同步
   useEffect(() => {
     if (relay?.config) {
-      setCfg(relay.config);
+      setCfg({ ...DEFAULT_RELAY, ...relay.config });
+      setFallbacksRaw((relay.config.fallback_gpus ?? []).join(", "));
     }
   }, [running, relay?.config]);
+
+  const activeGrab = relay?.grab_status ?? vm.grab_status ?? null;
+  useEffect(() => {
+    if (!activeGrab?.active) return;
+    setNowSec(Math.floor(Date.now() / 1000));
+    const timer = window.setInterval(() => {
+      setNowSec(Math.floor(Date.now() / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [activeGrab?.active]);
 
   const rawIdx = PHASES.findIndex(([k]) => k === relay?.phase);
   const phaseIdx = relay?.phase === "cooldown" ? PHASES.length - 1 : rawIdx;
@@ -89,9 +112,24 @@ export function RelayPanel(props: {
     ? findConflictingRelayVm(cfg.gdrive_dir, vm.name, props.allVms ?? [])
     : undefined;
   const gdriveConflictBlocked = Boolean(conflictingVm && !confirmReuseGdrive);
+  const parsedFallbacks = parseFallbackGpuInput(fallbacksRaw, cfg.gpu_type);
+  const grabMode = cfg.grab_mode ?? "budget";
+  const grabBudgetValid =
+    grabMode !== "budget" || isValidRelayGrabTimeoutMinutes(cfg.grab_timeout_minutes ?? 60);
+  const grabRetryValid =
+    grabMode === "fast" ||
+    isValidGrabRetrySeconds(cfg.grab_retry_seconds ?? DEFAULT_RELAY_GRAB_RETRY_SECONDS);
+  const fallbacksValid = parsedFallbacks.invalid.length === 0;
+  const grabSummary = describeGrabStatus(activeGrab, nowSec);
 
   const disabled = running || props.pending || !!vm.busy;
-  const canStart = gdriveValid && hoursValid && !gdriveConflictBlocked;
+  const canStart =
+    gdriveValid &&
+    hoursValid &&
+    !gdriveConflictBlocked &&
+    grabBudgetValid &&
+    grabRetryValid &&
+    fallbacksValid;
 
   const billingUnknown = Boolean(vm.server_state_unknown || props.serverStateUnknown);
   const completionView = resolveRelayCompletionView(relay, billingUnknown);
@@ -122,6 +160,14 @@ export function RelayPanel(props: {
         gdrive_dir: overrideGdriveDir ?? cfg.gdrive_dir,
         high_mem: effectiveHighMem,
         reset_done_flag: overrideResetDoneFlag ?? cfg.reset_done_flag,
+        grab_mode: grabMode,
+        grab_timeout_minutes: Number.isFinite(cfg.grab_timeout_minutes)
+          ? Math.round(cfg.grab_timeout_minutes ?? 60)
+          : 60,
+        grab_retry_seconds: Number.isFinite(cfg.grab_retry_seconds)
+          ? Math.round(cfg.grab_retry_seconds ?? DEFAULT_RELAY_GRAB_RETRY_SECONDS)
+          : DEFAULT_RELAY_GRAB_RETRY_SECONDS,
+        fallback_gpus: parsedFallbacks.gpus,
       },
       legacyGdriveAction ?? null,
     );
@@ -216,6 +262,16 @@ export function RelayPanel(props: {
         </div>
       )}
 
+      {running && grabSummary && (
+        <div className="vm-alert-box vm-alert-warn" role="status" style={{ marginBottom: 10 }}>
+          <Loader2 size={14} className="spin" style={{ flexShrink: 0, marginTop: 2 }} />
+          <div className="vm-alert-content">
+            <div className="vm-alert-title">{grabSummary.headline}</div>
+            <div className="vm-alert-desc">{grabSummary.subline}</div>
+          </div>
+        </div>
+      )}
+
       <div className="steps" title={PHASES.map((p) => p[1]).join(" → ")}>
         {PHASES.map(([k, label], i) => (
           <div
@@ -288,6 +344,75 @@ export function RelayPanel(props: {
       {!hoursValid && (
         <div className="field-err">
           受限于 Colab 单次最长运行周期，单棒时长必须在 {MIN_RELAY_SESSION_HOURS} ~ {MAX_RELAY_SESSION_HOURS} 小时之间。
+        </div>
+      )}
+      {hoursValid && cfg.max_session_hours > RECOMMENDED_MAX_RELAY_SESSION_HOURS && !running && (
+        <div className="field-hint" style={{ color: "var(--warn)" }}>
+          提示：推荐单棒时长 ≤ {RECOMMENDED_MAX_RELAY_SESSION_HOURS}h，为换棒前模型断点上传预留充足缓冲时间。
+        </div>
+      )}
+
+      <div className="form-grid" style={{ marginTop: 8 }}>
+        <div className="field">
+          <label>抢卡策略</label>
+          <select
+            value={grabMode}
+            disabled={disabled}
+            onChange={(e) => set("grab_mode", e.target.value)}
+          >
+            <option value="budget">限时蹲守 (排队0计费)</option>
+            <option value="persistent">一直抢卡 (无限蹲守)</option>
+            <option value="fast">单次探卡 (无卡立停)</option>
+          </select>
+        </div>
+        {grabMode === "budget" && (
+          <div className="field">
+            <label>抢卡预算 (分钟)</label>
+            <input
+              type="number"
+              min={1}
+              max={1440}
+              value={Number.isFinite(cfg.grab_timeout_minutes) ? cfg.grab_timeout_minutes : ""}
+              disabled={disabled}
+              style={!grabBudgetValid ? { borderColor: "var(--danger)" } : undefined}
+              onChange={(e) => {
+                const raw = e.target.value;
+                set("grab_timeout_minutes", raw === "" ? Number.NaN : Number(raw));
+              }}
+            />
+          </div>
+        )}
+        {grabMode !== "fast" && (
+          <div className="field">
+            <label>重试间隔 (s)</label>
+            <input
+              type="number"
+              min={MIN_GRAB_RETRY_SECONDS}
+              max={MAX_GRAB_RETRY_SECONDS}
+              value={Number.isFinite(cfg.grab_retry_seconds) ? cfg.grab_retry_seconds : ""}
+              disabled={disabled}
+              style={!grabRetryValid ? { borderColor: "var(--danger)" } : undefined}
+              onChange={(e) => {
+                const raw = e.target.value;
+                set("grab_retry_seconds", raw === "" ? Number.NaN : Number(raw));
+              }}
+            />
+          </div>
+        )}
+        <div className="field">
+          <label>备选卡型 (可选)</label>
+          <input
+            value={fallbacksRaw}
+            placeholder="如 G4, L4（留空不换卡）"
+            disabled={disabled}
+            style={!fallbacksValid ? { borderColor: "var(--danger)" } : undefined}
+            onChange={(e) => setFallbacksRaw(e.target.value)}
+          />
+        </div>
+      </div>
+      {!fallbacksValid && (
+        <div className="field-err">
+          不支持的备选卡型：{parsedFallbacks.invalid.join(", ")}
         </div>
       )}
 

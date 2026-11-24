@@ -44,6 +44,7 @@ import type {
 import { fmtDuration, fmtSnapshotTime, formatRealtimeTps, num, numOrNull, pct, shortEndpoint, str } from "../format";
 import {
   DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
+  describeGrabStatus,
   isLlmVm,
   isLlmVmReady,
   resolveKeepAliveBadge,
@@ -788,6 +789,7 @@ export function VmCard({
   onOpenScriptDialog,
   onSetKeepAlive,
   onPingKeepAlive,
+  onCancelCreate,
 }: {
   vm: VmView;
   allVms?: VmView[];
@@ -809,10 +811,13 @@ export function VmCard({
   onOpenScriptDialog?: (vm: VmView) => void;
   onSetKeepAlive?: (name: string, config: KeepAliveConfig) => Promise<void>;
   onPingKeepAlive?: (name: string) => Promise<void>;
+  onCancelCreate?: (name: string) => Promise<void>;
 }) {
   const [probingLocal, setProbingLocal] = useState(false);
   const [relayPending, setRelayPending] = useState(false);
   const [dismissingRelay, setDismissingRelay] = useState(false);
+  const [cancellingGrab, setCancellingGrab] = useState(false);
+  const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000));
   // #76 & #73：当接力运行中或为离线接力记录时初始展开一次，但允许用户随时手动点击折叠/展开
   const [relayExpanded, setRelayExpanded] = useState<boolean>(
     () => Boolean(vm.relay?.running) || (!vm.on_server && Boolean(vm.relay)),
@@ -852,6 +857,32 @@ export function VmCard({
   const offlineRelayView = isOfflineRelayRecord
     ? resolveRelayCompletionView(vm.relay, isBillingUnknown)
     : null;
+  const activeGrab = vm.grab_status ?? vm.relay?.grab_status ?? null;
+  const isGrabbing =
+    !vm.on_server &&
+    (isCreating ||
+      Boolean(activeGrab?.active) ||
+      Boolean(vm.relay?.running && vm.relay?.phase === "provisioning"));
+  const grabSummary = describeGrabStatus(activeGrab, nowSec);
+
+  useEffect(() => {
+    if (!activeGrab?.active) return;
+    setNowSec(Math.floor(Date.now() / 1000));
+    const timer = window.setInterval(() => {
+      setNowSec(Math.floor(Date.now() / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [activeGrab?.active]);
+
+  const handleCancelGrabClick = async () => {
+    if (!onCancelCreate || cancellingGrab) return;
+    setCancellingGrab(true);
+    try {
+      await onCancelCreate(vm.name);
+    } finally {
+      setCancellingGrab(false);
+    }
+  };
 
   const gpu = t?.gpu;
   const rawProcs = t?.threads?.processes;
@@ -988,6 +1019,28 @@ export function VmCard({
           >
             <MessageSquare size={13} />
             <span>{isDeployingLlm ? "部署预热中…" : llmReady ? "大模型对话" : "等待模型就绪"}</span>
+          </button>
+        )}
+
+        {isGrabbing && onCancelCreate && (
+          <button
+            type="button"
+            className="btn btn-danger-ghost btn-sm"
+            onClick={handleCancelGrabClick}
+            disabled={cancellingGrab || isDeleting}
+            title={`立即放弃抢卡并清理残留分配 (${vm.name})`}
+          >
+            {cancellingGrab ? (
+              <>
+                <Loader2 size={13} className="spin" />
+                <span>停止抢卡中…</span>
+              </>
+            ) : (
+              <>
+                <PowerOff size={13} />
+                <span>放弃抢卡</span>
+              </>
+            )}
           </button>
         )}
 
@@ -1225,17 +1278,46 @@ export function VmCard({
               </div>
             )}
           </div>
+        ) : isCreating || activeGrab?.active ? (
+          <div className="vm-alert-box vm-alert-warn" role="status" style={{ alignItems: "center" }}>
+            <Loader2 size={15} className="spin" style={{ flexShrink: 0 }} />
+            <div className="vm-alert-content">
+              <div className="vm-alert-title">
+                {grabSummary
+                  ? grabSummary.headline
+                  : `正在 Google Colab 云端请求分配 [${vm.accelerator}] 算力实例…`}
+              </div>
+              <div className="vm-alert-desc">
+                {grabSummary
+                  ? grabSummary.subline
+                  : "分配成功后将自动注入遥测探针与免密 SSH；您可随时点击右侧「放弃抢卡」终止请求。"}
+              </div>
+            </div>
+            {onCancelCreate && (
+              <div className="vm-alert-actions">
+                <button
+                  type="button"
+                  className="btn btn-danger-ghost btn-sm"
+                  onClick={handleCancelGrabClick}
+                  disabled={cancellingGrab}
+                >
+                  {cancellingGrab ? <Loader2 size={12} className="spin" /> : <PowerOff size={12} />}
+                  <span>{cancellingGrab ? "停止中…" : "放弃抢卡"}</span>
+                </button>
+              </div>
+            )}
+          </div>
         ) : (
           <div className="probe-line">
             <Loader2 size={14} className="spin" />
             <span>
-              {isCreating
-                ? "正在 Google Colab 云端分配算力实例并配置免密 SSH…"
-                : isDeployingLlm
-                  ? "正在云端拉取大模型权重并启动推理服务（首次预热约需 1–5 分钟）…"
+              {isDeployingLlm
+                ? "正在云端拉取大模型权重并启动推理服务（首次预热约需 1–5 分钟）…"
+                : vm.busy === "initializing_env"
+                  ? "正在后台同步环境配置与安装预装依赖…"
                   : "正在连接遥测…"}
             </span>
-            {!isCreating && onRetryProbe && vm.on_server && (
+            {onRetryProbe && vm.on_server && (
               <button
                 type="button"
                 className="copy-chip-btn"

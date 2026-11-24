@@ -1901,3 +1901,23 @@ summary:focus-visible {
     grid-template-columns: 1fr;
   }
 }
+
+/* ───────────────────── 开机抢卡策略与接力换棒准备样式 ───────────────────── */
+.cfg-panel-grab {
+  background: linear-gradient(180deg, #fffbf2 0%, #ffffff 100%);
+  border-color: #f6dfaf;
+}
+.grab-policy-subbox {
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px dashed #e6cfa4;
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.banner-info {
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  color: #1e40af;
+}

@@ -1363,3 +1363,86 @@ test("Per-instance Keep-Alive: default creation config, interval validation, bad
   assert.match(vmCardSrc, /function KeepAliveBar/);
   assert.match(vmCardSrc, /立即保活/);
 });
+
+test("GPU grab policy modes, cancel_create_vm API, countdown formatter, and Relay handover prep", async () => {
+  assert.equal(chatUtils.isValidGrabRetrySeconds(15), true);
+  assert.equal(chatUtils.isValidGrabRetrySeconds(3), false);
+  assert.equal(chatUtils.isValidGrabRetrySeconds(301), false);
+  assert.equal(chatUtils.isValidRelayGrabTimeoutMinutes(60), true);
+  assert.equal(chatUtils.isValidRelayGrabTimeoutMinutes(0), false);
+  assert.equal(chatUtils.isValidRelayGrabTimeoutMinutes(1441), false);
+
+  const parsedFb = chatUtils.parseFallbackGpuInput("g4, L4, A100, g4, rtx4090", "A100");
+  assert.deepEqual(parsedFb.gpus, ["G4", "L4"]);
+  assert.deepEqual(parsedFb.invalid, ["rtx4090"]);
+
+  const waitingDesc = chatUtils.describeGrabStatus(
+    {
+      active: true,
+      mode: "persistent",
+      attempt: 3,
+      max_attempts: null,
+      budget_minutes: null,
+      retry_seconds: 15,
+      started_at: 1000,
+      next_retry_at: 1082,
+      target_gpu: "G4",
+      phase: "waiting_retry",
+      last_error: "云端 [A100] 算力当前库存暂时售罄",
+    },
+    1070,
+  );
+  assert.ok(waitingDesc);
+  assert.equal(waitingDesc.countdownSec, 12);
+  assert.equal(waitingDesc.elapsedSec, 70);
+  assert.match(waitingDesc.headline, /12 秒后自动发起第 4 次抢卡/);
+  assert.match(waitingDesc.subline, /一直抢卡模式/);
+
+  const pillSpec = chatUtils.resolveVmStatusPillSpec(
+    {
+      name: "grab-vm",
+      busy: "creating",
+      on_server: false,
+      grab_status: {
+        active: true,
+        mode: "persistent",
+        attempt: 5,
+        max_attempts: null,
+        budget_minutes: null,
+        retry_seconds: 15,
+        started_at: 1000,
+        next_retry_at: null,
+        target_gpu: "A100",
+        phase: "requesting",
+        last_error: null,
+      },
+    },
+    false,
+  );
+  assert.equal(pillSpec.cls, "pill-amber");
+  assert.equal(pillSpec.pulse, true);
+  assert.match(pillSpec.text, /一直抢卡中 · 第 5 次/);
+
+  mockTauriCore.invokeCalls.length = 0;
+  await apiMod.api.cancelCreateVm("grab-vm");
+  assert.deepEqual(mockTauriCore.invokeCalls[0], {
+    cmd: "cancel_create_vm",
+    args: { name: "grab-vm" },
+  });
+
+  const createDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "CreateVmDialog.tsx"),
+    "utf8",
+  );
+  assert.match(createDlgSrc, /开机抢卡策略/);
+  assert.match(createDlgSrc, /放弃抢卡/);
+  assert.match(createDlgSrc, /转入后台抢卡/);
+  assert.match(createDlgSrc, /换棒抢卡策略与时间预算/);
+
+  const relayPanelSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "RelayPanel.tsx"),
+    "utf8",
+  );
+  assert.match(relayPanelSrc, /抢卡策略/);
+  assert.match(relayPanelSrc, /备选卡型/);
+});

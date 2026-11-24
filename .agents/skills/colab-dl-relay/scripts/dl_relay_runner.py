@@ -121,6 +121,29 @@ def format_colab_alloc_error(accelerator: str, raw_output: str) -> str:
     return cleaned
 
 
+def is_fatal_colab_alloc_error(raw_output: str) -> bool:
+    low = strip_colab_cli_banners(raw_output).lower()
+    return any(
+        k in low
+        for k in ("401", "unauthorized", "not logged in", "invalid_grant", "no such option")
+    )
+
+
+def parse_fallback_gpus(primary_gpu: str, raw_fallbacks: str) -> List[str]:
+    primary = (primary_gpu or "T4").strip().upper() or "T4"
+    valid_set = {"CPU", "T4", "L4", "G4", "A100", "H100", "V5E1", "V6E1"}
+    out = [primary]
+    for item in (raw_fallbacks or "").split(","):
+        g = item.strip().upper()
+        if not g:
+            continue
+        if g not in valid_set:
+            raise ValueError(f"不支持的备选硬件加速器型号: {item.strip()}")
+        if g not in out:
+            out.append(g)
+    return out
+
+
 def allocate_colab_instance(
     colab_bin: str,
     session_name: str,
@@ -390,6 +413,9 @@ def run_cmd(cmd: List[str], timeout: int = 300, stdin_text: Optional[str] = None
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["NO_COLOR"] = "1"
+    if len(cmd) >= 2 and "colab" in os.path.basename(cmd[0]).lower() and "new" in cmd[1:4]:
+        env.setdefault("COLAB_CLI_ASSIGN_RETRIES", "0")
+        env.setdefault("COLAB_CLI_REQUEST_TIMEOUT", "300" if "--tpu" in cmd else "60")
     return subprocess.run(
         cmd,
         input=stdin_text,
@@ -905,6 +931,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--total-epochs", type=int, default=100, help="总训练轮次")
     parser.add_argument("--max-session-hours", type=float, default=22.5, help="单台实例最长运行小时数 (默认 22.5h)")
     parser.add_argument("--backup-interval-minutes", type=float, default=30.0, help="Google Drive 定时热备间隔 (分钟)")
+    parser.add_argument(
+        "--grab-mode",
+        choices=["budget", "persistent", "fast", "standard"],
+        default="budget",
+        help="抢卡策略: budget(限时蹲守，默认) | persistent(一直抢卡) | fast(单次探卡) | standard(标准3轮)",
+    )
+    parser.add_argument(
+        "--grab-timeout-minutes",
+        type=float,
+        default=60.0,
+        help="当 --grab-mode=budget 时每棒最长抢卡等待分钟数 (默认 60 分钟，换棒等待期间 0 CU 计费)",
+    )
+    parser.add_argument(
+        "--grab-retry-seconds",
+        type=float,
+        default=None,
+        help="抢卡失败后的重试等待秒数 (默认 20s)",
+    )
+    parser.add_argument(
+        "--fallback-gpus",
+        default="",
+        help="可选备选卡型列表，逗号分隔如 G4,L4 (默认空，绝不擅自更换用户指定卡型)",
+    )
     parser.add_argument("--reset-done-flag", action="store_true", help="启动第 1 棒时清除旧的完成标记")
     parser.add_argument("--detach", action="store_true", help="在后台独立启动守护进程（关闭 Antigravity 不中断）")
     return parser
@@ -939,7 +988,15 @@ def build_detached_child_cmd(
         str(args.max_session_hours),
         "--backup-interval-minutes",
         str(args.backup_interval_minutes),
+        "--grab-mode",
+        str(getattr(args, "grab_mode", "budget") or "budget"),
+        "--grab-timeout-minutes",
+        str(getattr(args, "grab_timeout_minutes", 60.0)),
     ]
+    if getattr(args, "grab_retry_seconds", None) is not None:
+        cmd.extend(["--grab-retry-seconds", str(args.grab_retry_seconds)])
+    if getattr(args, "fallback_gpus", ""):
+        cmd.extend(["--fallback-gpus", args.fallback_gpus])
     if args.session_prefix:
         cmd.extend(["--session-prefix", args.session_prefix])
     if args.allow_shared_gdrive_dir:
@@ -1121,11 +1178,30 @@ def main(argv: Optional[List[str]] = None) -> int:
                     timeout=90,
                 )
 
+        try:
+            candidate_gpus = parse_fallback_gpus(args.gpu, getattr(args, "fallback_gpus", ""))
+        except ValueError as ve:
+            print(f"❌ {ve}", flush=True)
+            return 1
+
+        grab_mode = (getattr(args, "grab_mode", "budget") or "budget").strip().lower()
+        grab_timeout_min = float(getattr(args, "grab_timeout_minutes", 60.0))
+        if grab_mode == "budget" and (grab_timeout_min <= 0 or grab_timeout_min > 1440):
+            print("❌ --grab-timeout-minutes 必须在 (0, 1440] 分钟之间", flush=True)
+            return 1
+
         effective_round = 1
         alloc_attempt = 0
+        round_grab_started_ts: Optional[float] = None
         fast_handover_streak = 0
         max_sec = int(args.max_session_hours * 3600)
         bk_sec = int(args.backup_interval_minutes * 60)
+        if args.max_session_hours > 22.5:
+            print(
+                f"⚠️ [换棒准备提示] 当前 --max-session-hours={args.max_session_hours:g}h 较接近 Colab 24h 强制回收线，"
+                f"推荐 ≤22.5h 以留足大模型断点上传缓冲窗口。",
+                flush=True,
+            )
 
         while True:
             print(
@@ -1182,27 +1258,60 @@ def main(argv: Optional[List[str]] = None) -> int:
                     )
                     return 1
 
+            if round_grab_started_ts is None:
+                round_grab_started_ts = time.monotonic()
+            target_gpu = candidate_gpus[alloc_attempt % len(candidate_gpus)]
+            alloc_timeout = 360 if target_gpu in TPU_ACCELERATORS else 150
             res_new = allocate_colab_instance(
                 colab_bin=colab_bin,
                 session_name=args.session,
-                accelerator=args.gpu,
+                accelerator=target_gpu,
                 high_mem=args.high_mem,
-                timeout=300,
+                timeout=alloc_timeout,
                 log_prefix=f"[Round #{effective_round}]",
             )
             if res_new.returncode != 0:
                 alloc_attempt += 1
-                err_msg = format_colab_alloc_error(args.gpu, (res_new.stderr or "") + "\n" + (res_new.stdout or ""))
+                combined_err = (res_new.stderr or "") + "\n" + (res_new.stdout or "")
+                err_msg = format_colab_alloc_error(target_gpu, combined_err)
+                if is_fatal_colab_alloc_error(combined_err):
+                    print(f"❌ [Round #{effective_round}] 授权或参数错误，停止重试: {err_msg}", flush=True)
+                    return 1
+                if grab_mode == "fast" and alloc_attempt >= len(candidate_gpus):
+                    print(f"❌ [Round #{effective_round} | 单次探卡失败] {err_msg}", flush=True)
+                    return 1
+                if grab_mode == "standard" and alloc_attempt >= max(3, len(candidate_gpus)):
+                    print(f"❌ [Round #{effective_round} | 标准重试 {alloc_attempt} 次均无卡] {err_msg}", flush=True)
+                    return 1
+                elapsed_grab_min = (time.monotonic() - round_grab_started_ts) / 60.0
+                if grab_mode == "budget" and elapsed_grab_min >= grab_timeout_min:
+                    print(
+                        f"❌ [Round #{effective_round} | 抢卡窗口超时] 在 {grab_timeout_min:g} 分钟预算内共尝试 {alloc_attempt} 次仍未分配到实例: {err_msg}",
+                        flush=True,
+                    )
+                    return 1
+                retry_sleep = (
+                    0.0
+                    if grab_mode == "fast"
+                    else float(
+                        ALLOC_RETRY_SLEEP_SECONDS
+                        if getattr(args, "grab_retry_seconds", None) is None
+                        else args.grab_retry_seconds
+                    )
+                )
+                next_gpu = candidate_gpus[alloc_attempt % len(candidate_gpus)]
+                q_note = "，排队期无运行实例 0 CU 计费" if effective_round > 1 else ""
                 print(
-                    f"[Round #{effective_round} | 分配重试 #{alloc_attempt}] 分配实例失败: {err_msg}，"
-                    f"{ALLOC_RETRY_SLEEP_SECONDS:g} 秒后重试（有效棒次保持为 Round #{effective_round}）...",
+                    f"[Round #{effective_round} | 分配重试 #{alloc_attempt}] [{target_gpu}] 分配失败: {err_msg}，"
+                    f"{retry_sleep:g} 秒后尝试 [{next_gpu}]（有效棒次保持为 Round #{effective_round}{q_note}）...",
                     flush=True,
                 )
-                if ALLOC_RETRY_SLEEP_SECONDS > 0:
-                    time.sleep(ALLOC_RETRY_SLEEP_SECONDS)
+                if retry_sleep > 0:
+                    time.sleep(retry_sleep)
                 continue
 
             alloc_attempt = 0
+            round_grab_started_ts = None
             ws_meta_local = os.path.join(workspace_abs, f".colab_workspace.{os.getpid()}.json")
             outcome = "failed"
             stop_ok = False
@@ -1266,10 +1375,20 @@ proc = subprocess.Popen(
     text=True,
     bufsize=1,
 )
+saw_handover = False
 for line in proc.stdout:
+    if "HANDOVER_REQUESTED" in line:
+        saw_handover = True
     print(line, end="", flush=True)
 proc.stdout.close()
 rc = proc.wait()
+if rc == 0 and saw_handover and os.path.exists("/content/rclone.conf"):
+    gd_target = {json.dumps(effective_gdrive_dir.rstrip('/'))}
+    ckpt_name = {json.dumps(ckpt_basename)}
+    ls_r = subprocess.run(["rclone", "--config", "/content/rclone.conf", "lsf", "--retries=3", "--", gd_target], capture_output=True, text=True)
+    remote_items = set((ls_r.stdout or "").splitlines()) if ls_r.returncode == 0 else set()
+    if ckpt_name not in remote_items and os.path.isfile(f"/content/{{ckpt_name}}") and os.path.getsize(f"/content/{{ckpt_name}}") > 0:
+        subprocess.run(["rclone", "--config", "/content/rclone.conf", "copyto", "--retries=3", "--", f"/content/{{ckpt_name}}", f"{{gd_target}}/{{ckpt_name}}"])
 print(f"TRAIN_EXIT_CODE={{rc}}", flush=True)
 if rc != 0:
     sys.exit(rc)

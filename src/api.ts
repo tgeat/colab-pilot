@@ -19,6 +19,7 @@ export const api = {
   getOverview: () => invoke<Overview>("get_overview"),
   refreshNow: () => invoke<Overview>("refresh_now"),
   createVm: (req: CreateVmRequest) => invoke<string>("create_vm", { req }),
+  cancelCreateVm: (name: string) => invoke<TerminateReceipt>("cancel_create_vm", { name }),
   deleteVm: (name: string, endpoint: string | null) =>
     invoke<TerminateReceipt>("delete_vm", { name, endpoint }),
   deployProbe: (name: string) => invoke<void>("deploy_probe", { name }),

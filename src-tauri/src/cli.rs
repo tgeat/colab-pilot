@@ -807,6 +807,8 @@ pub struct SessionProfile {
     #[serde(default)]
     pub keep_alive: Option<crate::KeepAliveConfig>,
     #[serde(default)]
+    pub grab_config: Option<crate::relay::GrabConfig>,
+    #[serde(default)]
     pub updated_at: Option<String>,
 }
 
@@ -2300,12 +2302,32 @@ pub async fn run_streaming<F>(
     timeout: Duration,
     cancel: Option<CancellationToken>,
     pid_slot: Option<&std::sync::Mutex<Option<u32>>>,
+    on_line: F,
+) -> Result<RunOutput>
+where
+    F: FnMut(&str),
+{
+    run_streaming_with_env(bin, args, &[], stdin_data, timeout, cancel, pid_slot, on_line).await
+}
+
+/// 运行命令（支持附加单次子进程环境变量覆盖，如控制 colab-cli 重试次数与请求超时）
+pub async fn run_streaming_with_env<F>(
+    bin: &PathBuf,
+    args: &[String],
+    extra_env: &[(&str, &str)],
+    stdin_data: Option<String>,
+    timeout: Duration,
+    cancel: Option<CancellationToken>,
+    pid_slot: Option<&std::sync::Mutex<Option<u32>>>,
     mut on_line: F,
 ) -> Result<RunOutput>
 where
     F: FnMut(&str),
 {
     let mut cmd = build_cmd(bin, args);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     if stdin_data.is_some() {
         cmd.stdin(Stdio::piped());
     }
@@ -2994,6 +3016,7 @@ mod tests {
                 llm_config: Some(saved_llm),
                 relay_config: None,
                 keep_alive: Some(crate::KeepAliveConfig::default()),
+                grab_config: None,
                 updated_at: None,
             },
         )

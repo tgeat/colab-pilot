@@ -456,9 +456,29 @@ function Dashboard() {
       if (req.boot_mode === "llm") {
         toast(`实例 [${createdName}] 已开机，正在后台部署大模型…`, "info");
       } else if (req.boot_mode === "relay" || req.auto_relay) {
-        toast(`实例 [${createdName}] 已开机，正在启动自动接力训练…`, "info");
+        toast(`实例 [${createdName}] 已启动后台接力监工与受控抢卡…`, "info");
       } else {
-        toast(`实例 [${createdName}] 已开机分配并自动配置免密 SSH`, "success");
+        toast(`实例 [${createdName}] 已分配就绪，正在后台配置监控与免密 SSH`, "success");
+      }
+      await refresh(false);
+    } catch (e) {
+      const msg = errText(e);
+      if (!msg.includes("放弃抢卡")) {
+        toast(msg, "error");
+      }
+      throw e;
+    }
+  };
+
+  const handleCancelCreateVm = async (name: string) => {
+    try {
+      const r = await api.cancelCreateVm(name);
+      if (r.verified_unassigned) {
+        toast(`已放弃抢卡 [${name}]，服务端核验无残留计费实例`, "info");
+      } else if (r.error) {
+        toast(`已停止抢卡 [${name}]，请留意核验：${r.error}`, "error");
+      } else {
+        toast(`已放弃抢卡 [${name}]`, "info");
       }
       await refresh(false);
     } catch (e) {
@@ -771,6 +791,7 @@ function Dashboard() {
                   onDismissRelay={handleDismissRelay}
                   onSetKeepAlive={handleSetKeepAlive}
                   onPingKeepAlive={handlePingKeepAlive}
+                  onCancelCreate={handleCancelCreateVm}
                   onOpenScriptDialog={(v) =>
                     setScriptTarget({
                       open: true,
@@ -845,6 +866,7 @@ function Dashboard() {
           preset={createPreset}
           onClose={() => setCreateOpen(false)}
           onCreate={handleCreateVm}
+          onCancelCreate={handleCancelCreateVm}
           onDeployLlmOnVm={handleDeployLlmOnVm}
         />
       </ErrorBoundary>

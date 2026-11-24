@@ -12,7 +12,7 @@ use anyhow::Context;
 use cli::{s, CliEventView, LlmApiAccessInfo, RecentSessionView, VmSshInfo, WorkspaceInfo};
 use colab::{Assignment, Ccu, ColabClient};
 use futures::future::join_all;
-use relay::{RelayConfig, RelayHandle, RelayStatus};
+use relay::{GrabConfig, GrabLoopOptions, GrabStatus, RelayConfig, RelayHandle, RelayStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -249,6 +249,8 @@ pub struct VmView {
     #[serde(default)]
     pub keep_alive: Option<KeepAliveStatus>,
     #[serde(default)]
+    pub grab_status: Option<GrabStatus>,
+    #[serde(default)]
     pub deploy_error: Option<String>,
     #[serde(default)]
     pub server_state_unknown: bool,
@@ -411,6 +413,12 @@ struct CreatingVmMeta {
     workspace_name: String,
     workspace_path: Option<String>,
     description: Option<String>,
+    had_ws_entry: bool,
+    cancel: tokio_util::sync::CancellationToken,
+    child_pid: Arc<Mutex<Option<u32>>>,
+    pre_provision_endpoints: Arc<Mutex<std::collections::HashSet<String>>>,
+    pre_provision_snapshot_invalid: Arc<std::sync::atomic::AtomicBool>,
+    grab_status: Arc<Mutex<Option<GrabStatus>>>,
 }
 
 struct SshBridgeTarget {
@@ -2336,6 +2344,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             ssh: Some(ssh_info),
             llm_api,
             keep_alive: Some(ka_status),
+            grab_status: None,
             deploy_error: deploy_errs.get(&d.name).cloned(),
             server_state_unknown: false,
         });
@@ -2378,6 +2387,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
                 && !h
                     .cloud_unassign_verified
                     .load(std::sync::atomic::Ordering::SeqCst));
+        let relay_grab = snap.grab_status.clone();
         ov.vms.push(VmView {
             name: name.clone(),
             workspace,
@@ -2393,6 +2403,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             cli_events,
             relay: Some(snap),
             busy: cur_busy,
+            grab_status: relay_grab,
             deploy_error: deploy_errs.get(&name).cloned(),
             server_state_unknown: card_state_unknown,
             ..Default::default()
@@ -2403,7 +2414,13 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
     for (name, meta) in creating_pending {
         let (cli_events, workspace) =
             creating_extra.next().unwrap_or_else(|| fallback_extra(&name));
-        let acc_upper = meta.accelerator.trim().to_uppercase();
+        let live_grab = meta.grab_status.l().clone();
+        let active_acc = live_grab
+            .as_ref()
+            .filter(|g| g.active && !g.target_gpu.is_empty())
+            .map(|g| g.target_gpu.clone())
+            .unwrap_or_else(|| meta.accelerator.clone());
+        let acc_upper = active_acc.trim().to_uppercase();
         let variant = if matches!(acc_upper.as_str(), "V5E1" | "V6E1") {
             "TPU".to_string()
         } else if acc_upper.is_empty() || acc_upper == "CPU" || acc_upper == "NONE" {
@@ -2432,6 +2449,7 @@ async fn refresh_overview_opts(app: &Arc<AppState>, force_gdrive: bool, wait: bo
             cli_events,
             busy: cur_busy,
             keep_alive: ka_creating,
+            grab_status: live_grab,
             deploy_error: deploy_errs.get(&name).cloned(),
             ..Default::default()
         });
@@ -2689,10 +2707,30 @@ pub async fn hard_terminate(
     };
 
     let mut stopped_local_relay = false;
+    let mut stopped_creating_vm = false;
     let mut stopped_during_provisioning = false;
     let mut pre_prov_snapshot_invalid = true;
     let mut pre_prov_endpoints: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let removed_creating = app.creating_vms.l().remove(name);
+    if let Some(cm) = removed_creating {
+        cm.cancel.cancel();
+        let pid = *cm.child_pid.l();
+        if let Some(pid) = pid {
+            cli::kill_pid_tree(pid).await;
+        }
+        stopped_creating_vm = true;
+        stopped_during_provisioning = true;
+        pre_prov_endpoints = cm.pre_provision_endpoints.l().clone();
+        pre_prov_snapshot_invalid = cm
+            .pre_provision_snapshot_invalid
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
+        if !cm.had_ws_entry && !cli::read_sessions().contains_key(name) {
+            cli::remove_workspace_entry(name);
+        }
+        r.steps
+            .push("已取消本机抢卡创建任务并结束 colab 子进程树".into());
+    }
     if let Some(h) = app.relay(name) {
         if stop_relay {
             h.keep_vm_on_stop
@@ -2720,7 +2758,7 @@ pub async fn hard_terminate(
             .swap(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    if stopped_local_relay {
+    if stopped_local_relay || stopped_creating_vm {
         tokio::time::sleep(Duration::from_millis(if cfg!(test) { 10 } else { 300 })).await;
     }
 
@@ -2829,14 +2867,24 @@ pub async fn hard_terminate(
                 let unaccounted: Vec<String> = r
                     .remaining_endpoints
                     .iter()
-                    .filter(|e| !other_session_endpoints.contains(*e))
+                    .filter(|e| {
+                        !other_session_endpoints.contains(*e)
+                            && !(stopped_during_provisioning
+                                && !pre_prov_snapshot_invalid
+                                && pre_prov_endpoints.contains(*e))
+                    })
                     .cloned()
                     .collect();
                 let can_verify_absent = list.is_empty()
-                    || ((stopped_local_relay || managed) && unaccounted.is_empty());
+                    || ((stopped_local_relay || stopped_creating_vm || managed)
+                        && unaccounted.is_empty());
                 if can_verify_absent {
                     r.verified_unassigned = true;
-                    if stopped_local_relay {
+                    if stopped_creating_vm {
+                        r.steps.push(
+                            "服务端核验通过：已放弃抢卡且未产生残留计费实例".into(),
+                        );
+                    } else if stopped_local_relay {
                         r.steps.push(
                             "服务端核验通过：未产生未受管残留计费实例，本机接力任务已终止".into(),
                         );
@@ -3501,6 +3549,8 @@ pub struct CreateVmRequest {
     pub env_config: Option<CreateVmEnvConfig>,
     #[serde(default)]
     pub keep_alive: Option<KeepAliveConfig>,
+    #[serde(default)]
+    pub grab_config: Option<GrabConfig>,
 }
 
 fn valid_name(n: &str) -> bool {
@@ -4124,6 +4174,7 @@ pub(crate) struct PreparedCreateVm {
     pub relay_auto_isolated: bool,
     pub validated_llm_cfg: Option<CreateVmLlmConfig>,
     pub validated_keep_alive: KeepAliveConfig,
+    pub validated_grab_cfg: GrabConfig,
 }
 
 pub(crate) fn validate_and_prepare_create_vm(
@@ -4302,6 +4353,11 @@ pub(crate) fn validate_and_prepare_create_vm(
         .unwrap_or_default()
         .validate()?;
 
+    let validated_grab_cfg = relay::validate_grab_config(
+        &req.grab_config.clone().unwrap_or_default(),
+    )
+    .map_err(|e| e.to_string())?;
+
     Ok(PreparedCreateVm {
         name,
         boot_mode,
@@ -4314,7 +4370,59 @@ pub(crate) fn validate_and_prepare_create_vm(
         relay_auto_isolated,
         validated_llm_cfg,
         validated_keep_alive,
+        validated_grab_cfg,
     })
+}
+
+pub(crate) async fn cancel_create_vm_inner(
+    app: &Arc<AppState>,
+    name: &str,
+) -> Result<TerminateReceipt, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || !valid_name(trimmed) {
+        return Err("非法的实例名称".into());
+    }
+    let has_creating = app.creating_vms.l().contains_key(trimmed);
+    let has_relay = app
+        .relay(trimmed)
+        .map(|h| h.is_running() || h.task_alive.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false);
+    let busy_creating = matches!(
+        app.busy.l().get(trimmed).map(String::as_str),
+        Some("creating" | "probing" | "initializing_env")
+    );
+    if !has_creating && !has_relay && !busy_creating {
+        return Ok(TerminateReceipt {
+            name: trimmed.into(),
+            verified_unassigned: true,
+            steps: vec!["抢卡任务已结束或不存在".into()],
+            ..Default::default()
+        });
+    }
+    let receipt = hard_terminate(app, trimmed, None, true).await;
+    app.release_busy(trimmed, "creating");
+    app.release_busy(trimmed, "probing");
+    app.release_busy(trimmed, "initializing_env");
+    if receipt.verified_unassigned && !cli::read_sessions().contains_key(trimmed) {
+        if let Some(h) = app.relay(trimmed) {
+            if !h.is_running() && h.status.l().round <= 1 && !h.status.l().training_completed {
+                app.relays.l().remove(trimmed);
+            }
+        }
+    }
+    Ok(receipt)
+}
+
+#[tauri::command]
+async fn cancel_create_vm(
+    handle: AppHandle,
+    state: AppStateRef<'_>,
+    name: String,
+) -> Result<TerminateReceipt, String> {
+    let app = state.inner().clone();
+    let receipt = cancel_create_vm_inner(&app, &name).await?;
+    spawn_refresh(&app, &handle);
+    Ok(receipt)
 }
 
 #[tauri::command]
@@ -4339,16 +4447,6 @@ async fn create_vm(
         name.clone(),
         VmKeepAliveRuntime::from_config(prep.validated_keep_alive.clone(), None),
     );
-    app.creating_vms.l().insert(
-        name.clone(),
-        CreatingVmMeta {
-            accelerator: req.accelerator.clone(),
-            high_mem: effective_high_mem,
-            workspace_name: ws_display_name.clone(),
-            workspace_path: Some(effective_ws_dir.to_string_lossy().to_string()),
-            description: desc_clean.clone(),
-        },
-    );
     let had_ws_entry = cli::has_workspace_entry(&name);
     cli::register_workspace_entry(
         &name,
@@ -4356,32 +4454,7 @@ async fn create_vm(
         Some(&effective_ws_dir.to_string_lossy()),
         desc_clean.as_deref(),
     );
-    spawn_refresh(&app, &handle);
 
-    let res = relay::colab_new_with_opts(
-        &name,
-        &req.accelerator,
-        effective_high_mem,
-        prep.auth_mode.as_deref(),
-        None,
-        None,
-        &|_l: &str| {},
-    )
-    .await;
-    app.creating_vms.l().remove(&name);
-    *app.last_assignments.l() = None;
-
-    if let Err(e) = res {
-        if !had_ws_entry && !cli::read_sessions().contains_key(&name) {
-            cli::remove_workspace_entry(&name);
-        }
-        app.keep_alive.l().remove(&name);
-        app.set_busy(&name, None);
-        spawn_refresh(&app, &handle);
-        return Err(format!("{e:#}"));
-    }
-
-    // 持久化会话工作模式、认证方式、保活策略与硬件/模式参数（#74 + #43），确保后续命令自动携带 --auth adc 且重启后自动续跑保活
     let norm_acc = {
         let u = req.accelerator.trim().to_ascii_uppercase();
         if u.is_empty() || u == "NONE" {
@@ -4390,44 +4463,23 @@ async fn create_vm(
             u
         }
     };
-    let session_profile = cli::SessionProfile {
-        boot_mode: prep.boot_mode.clone(),
-        accelerator: norm_acc,
-        high_mem: effective_high_mem,
-        workspace_path: Some(effective_ws_dir.to_string_lossy().to_string()),
-        auth_mode: prep.auth_mode.clone(),
-        llm_config: prep.validated_llm_cfg.clone(),
-        relay_config: prep.validated_relay_cfg.clone(),
-        keep_alive: Some(prep.validated_keep_alive.clone()),
-        updated_at: None,
-    };
-    let _ = cli::save_session_profile(&name, &session_profile);
 
-    if prep.validated_relay_cfg.is_none() {
-        let mut map = app.relays.l();
-        if map.get(&name).map(|h| !h.is_running()).unwrap_or(false) {
-            map.remove(&name);
-        }
-    }
-
-    app.set_busy(&name, Some("probing"));
-    spawn_refresh(&app, &handle);
-    let _ = deploy_probe_inner(&app, &name).await;
-
-    if let Some(ref env_cfg) = req.env_config {
-        if has_enabled_env_steps(env_cfg) {
-            app.set_busy(&name, Some("initializing_env"));
-            spawn_refresh(&app, &handle);
-            if let Err(e) =
-                apply_post_boot_env_config(&app, &name, &effective_ws_dir, env_cfg).await
-            {
-                app.set_deploy_error(&name, Some(format!("{e:#}")));
-            }
-        }
-    }
-    app.set_busy(&name, None);
-
+    // 接力训练模式：直接移交后台接力监工执行网盘预检与第 1 棒受控抢卡，弹窗秒关并在卡片/接力面板实时展示抢卡进度
     if let Some(cfg) = prep.validated_relay_cfg {
+        let session_profile = cli::SessionProfile {
+            boot_mode: prep.boot_mode.clone(),
+            accelerator: norm_acc,
+            high_mem: effective_high_mem,
+            workspace_path: Some(effective_ws_dir.to_string_lossy().to_string()),
+            auth_mode: prep.auth_mode.clone(),
+            llm_config: None,
+            relay_config: Some(cfg.clone()),
+            keep_alive: Some(prep.validated_keep_alive.clone()),
+            grab_config: Some(prep.validated_grab_cfg.clone()),
+            updated_at: None,
+        };
+        let _ = cli::save_session_profile(&name, &session_profile);
+        app.release_busy(&name, "creating");
         start_relay_inner(
             &app,
             &name,
@@ -4437,34 +4489,171 @@ async fn create_vm(
             prep.relay_auto_isolated,
             None,
         );
-    } else if let Some(llm_cfg) = prep.validated_llm_cfg {
-        if let Err(e) = spawn_llm_deployment_task(
-            app.clone(),
-            handle.clone(),
-            name.clone(),
-            req.accelerator.clone(),
-            effective_high_mem,
-            effective_ws_dir,
-            llm_cfg,
-        ) {
-            app.set_deploy_error(&name, Some(e));
+        spawn_refresh(&app, &handle);
+        return Ok(name);
+    }
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let child_pid = Arc::new(Mutex::new(None));
+    let pre_prov_eps = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let pre_prov_invalid = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let grab_slot = Arc::new(Mutex::new(None));
+
+    app.creating_vms.l().insert(
+        name.clone(),
+        CreatingVmMeta {
+            accelerator: req.accelerator.clone(),
+            high_mem: effective_high_mem,
+            workspace_name: ws_display_name.clone(),
+            workspace_path: Some(effective_ws_dir.to_string_lossy().to_string()),
+            description: desc_clean.clone(),
+            had_ws_entry,
+            cancel: cancel.clone(),
+            child_pid: child_pid.clone(),
+            pre_provision_endpoints: pre_prov_eps.clone(),
+            pre_provision_snapshot_invalid: pre_prov_invalid.clone(),
+            grab_status: grab_slot.clone(),
+        },
+    );
+    spawn_refresh(&app, &handle);
+
+    let grab_opts = GrabLoopOptions {
+        name: name.clone(),
+        primary_gpu: req.accelerator.clone(),
+        fallback_gpus: prep.validated_grab_cfg.fallback_gpus.clone(),
+        high_mem: effective_high_mem,
+        auth_mode: prep.auth_mode.clone(),
+        mode: prep.validated_grab_cfg.mode.clone(),
+        budget_minutes: None,
+        retry_seconds: prep.validated_grab_cfg.retry_seconds,
+        cancel: Some(cancel.clone()),
+    };
+
+    let app_for_status = app.clone();
+    let handle_for_status = handle.clone();
+    let grab_slot_cb = grab_slot.clone();
+    let res = relay::grab_colab_vm_loop(
+        &grab_opts,
+        Some((&app, &pre_prov_eps, &pre_prov_invalid)),
+        Some(&child_pid),
+        &move |gs: &GrabStatus| {
+            *grab_slot_cb.l() = Some(gs.clone());
+            spawn_refresh(&app_for_status, &handle_for_status);
+        },
+        &|_l: &str| {},
+    )
+    .await;
+
+    app.creating_vms.l().remove(&name);
+    *app.last_assignments.l() = None;
+
+    let allocated_acc = match res {
+        Ok(acc) => acc,
+        Err(e) => {
+            if !had_ws_entry && !cli::read_sessions().contains_key(&name) {
+                cli::remove_workspace_entry(&name);
+            }
+            app.keep_alive.l().remove(&name);
+            app.release_busy(&name, "creating");
+            spawn_refresh(&app, &handle);
+            return Err(format!("{e:#}"));
+        }
+    };
+
+    // 持久化会话工作模式、认证方式、保活策略、抢卡策略与实际分配硬件（#74 + #43）
+    let final_acc = if allocated_acc.trim().is_empty() {
+        norm_acc
+    } else {
+        allocated_acc
+    };
+    let session_profile = cli::SessionProfile {
+        boot_mode: prep.boot_mode.clone(),
+        accelerator: final_acc.clone(),
+        high_mem: effective_high_mem,
+        workspace_path: Some(effective_ws_dir.to_string_lossy().to_string()),
+        auth_mode: prep.auth_mode.clone(),
+        llm_config: prep.validated_llm_cfg.clone(),
+        relay_config: None,
+        keep_alive: Some(prep.validated_keep_alive.clone()),
+        grab_config: Some(prep.validated_grab_cfg.clone()),
+        updated_at: None,
+    };
+    let _ = cli::save_session_profile(&name, &session_profile);
+
+    {
+        let mut map = app.relays.l();
+        if map.get(&name).map(|h| !h.is_running()).unwrap_or(false) {
+            map.remove(&name);
         }
     }
 
-    if prep.validated_keep_alive.enabled {
-        let app_ka = app.clone();
-        let handle_ka = handle.clone();
-        let name_ka = name.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Some(a) = app_ka.find_assignment_by_name(&name_ka).await {
-                let _ = run_keep_alive_tick_for_vm(&app_ka, &name_ka, &a, None, true).await;
-                let ov = refresh_overview_opts(&app_ka, false, true).await;
-                emit_overview(&handle_ka, &ov);
-            }
-        });
-    }
-
+    // Session READY 后立即返回释放弹窗，遥测探针、环境依赖、LLM 部署与首轮保活全部转入后台异步推进
+    app.set_busy(&name, Some("probing"));
     spawn_refresh(&app, &handle);
+
+    let app_bg = app.clone();
+    let handle_bg = handle.clone();
+    let name_bg = name.clone();
+    let env_cfg_bg = req.env_config.clone();
+    let ws_bg = effective_ws_dir.clone();
+    let llm_cfg_bg = prep.validated_llm_cfg.clone();
+    let ka_enabled = prep.validated_keep_alive.enabled;
+    tauri::async_runtime::spawn(async move {
+        if app_bg.is_deleting(&name_bg) {
+            return;
+        }
+        let _ = deploy_probe_inner(&app_bg, &name_bg).await;
+
+        if !app_bg.is_deleting(&name_bg) {
+            if let Some(ref env_cfg) = env_cfg_bg {
+                if has_enabled_env_steps(env_cfg) {
+                    app_bg.set_busy(&name_bg, Some("initializing_env"));
+                    spawn_refresh(&app_bg, &handle_bg);
+                    if let Err(e) =
+                        apply_post_boot_env_config(&app_bg, &name_bg, &ws_bg, env_cfg).await
+                    {
+                        app_bg.set_deploy_error(&name_bg, Some(format!("{e:#}")));
+                    }
+                }
+            }
+        }
+
+        {
+            let should_clear = matches!(
+                app_bg.busy.l().get(&name_bg).map(String::as_str),
+                Some("probing" | "initializing_env" | "creating")
+            );
+            if should_clear {
+                app_bg.set_busy(&name_bg, None);
+            }
+        }
+
+        if !app_bg.is_deleting(&name_bg) {
+            if let Some(llm_cfg) = llm_cfg_bg {
+                if let Err(e) = spawn_llm_deployment_task(
+                    app_bg.clone(),
+                    handle_bg.clone(),
+                    name_bg.clone(),
+                    final_acc,
+                    effective_high_mem,
+                    ws_bg,
+                    llm_cfg,
+                ) {
+                    app_bg.set_deploy_error(&name_bg, Some(e));
+                }
+            }
+        }
+
+        if ka_enabled && !app_bg.is_deleting(&name_bg) {
+            if let Some(a) = app_bg.find_assignment_by_name(&name_bg).await {
+                let _ = run_keep_alive_tick_for_vm(&app_bg, &name_bg, &a, None, true).await;
+            }
+        }
+
+        let ov = refresh_overview_opts(&app_bg, false, true).await;
+        emit_overview(&handle_bg, &ov);
+    });
+
     Ok(name)
 }
 
@@ -7563,6 +7752,7 @@ pub fn run() {
             get_overview,
             refresh_now,
             create_vm,
+            cancel_create_vm,
             delete_vm,
             deploy_probe,
             start_relay,
@@ -8350,6 +8540,7 @@ sys.exit(rc)
                 llm_config: None,
                 relay_config: None,
                 keep_alive: None,
+                grab_config: None,
                 updated_at: None,
             },
         )
@@ -8666,6 +8857,7 @@ sys.exit(rc)
                     backup_interval_minutes: 20.0,
                     total_epochs: 50,
                     reset_done_flag: false,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -9665,6 +9857,280 @@ sys.exit(rc)
             "scheduled tick must skip paused keep-alive VM"
         );
 
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        *cli::TEST_RCLONE_CONF.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_grab_modes_fallback_env_and_cancel_create_vm() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let py = cli::colab_python_bin();
+        if !py.exists() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("pilot_grab_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let tok_file = cfg_dir.join("token.json");
+        std::fs::write(
+            &tok_file,
+            r#"{"token":"grab-test-token","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(cfg_dir.join("sessions.json"), "{}").unwrap();
+        std::fs::write(cfg_dir.join("rclone.conf"), "[gdrive]\ntype = drive\n").unwrap();
+
+        // 1. Verify differentiated request timeouts for GPU/CPU (60s) vs TPU cold boot (300s)
+        assert_eq!(
+            relay::colab_assign_env_for_gpu("A100"),
+            ("60", Duration::from_secs(150))
+        );
+        assert_eq!(
+            relay::colab_assign_env_for_gpu("V6E1"),
+            ("300", Duration::from_secs(360))
+        );
+
+        // 2. Mock Colab CLI script recording COLAB_CLI_ASSIGN_RETRIES & COLAB_CLI_REQUEST_TIMEOUT
+        let env_log = tmp.join("colab_env_log.jsonl");
+        let colab_py = tmp.join("mock_colab_grab.py");
+        std::fs::write(
+            &colab_py,
+            r#"import json, os, sys
+log_path = os.environ.get("MOCK_COLAB_ENV_LOG", "")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "argv": sys.argv[1:],
+            "retries": os.environ.get("COLAB_CLI_ASSIGN_RETRIES"),
+            "timeout": os.environ.get("COLAB_CLI_REQUEST_TIMEOUT"),
+        }) + "\n")
+if "new" in sys.argv[1:]:
+    if "--gpu" in sys.argv and sys.argv[sys.argv.index("--gpu") + 1] == "A100":
+        sys.stderr.write("Error: HTTP 503 Service Unavailable\n")
+        sys.exit(1)
+    sys.stdout.write("Session READY\n")
+    sys.exit(0)
+sys.exit(0)
+"#,
+        )
+        .unwrap();
+
+        #[cfg(windows)]
+        let mock_colab = {
+            let cmd_path = tmp.join("mock_colab_grab.cmd");
+            std::fs::write(
+                &cmd_path,
+                format!("@echo off\r\n\"{}\" \"{}\" %*\r\n", py.display(), colab_py.display()),
+            )
+            .unwrap();
+            cmd_path
+        };
+        #[cfg(not(windows))]
+        let mock_colab = {
+            use std::os::unix::fs::PermissionsExt;
+            let sh_path = tmp.join("mock_colab_grab.sh");
+            std::fs::write(
+                &sh_path,
+                format!("#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n", py.display(), colab_py.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            sh_path
+        };
+
+        // 3. Mock Colab backend with 1 pre-existing VM (`m-s-existing`) and 1 newly leaked VM (`m-s-leaked`)
+        let existing_alive = Arc::new(AtomicBool::new(true));
+        let leaked_alive = Arc::new(AtomicBool::new(true));
+        let unassigned = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ex_srv = existing_alive.clone();
+        let lk_srv = leaked_alive.clone();
+        let un_srv = unassigned.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let ex = ex_srv.clone();
+                let lk = lk_srv.clone();
+                let un = un_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first = req.lines().next().unwrap_or("");
+                    let body = if first.starts_with("GET /tun/m/unassign/") {
+                        r#"{"token":"xsrf-tok"}"#.to_string()
+                    } else if first.starts_with("POST /tun/m/unassign/") {
+                        let ep = first
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim_start_matches("/tun/m/unassign/")
+                            .split('?')
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        un.l().push(ep.clone());
+                        if ep == "m-s-existing" {
+                            ex.store(false, Ordering::SeqCst);
+                        } else if ep == "m-s-leaked" {
+                            lk.store(false, Ordering::SeqCst);
+                        }
+                        "{}".to_string()
+                    } else {
+                        let mut arr = Vec::new();
+                        if ex.load(Ordering::SeqCst) {
+                            arr.push(serde_json::json!({
+                                "endpoint": "m-s-existing",
+                                "accelerator": "T4",
+                                "variant": "GPU",
+                                "machineShape": "STANDARD",
+                                "runtimeProxyInfo": { "token": "ptok", "url": "http://127.0.0.1:9" }
+                            }));
+                        }
+                        if lk.load(Ordering::SeqCst) {
+                            arr.push(serde_json::json!({
+                                "endpoint": "m-s-leaked",
+                                "accelerator": "A100",
+                                "variant": "GPU",
+                                "machineShape": "HIGH_RAM",
+                                "runtimeProxyInfo": { "token": "ptok", "url": "http://127.0.0.1:9" }
+                            }));
+                        }
+                        format!(")]}}'\n{}", serde_json::json!({ "assignments": arr }))
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        std::env::set_var("MOCK_COLAB_ENV_LOG", &env_log);
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(mock_colab);
+        *cli::TEST_RCLONE_CONF.l() = Some(cfg_dir.join("rclone.conf"));
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_file);
+        let app = AppState::new_with(client, ws_dir.clone());
+
+        // Validate grab_config & relay grab bounds in CreateVmRequest
+        let prep_ok = validate_and_prepare_create_vm(
+            &app,
+            &CreateVmRequest {
+                name: Some("grab-ok".into()),
+                accelerator: "A100".into(),
+                boot_mode: Some("general".into()),
+                grab_config: Some(GrabConfig {
+                    mode: "persistent".into(),
+                    retry_seconds: 15,
+                    fallback_gpus: vec!["g4".into(), "L4".into(), "g4".into()],
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("persistent grab config with deduplicated fallbacks must pass");
+        assert_eq!(prep_ok.validated_grab_cfg.mode, "persistent");
+        assert_eq!(prep_ok.validated_grab_cfg.fallback_gpus, vec!["G4", "L4"]);
+
+        assert!(validate_and_prepare_create_vm(
+            &app,
+            &CreateVmRequest {
+                name: Some("grab-bad".into()),
+                accelerator: "T4".into(),
+                grab_config: Some(GrabConfig {
+                    mode: "persistent".into(),
+                    retry_seconds: 2,
+                    fallback_gpus: vec![],
+                }),
+                ..Default::default()
+            },
+        )
+        .is_err());
+
+        // Run grab_colab_vm_loop in fast mode with fallback G4: A100 503 -> immediate G4 success with COLAB_CLI_ASSIGN_RETRIES=0
+        let grab_opts = GrabLoopOptions {
+            name: "fast-fb-vm".into(),
+            primary_gpu: "A100".into(),
+            fallback_gpus: vec!["G4".into()],
+            high_mem: true,
+            auth_mode: None,
+            mode: "fast".into(),
+            budget_minutes: None,
+            retry_seconds: 15,
+            cancel: None,
+        };
+        let got_gpu = relay::grab_colab_vm_loop(&grab_opts, None, None, &|_| {}, &|_| {})
+            .await
+            .expect("fallback G4 should allocate");
+        assert_eq!(got_gpu, "G4");
+
+        let logged = std::fs::read_to_string(&env_log).unwrap();
+        let entries: Vec<Value> = logged
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["retries"], "0");
+        assert_eq!(entries[0]["timeout"], "60");
+        assert_eq!(entries[1]["retries"], "0");
+
+        // Test cancel_create_vm_inner: cancels active grab, unassigns newly leaked m-s-leaked, leaves pre-existing m-s-existing untouched!
+        let cancel_tok = tokio_util::sync::CancellationToken::new();
+        let pre_eps = Arc::new(Mutex::new(
+            ["m-s-existing".to_string()].into_iter().collect(),
+        ));
+        let pre_invalid = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.try_claim_busy("cancel-me", "creating");
+        cli::register_workspace_entry("cancel-me", "ws", Some(&ws_dir.to_string_lossy()), None);
+        app.creating_vms.l().insert(
+            "cancel-me".into(),
+            CreatingVmMeta {
+                accelerator: "A100".into(),
+                high_mem: true,
+                workspace_name: "ws".into(),
+                workspace_path: Some(ws_dir.to_string_lossy().to_string()),
+                description: None,
+                had_ws_entry: false,
+                cancel: cancel_tok.clone(),
+                child_pid: Arc::new(Mutex::new(None)),
+                pre_provision_endpoints: pre_eps,
+                pre_provision_snapshot_invalid: pre_invalid,
+                grab_status: Arc::new(Mutex::new(None)),
+            },
+        );
+
+        let receipt = cancel_create_vm_inner(&app, "cancel-me")
+            .await
+            .expect("cancel_create_vm_inner should succeed");
+        assert!(cancel_tok.is_cancelled());
+        assert!(receipt.verified_unassigned);
+        assert_eq!(receipt.endpoint.as_deref(), Some("m-s-leaked"));
+        assert!(!leaked_alive.load(Ordering::SeqCst));
+        assert!(
+            existing_alive.load(Ordering::SeqCst),
+            "pre-existing endpoint must NEVER be unassigned"
+        );
+        assert_eq!(*unassigned.l(), vec!["m-s-leaked".to_string()]);
+        assert!(!app.creating_vms.l().contains_key("cancel-me"));
+        assert!(!cli::has_workspace_entry("cancel-me"));
+
+        std::env::remove_var("MOCK_COLAB_ENV_LOG");
         *cli::TEST_CONFIG_DIR.l() = None;
         *cli::TEST_COLAB_BIN.l() = None;
         *cli::TEST_RCLONE_CONF.l() = None;

@@ -2867,6 +2867,131 @@ class IssueRegressionTests(unittest.TestCase):
                 self.assertEqual(after["dl-vm-1"]["keep_alive"]["interval_seconds"], 300)
                 self.assertEqual(after["dl-vm-1"]["keep_alive"]["enabled"], False)
 
+    def test_dl_relay_grab_modes_fallback_gpus_and_env_overrides(self):
+        runner_mod = load_module(
+            "dl_relay_runner_grab_test",
+            REPO_ROOT / ".agents" / "skills" / "colab-dl-relay" / "scripts" / "dl_relay_runner.py",
+        )
+        # 1. parse_fallback_gpus deduplicates and rejects invalid models
+        self.assertEqual(
+            runner_mod.parse_fallback_gpus("A100", "g4, L4, a100, G4"),
+            ["A100", "G4", "L4"],
+        )
+        with self.assertRaises(ValueError):
+            runner_mod.parse_fallback_gpus("T4", "G4,RTX4090")
+
+        # 2. build_detached_child_cmd forwards grab policy flags
+        parsed = runner_mod.build_parser().parse_args(
+            [
+                "--session",
+                "grab-exp",
+                "--workspace",
+                ".",
+                "--grab-mode",
+                "budget",
+                "--grab-timeout-minutes",
+                "90",
+                "--grab-retry-seconds",
+                "12",
+                "--fallback-gpus",
+                "G4,L4",
+            ]
+        )
+        child_cmd = runner_mod.build_detached_child_cmd(
+            parsed, "/abs/ws", "/abs/ws/train.py", "gdrive:colab_relay/grab-exp"
+        )
+        self.assertIn("--grab-mode", child_cmd)
+        self.assertIn("budget", child_cmd)
+        self.assertIn("90.0", child_cmd)
+        self.assertIn("--grab-retry-seconds", child_cmd)
+        self.assertIn("12.0", child_cmd)
+        self.assertIn("--fallback-gpus", child_cmd)
+        self.assertIn("G4,L4", child_cmd)
+
+        # 3. run_cmd injects COLAB_CLI_ASSIGN_RETRIES=0 and GPU(60s)/TPU(300s) COLAB_CLI_REQUEST_TIMEOUT
+        captured_envs = []
+
+        def fake_subproc_run(cmd, **kwargs):
+            captured_envs.append((list(cmd), dict(kwargs.get("env") or {})))
+            return subprocess.CompletedProcess(cmd, 0, stdout="Session READY", stderr="")
+
+        with mock.patch.object(runner_mod.subprocess, "run", side_effect=fake_subproc_run):
+            runner_mod.run_cmd(["colab", "new", "-s", "vm-gpu", "--gpu", "A100"])
+            runner_mod.run_cmd(["colab", "new", "-s", "vm-tpu", "--tpu", "v6e1"])
+
+        self.assertEqual(captured_envs[0][1].get("COLAB_CLI_ASSIGN_RETRIES"), "0")
+        self.assertEqual(captured_envs[0][1].get("COLAB_CLI_REQUEST_TIMEOUT"), "60")
+        self.assertEqual(captured_envs[1][1].get("COLAB_CLI_ASSIGN_RETRIES"), "0")
+        self.assertEqual(captured_envs[1][1].get("COLAB_CLI_REQUEST_TIMEOUT"), "300")
+
+        # 4. --grab-mode fast + --fallback-gpus G4 rotates immediately on A100 503 and completes on G4
+        with tempfile.TemporaryDirectory() as td:
+            ws_dir = os.path.join(td, "ws")
+            cfg_dir = os.path.join(td, "cfg")
+            os.makedirs(ws_dir, exist_ok=True)
+            os.makedirs(cfg_dir, exist_ok=True)
+            Path(os.path.join(ws_dir, "train.py")).write_text("print('ok')\n", encoding="utf-8")
+            rclone_conf = os.path.join(td, "rclone.conf")
+            Path(rclone_conf).write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+            locks_file = os.path.join(td, "locks.json")
+            tried_gpus = []
+
+            def fake_run(cmd, timeout=300, stdin_text=None):
+                prog = os.path.basename(cmd[0]).lower()
+                if "rclone" in prog:
+                    if "copyto" in cmd:
+                        Path(cmd[-1]).write_bytes(b"weights-ok")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                sub = cmd[1]
+                if sub == "new":
+                    gpu_idx = cmd.index("--gpu") + 1
+                    gpu_name = cmd[gpu_idx]
+                    tried_gpus.append(gpu_name)
+                    if gpu_name == "A100":
+                        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="HTTP 503 Service Unavailable")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Session READY", stderr="")
+                if sub == "status":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No active session")
+                if sub == "sessions":
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                if sub == "upload":
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Uploaded", stderr="")
+                if sub == "exec":
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout="CLOUD_SMOKE_PASSED\nTRAINING_COMPLETED\nTRAIN_EXIT_CODE=0\n",
+                        stderr="",
+                    )
+                if sub == "stop":
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Stopped", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(runner_mod, "colab_cfg_dir", return_value=cfg_dir),
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_run),
+                redirect_stdout(io.StringIO()),
+            ):
+                rc = runner_mod.main(
+                    [
+                        "--session",
+                        "exp-fallback",
+                        "--workspace",
+                        ws_dir,
+                        "--gpu",
+                        "A100",
+                        "--grab-mode",
+                        "fast",
+                        "--fallback-gpus",
+                        "G4",
+                        "--reset-done-flag",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual(tried_gpus, ["A100", "G4"])
+
 
 if __name__ == "__main__":
     unittest.main()

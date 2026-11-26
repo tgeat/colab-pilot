@@ -121,6 +121,15 @@ impl Default for KeepAliveConfig {
 
 impl KeepAliveConfig {
     pub fn validate(&self) -> Result<Self, String> {
+        if !self.enabled {
+            let mut normalized = self.clone();
+            if normalized.interval_seconds < MIN_KEEP_ALIVE_INTERVAL_SECONDS
+                || normalized.interval_seconds > MAX_KEEP_ALIVE_INTERVAL_SECONDS
+            {
+                normalized.interval_seconds = DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS;
+            }
+            return Ok(normalized);
+        }
         if self.interval_seconds < MIN_KEEP_ALIVE_INTERVAL_SECONDS
             || self.interval_seconds > MAX_KEEP_ALIVE_INTERVAL_SECONDS
         {
@@ -135,7 +144,7 @@ impl KeepAliveConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct KeepAliveStatus {
     pub enabled: bool,
     pub interval_seconds: u64,
@@ -144,18 +153,46 @@ pub struct KeepAliveStatus {
     pub state: String,
     pub last_ok_at: Option<i64>,
     pub last_attempt_at: Option<i64>,
+    /// Result of the authenticated runtime connection check.
     pub tunnel_ok: bool,
-    /// "ok" | "skipped_busy" | "disabled" | "error" | "pending"
+    /// "ok" | "skipped_busy" | "skipped_no_kernel" | "disabled" | "error" | "pending"
     pub kernel_ping_state: String,
     pub success_count: u64,
     pub consecutive_failures: u32,
     pub last_error: Option<String>,
+    #[serde(default = "default_keep_alive_true")]
+    pub profile_saved: bool,
+    #[serde(default)]
+    pub persistence_error: Option<String>,
+}
+
+impl Default for KeepAliveStatus {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: 0,
+            kernel_ping: false,
+            state: String::new(),
+            last_ok_at: None,
+            last_attempt_at: None,
+            tunnel_ok: false,
+            kernel_ping_state: String::new(),
+            success_count: 0,
+            consecutive_failures: 0,
+            last_error: None,
+            profile_saved: true,
+            persistence_error: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct VmKeepAliveRuntime {
     config: KeepAliveConfig,
     endpoint: Option<String>,
+    epoch: u64,
+    policy_version: u64,
+    last_verified_endpoint: Option<String>,
     last_attempt_instant: Option<Instant>,
     last_ok_at: Option<i64>,
     last_attempt_at: Option<i64>,
@@ -165,6 +202,10 @@ struct VmKeepAliveRuntime {
     consecutive_failures: u32,
     last_error: Option<String>,
     in_flight: bool,
+    in_flight_tick_id: Option<u64>,
+    active_cancel: Option<tokio_util::sync::CancellationToken>,
+    profile_saved: bool,
+    persistence_error: Option<String>,
 }
 
 impl VmKeepAliveRuntime {
@@ -177,6 +218,9 @@ impl VmKeepAliveRuntime {
         Self {
             config,
             endpoint,
+            epoch: 0,
+            policy_version: 1,
+            last_verified_endpoint: None,
             last_attempt_instant: None,
             last_ok_at: None,
             last_attempt_at: None,
@@ -186,19 +230,46 @@ impl VmKeepAliveRuntime {
             consecutive_failures: 0,
             last_error: None,
             in_flight: false,
+            in_flight_tick_id: None,
+            active_cancel: None,
+            profile_saved: true,
+            persistence_error: None,
         }
     }
 
+    fn reset_verification(&mut self, endpoint: Option<String>) {
+        if let Some(tok) = self.active_cancel.take() {
+            tok.cancel();
+        }
+        self.endpoint = endpoint;
+        self.last_verified_endpoint = None;
+        self.last_attempt_instant = None;
+        self.last_ok_at = None;
+        self.last_attempt_at = None;
+        self.tunnel_ok = false;
+        self.kernel_ping_state = if !self.config.enabled || !self.config.kernel_ping {
+            "disabled".to_string()
+        } else {
+            "pending".to_string()
+        };
+        self.success_count = 0;
+        self.consecutive_failures = 0;
+        self.last_error = None;
+        self.in_flight = false;
+        self.in_flight_tick_id = None;
+    }
+
     fn to_status(&self) -> KeepAliveStatus {
-        let state = if !self.config.enabled {
-            "paused"
-        } else if self.consecutive_failures > 0 {
+        let state = if self.consecutive_failures > 0 {
             "error"
+        } else if !self.config.enabled {
+            "paused"
         } else if self.last_ok_at.is_some() {
             "active"
         } else {
             "idle"
         };
+        let last_error = self.last_error.clone();
         KeepAliveStatus {
             enabled: self.config.enabled,
             interval_seconds: self.config.interval_seconds,
@@ -214,11 +285,9 @@ impl VmKeepAliveRuntime {
             },
             success_count: self.success_count,
             consecutive_failures: self.consecutive_failures,
-            last_error: if self.config.enabled {
-                self.last_error.clone()
-            } else {
-                None
-            },
+            last_error,
+            profile_saved: self.profile_saved,
+            persistence_error: self.persistence_error.clone(),
         }
     }
 }
@@ -439,6 +508,12 @@ impl LocalSshBridge {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ActiveChatEntry {
+    cancel: tokio_util::sync::CancellationToken,
+    vm_name: Option<String>,
+}
+
 pub struct AppState {
     pub client: ColabClient,
     pub workspace: PathBuf,
@@ -450,10 +525,12 @@ pub struct AppState {
     creating_vms: Mutex<HashMap<String, CreatingVmMeta>>,
     ssh_bridges: Mutex<HashMap<String, Arc<LocalSshBridge>>>,
     deploy_errors: Mutex<HashMap<String, String>>,
-    active_chats: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
+    active_chats: Mutex<HashMap<String, ActiveChatEntry>>,
     busy: Mutex<HashMap<String, String>>,
     probe_cooldown: Mutex<HashMap<String, Instant>>,
     keep_alive: Mutex<HashMap<String, VmKeepAliveRuntime>>,
+    keep_alive_epochs: Mutex<HashMap<String, u64>>,
+    keep_alive_seq: std::sync::atomic::AtomicU64,
     gdrive: tokio::sync::Mutex<GdriveCache>,
     refresh_lock: tokio::sync::Mutex<()>,
     overview_seq: std::sync::atomic::AtomicU64,
@@ -515,6 +592,8 @@ impl AppState {
             busy: Mutex::new(HashMap::new()),
             probe_cooldown: Mutex::new(HashMap::new()),
             keep_alive: Mutex::new(HashMap::new()),
+            keep_alive_epochs: Mutex::new(HashMap::new()),
+            keep_alive_seq: std::sync::atomic::AtomicU64::new(1),
             gdrive: tokio::sync::Mutex::new(GdriveCache::default()),
             refresh_lock: tokio::sync::Mutex::new(()),
             overview_seq: std::sync::atomic::AtomicU64::new(0),
@@ -522,6 +601,45 @@ impl AppState {
             script_dirty: std::sync::atomic::AtomicBool::new(false),
             pending_close_vms: Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    pub(crate) fn current_keep_alive_epoch(&self, vm_name: &str) -> u64 {
+        *self.keep_alive_epochs.l().get(vm_name).unwrap_or(&0)
+    }
+
+    pub(crate) fn bump_keep_alive_epoch(&self, vm_name: &str) -> u64 {
+        let next = self
+            .keep_alive_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        self.keep_alive_epochs.l().insert(vm_name.to_string(), next);
+        next
+    }
+
+    pub(crate) fn invalidate_keep_alive(&self, vm_name: &str, remove_runtime: bool) -> u64 {
+        let next = self.bump_keep_alive_epoch(vm_name);
+        let mut map = self.keep_alive.l();
+        if remove_runtime {
+            if let Some(old) = map.remove(vm_name) {
+                if let Some(tok) = old.active_cancel {
+                    tok.cancel();
+                }
+            }
+        } else if let Some(rt) = map.get_mut(vm_name) {
+            rt.epoch = next;
+            if let Some(tok) = rt.active_cancel.take() {
+                tok.cancel();
+            }
+            rt.in_flight = false;
+            rt.in_flight_tick_id = None;
+        }
+        next
+    }
+
+    fn next_keep_alive_tick_id(&self) -> u64 {
+        self.keep_alive_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1)
     }
 
     fn relay(&self, name: &str) -> Option<Arc<RelayHandle>> {
@@ -2660,7 +2778,7 @@ fn cleanup_llm_bluegreen_after_terminate(
 fn cleanup_local_vm_artifacts(app: &AppState, name: &str) {
     app.set_deploy_error(name, None);
     app.creating_vms.l().remove(name);
-    app.keep_alive.l().remove(name);
+    app.invalidate_keep_alive(name, true);
     let remaining_ssh: Option<Vec<(String, u16)>> = {
         let mut bridges = app.ssh_bridges.l();
         if let Some(b) = bridges.remove(name) {
@@ -2705,6 +2823,7 @@ pub async fn hard_terminate(
         name: name.into(),
         ..Default::default()
     };
+    app.invalidate_keep_alive(name, true);
 
     let mut stopped_local_relay = false;
     let mut stopped_creating_vm = false;
@@ -3125,19 +3244,74 @@ pub struct CreateVmEnvConfig {
 
 // ───────────────────────────── 通用每实例保活引擎 ─────────────────────────────
 // 覆盖所有在线实例（通用算力 / 终端 SSH / 大模型 / 接力训练）：
-// 1. 隧道租约续期：GET /tun/m/keep-alive/{endpoint}（带 X-Colab-Tunnel: Google）
+// 1. 通过 Jupyter /api/kernels 检查运行时连接。
 // 2. 代理令牌实时保鲜：始终从最新 Assignment 获取有效 1h runtimeProxyInfo.token，401/403 自动刷新重试
 // 3. 忙时避让的 Jupyter Kernel 脉冲心跳：先查本地忙态与 GET /api/kernels，若存在 busy/starting 内核则主动跳过（不抢占、不阻塞）；
 //    仅当空闲时通过独立 ZMQ session_id=None 执行毫秒级 `pass` 刷新 last_activity，复用已有空闲 kernel_id 不产生多余内核。
 
 const REMOTE_KERNEL_KEEPALIVE_PY: &str = r#"
+import queue
 import sys
+import time
+import jupyter_kernel_client.manager as _jkm
 from colab_cli.runtime import ColabRuntime
-url, tok, kid = sys.argv[1], sys.argv[2], (sys.argv[3] or None)
+
+url, tok, kid = sys.argv[1], sys.argv[2], (sys.argv[3] or "").strip()
+if not kid:
+    print("KA_NO_KERNEL", flush=True)
+    sys.exit(0)
+
+def _forbid_start_kernel(*args, **kwargs):
+    raise RuntimeError("KA_KERNEL_GONE: start_kernel forbidden during keep-alive")
+
+_jkm.KernelHttpManager.start_kernel = _forbid_start_kernel
+
 rt = ColabRuntime(url, tok, kernel_id=kid, session_id=None)
 try:
-    rt.execute_code("pass", timeout=15)
-    print(f"KA_KERNEL_OK:{rt.kernel_id or ''}", flush=True)
+    wsclient = rt.kernel_client._manager.client
+    msg_id = wsclient.execute("pass", silent=True, store_history=False, allow_stdin=False)
+
+    def _next_msg(get_msg, waiting_for):
+        deadline = time.monotonic() + 15.0
+        while True:
+            if not wsclient.connection_ready.is_set():
+                raise RuntimeError("Connection was lost.")
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(f"Timeout waiting for {waiting_for}")
+            try:
+                msg = get_msg(timeout=min(0.25, left))
+            except queue.Empty:
+                continue
+            state = msg.get("content", {}).get("execution_state")
+            if msg.get("header", {}).get("msg_type") == "status" and state in ("dead", "restarting"):
+                raise RuntimeError(f"Kernel {state} before keep-alive finished.")
+            if msg.get("parent_header", {}).get("msg_id") == msg_id:
+                return msg
+
+    while True:
+        iopub = _next_msg(wsclient.get_iopub_msg, "iopub")
+        if (
+            iopub.get("header", {}).get("msg_type") == "status"
+            and iopub.get("content", {}).get("execution_state") == "idle"
+        ):
+            break
+
+    reply = _next_msg(wsclient.get_shell_msg, "execute_reply")
+    content = reply.get("content", {})
+    if content.get("status") != "ok":
+        ename = content.get("ename") or content.get("status") or "error"
+        evalue = content.get("evalue") or ""
+        print(f"KA_KERNEL_ERR:{ename}: {evalue}".strip(), file=sys.stderr, flush=True)
+        sys.exit(2)
+
+    print(f"KA_KERNEL_OK:{rt.kernel_id or kid}", flush=True)
+except Exception as exc:
+    if "KA_KERNEL_GONE" in str(exc):
+        print("KA_NO_KERNEL", flush=True)
+        sys.exit(0)
+    print(f"KA_KERNEL_ERR:{exc}", file=sys.stderr, flush=True)
+    sys.exit(2)
 finally:
     rt.stop()
 "#;
@@ -3148,14 +3322,29 @@ fn snapshot_keep_alive_for_vm(
     endpoint: Option<&str>,
     saved_profiles: &HashMap<String, cli::SessionProfile>,
 ) -> KeepAliveStatus {
+    if app.is_deleting(vm_name) {
+        return KeepAliveStatus {
+            enabled: false,
+            interval_seconds: DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
+            kernel_ping: true,
+            state: "paused".into(),
+            kernel_ping_state: "disabled".into(),
+            ..Default::default()
+        };
+    }
     let mut map = app.keep_alive.l();
     if let Some(rt) = map.get_mut(vm_name) {
         if let Some(ep) = endpoint {
-            if rt.endpoint.as_deref() != Some(ep) {
+            let endpoint_handover = rt.endpoint.as_deref().is_some_and(|cur| cur != ep)
+                || rt
+                    .last_verified_endpoint
+                    .as_deref()
+                    .is_some_and(|v| v != ep);
+            if endpoint_handover {
+                rt.reset_verification(Some(ep.to_string()));
+                rt.epoch = app.bump_keep_alive_epoch(vm_name);
+            } else if rt.endpoint.is_none() {
                 rt.endpoint = Some(ep.to_string());
-                rt.last_attempt_instant = None;
-                rt.consecutive_failures = 0;
-                rt.last_error = None;
             }
         }
         return rt.to_status();
@@ -3164,7 +3353,8 @@ fn snapshot_keep_alive_for_vm(
         .get(vm_name)
         .and_then(|p| p.keep_alive.clone())
     {
-        let rt = VmKeepAliveRuntime::from_config(cfg, endpoint.map(|s| s.to_string()));
+        let mut rt = VmKeepAliveRuntime::from_config(cfg, endpoint.map(|s| s.to_string()));
+        rt.epoch = app.current_keep_alive_epoch(vm_name);
         let status = rt.to_status();
         map.insert(vm_name.to_string(), rt);
         return status;
@@ -3175,17 +3365,22 @@ fn snapshot_keep_alive_for_vm(
         interval_seconds: DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
         kernel_ping: true,
         state: "paused".into(),
-        last_ok_at: None,
-        last_attempt_at: None,
-        tunnel_ok: false,
         kernel_ping_state: "disabled".into(),
-        success_count: 0,
-        consecutive_failures: 0,
-        last_error: None,
+        ..Default::default()
     }
 }
 
-async fn execute_remote_kernel_ping(a: &Assignment, kernel_id: Option<&str>) -> Result<(), String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KernelPingOutcome {
+    Ok,
+    NoKernel,
+}
+
+async fn execute_remote_kernel_ping(
+    a: &Assignment,
+    kernel_id: &str,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+) -> Result<KernelPingOutcome, String> {
     let py = cli::colab_python_bin();
     let args = vec![
         "-u".to_string(),
@@ -3193,15 +3388,32 @@ async fn execute_remote_kernel_ping(a: &Assignment, kernel_id: Option<&str>) -> 
         REMOTE_KERNEL_KEEPALIVE_PY.to_string(),
         a.runtime_proxy_info.url.clone(),
         a.runtime_proxy_info.token.clone(),
-        kernel_id.unwrap_or("").to_string(),
+        kernel_id.to_string(),
     ];
-    let out = cli::run_simple(&py, &args, Duration::from_secs(20))
-        .await
-        .map_err(|e| format!("启动 Kernel 心跳子进程失败: {e:#}"))?;
+    let out = cli::run_streaming(
+        &py,
+        &args,
+        None,
+        Duration::from_secs(20),
+        cancel,
+        None,
+        |_| {},
+    )
+    .await
+    .map_err(|e| format!("启动 Kernel 心跳子进程失败: {e:#}"))?;
+    if out.cancelled {
+        return Err("保活心跳已取消".into());
+    }
     if out.timed_out {
         return Err("Jupyter Kernel `pass` 心跳超时 (20s)".into());
     }
-    if out.code != 0 || !out.stdout.contains("KA_KERNEL_OK:") {
+    if out.code == 0 && out.stdout.contains("KA_NO_KERNEL") {
+        return Ok(KernelPingOutcome::NoKernel);
+    }
+    if out.code != 0
+        || !out.stdout.contains("KA_KERNEL_OK:")
+        || out.output.contains("KA_KERNEL_ERR:")
+    {
         let detail = out
             .output
             .lines()
@@ -3211,7 +3423,26 @@ async fn execute_remote_kernel_ping(a: &Assignment, kernel_id: Option<&str>) -> 
             .trim();
         return Err(format!("Kernel 心跳失败 (code={}): {detail}", out.code));
     }
-    Ok(())
+    Ok(KernelPingOutcome::Ok)
+}
+
+struct KeepAliveInFlightGuard {
+    app: Arc<AppState>,
+    vm_name: String,
+    tick_id: u64,
+}
+
+impl Drop for KeepAliveInFlightGuard {
+    fn drop(&mut self) {
+        let mut map = self.app.keep_alive.l();
+        if let Some(rt) = map.get_mut(&self.vm_name) {
+            if rt.in_flight_tick_id == Some(self.tick_id) {
+                rt.in_flight = false;
+                rt.in_flight_tick_id = None;
+                rt.active_cancel = None;
+            }
+        }
+    }
 }
 
 pub(crate) async fn run_keep_alive_tick_for_vm(
@@ -3220,118 +3451,302 @@ pub(crate) async fn run_keep_alive_tick_for_vm(
     a: &Assignment,
     kernel_hint: Option<String>,
     force: bool,
+    require_enabled: bool,
+    expected_epoch: Option<u64>,
 ) -> Option<KeepAliveStatus> {
-    let cfg = {
-        let mut map = app.keep_alive.l();
-        let rt = map.entry(vm_name.to_string()).or_insert_with(|| {
-            let persisted = cli::get_session_profile(vm_name)
-                .and_then(|p| p.keep_alive)
-                .unwrap_or(KeepAliveConfig {
-                    enabled: false,
-                    ..KeepAliveConfig::default()
-                });
-            VmKeepAliveRuntime::from_config(persisted, Some(a.endpoint.clone()))
-        });
-        if rt.endpoint.as_deref() != Some(a.endpoint.as_str()) {
-            rt.endpoint = Some(a.endpoint.clone());
-            rt.last_attempt_instant = None;
+    run_keep_alive_tick_inner(
+        app,
+        vm_name,
+        a,
+        kernel_hint,
+        force,
+        require_enabled,
+        expected_epoch,
+        None,
+    )
+    .await
+}
+
+async fn run_keep_alive_tick_inner(
+    app: &Arc<AppState>,
+    vm_name: &str,
+    a: &Assignment,
+    kernel_hint: Option<String>,
+    force: bool,
+    require_enabled: bool,
+    expected_epoch: Option<u64>,
+    pre_claimed: Option<(
+        u64,
+        tokio_util::sync::CancellationToken,
+        KeepAliveConfig,
+        u64,
+        u64,
+        String,
+        KeepAliveInFlightGuard,
+    )>,
+) -> Option<KeepAliveStatus> {
+    if app.is_deleting(vm_name) {
+        return None;
+    }
+
+    let (
+        tick_id,
+        tick_cancel,
+        cfg,
+        start_epoch,
+        start_policy_version,
+        start_endpoint,
+        _flight_guard,
+    ) = if let Some(claimed) = pre_claimed {
+        if let Some(exp) = expected_epoch {
+            if exp != app.current_keep_alive_epoch(vm_name) || exp != claimed.3 {
+                return None;
+            }
         }
-        if !force && !rt.config.enabled {
-            return None;
-        }
-        if rt.in_flight {
-            return None;
-        }
-        if !force {
-            if let Some(prev) = rt.last_attempt_instant {
-                if prev.elapsed() < Duration::from_secs(rt.config.interval_seconds) {
+        claimed
+    } else {
+        let tick_id = app.next_keep_alive_tick_id();
+        let tick_cancel = tokio_util::sync::CancellationToken::new();
+        let (cfg, start_epoch, start_policy_version, start_endpoint) = {
+            let cur_epoch = app.current_keep_alive_epoch(vm_name);
+            if let Some(exp) = expected_epoch {
+                if exp != cur_epoch {
                     return None;
                 }
             }
-        }
-        rt.in_flight = true;
-        rt.last_attempt_instant = Some(Instant::now());
-        rt.config.clone()
+            let mut map = app.keep_alive.l();
+            if app.is_deleting(vm_name) {
+                return None;
+            }
+            let rt = map.entry(vm_name.to_string()).or_insert_with(|| {
+                let persisted = cli::get_session_profile(vm_name)
+                    .and_then(|p| p.keep_alive)
+                    .unwrap_or(KeepAliveConfig {
+                        enabled: false,
+                        ..KeepAliveConfig::default()
+                    });
+                let mut r = VmKeepAliveRuntime::from_config(persisted, Some(a.endpoint.clone()));
+                r.epoch = cur_epoch;
+                r
+            });
+            if let Some(exp) = expected_epoch {
+                if exp != rt.epoch {
+                    return None;
+                }
+            }
+            let endpoint_handover = rt
+                .endpoint
+                .as_deref()
+                .is_some_and(|cur| cur != a.endpoint.as_str())
+                || rt
+                    .last_verified_endpoint
+                    .as_deref()
+                    .is_some_and(|v| v != a.endpoint.as_str());
+            if endpoint_handover {
+                rt.reset_verification(Some(a.endpoint.clone()));
+                rt.epoch = app.bump_keep_alive_epoch(vm_name);
+                if expected_epoch.is_some() {
+                    return None;
+                }
+            } else if rt.endpoint.is_none() {
+                rt.endpoint = Some(a.endpoint.clone());
+            }
+            if require_enabled && !rt.config.enabled {
+                return None;
+            }
+            if rt.in_flight {
+                return None;
+            }
+            if !force {
+                if let Some(prev) = rt.last_attempt_instant {
+                    if prev.elapsed() < Duration::from_secs(rt.config.interval_seconds) {
+                        return None;
+                    }
+                }
+            }
+            rt.in_flight = true;
+            rt.in_flight_tick_id = Some(tick_id);
+            rt.active_cancel = Some(tick_cancel.clone());
+            rt.last_attempt_instant = Some(Instant::now());
+            (
+                rt.config.clone(),
+                rt.epoch,
+                rt.policy_version,
+                a.endpoint.clone(),
+            )
+        };
+        let guard = KeepAliveInFlightGuard {
+            app: app.clone(),
+            vm_name: vm_name.to_string(),
+            tick_id,
+        };
+        (
+            tick_id,
+            tick_cancel,
+            cfg,
+            start_epoch,
+            start_policy_version,
+            start_endpoint,
+            guard,
+        )
     };
 
-    let mut cur_assignment = a.clone();
+    let is_tick_still_valid = |app: &AppState| -> bool {
+        if app.is_deleting(vm_name) {
+            return false;
+        }
+        if app.current_keep_alive_epoch(vm_name) != start_epoch {
+            return false;
+        }
+        let map = app.keep_alive.l();
+        let Some(rt) = map.get(vm_name) else {
+            return false;
+        };
+        rt.in_flight_tick_id == Some(tick_id)
+            && rt.epoch == start_epoch
+            && rt.policy_version == start_policy_version
+            && rt.endpoint.as_deref() == Some(start_endpoint.as_str())
+            && (!require_enabled || rt.config.enabled)
+    };
+
+    if tick_cancel.is_cancelled() || !is_tick_still_valid(app) {
+        return None;
+    }
+
     let now_ts = chrono::Utc::now().timestamp();
 
-    // 1. 隧道租约续期：GET /tun/m/keep-alive/{endpoint}
-    let tunnel_res = app.client.keep_alive(&cur_assignment.endpoint).await;
-    let (tunnel_ok, mut err_parts): (bool, Vec<String>) = match tunnel_res {
-        Ok(()) => (true, Vec::new()),
-        Err(e) => (false, vec![format!("隧道保活失败: {e:#}")]),
-    };
-
-    // 2. 忙时避让的 Jupyter Kernel 轻量 `pass` 心跳
-    let kernel_ping_state = if !cfg.kernel_ping {
-        "disabled".to_string()
-    } else {
-        let local_busy = app.relay(vm_name).map(|h| h.is_running()).unwrap_or(false)
-            || app.busy.l().contains_key(vm_name)
-            || !app.active_chats.l().is_empty();
-        if local_busy {
-            "skipped_busy".to_string()
-        } else {
-            let mut kernels_res = app.client.list_kernels(&cur_assignment).await;
-            if let Err(ref e) = kernels_res {
-                let s = format!("{e:#}");
-                if s.contains("401") || s.contains("403") {
-                    if let Ok(fresh_list) = app.client.list_assignments().await {
-                        if let Some(fresh_a) = fresh_list
-                            .into_iter()
-                            .find(|x| x.endpoint == cur_assignment.endpoint)
-                        {
-                            cur_assignment = fresh_a;
-                            kernels_res = app.client.list_kernels(&cur_assignment).await;
-                        }
-                    }
-                }
-            }
-            match kernels_res {
-                Ok(kernels) => {
-                    let any_busy = kernels.iter().any(|k| {
-                        let st = k.execution_state.trim().to_ascii_lowercase();
-                        st == "busy" || st == "starting"
-                    });
-                    if any_busy {
-                        "skipped_busy".to_string()
-                    } else {
-                        let idle_kid = kernels
-                            .iter()
-                            .find(|k| !k.id.trim().is_empty())
-                            .map(|k| k.id.clone())
-                            .or(kernel_hint);
-                        match execute_remote_kernel_ping(&cur_assignment, idle_kid.as_deref()).await {
-                            Ok(()) => "ok".to_string(),
-                            Err(e) => {
-                                err_parts.push(e);
-                                "error".to_string()
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    err_parts.push(format!("查询 Kernel 忙闲状态失败: {e:#}"));
-                    "error".to_string()
+    // Stage 1: 运行时连接检查（也提供内核忙闲信息；若被暂停/删除/换棒则立即取消并中止）
+    let mut cur_assignment = a.clone();
+    let kernels_fut = async {
+        let mut k = app.client.list_kernels(&cur_assignment).await;
+        if k.as_ref().is_err_and(crate::colab::is_proxy_auth_error) {
+            if let Ok(assignments) = app.client.list_assignments().await {
+                if let Some(fresh) = assignments
+                    .into_iter()
+                    .find(|item| item.endpoint == cur_assignment.endpoint)
+                {
+                    cur_assignment = fresh;
+                    k = app.client.list_kernels(&cur_assignment).await;
                 }
             }
         }
+        (cur_assignment, k)
     };
+
+    let (cur_assignment, kernels) = tokio::select! {
+        _ = tick_cancel.cancelled() => return None,
+        res = kernels_fut => res,
+    };
+
+    if tick_cancel.is_cancelled() || !is_tick_still_valid(app) {
+        return None;
+    }
+
+    let tunnel_ok = kernels.is_ok();
+    let mut err_parts = Vec::new();
+    let local_busy = cfg.kernel_ping
+        && (app.relay(vm_name).map(|h| h.is_running()).unwrap_or(false)
+            || app.busy.l().contains_key(vm_name)
+            || app
+                .active_chats
+                .l()
+                .values()
+                .any(|e| e.vm_name.as_deref() == Some(vm_name)));
+    let kernel_ping_state = match kernels {
+        Err(err) => {
+            err_parts.push(format!("运行时连接检查失败: {err:#}"));
+            if cfg.kernel_ping {
+                "error"
+            } else {
+                "disabled"
+            }
+        }
+        Ok(_) if !cfg.kernel_ping => "disabled",
+        Ok(ref kernels)
+            if local_busy
+                || kernels.iter().any(|k| {
+                    matches!(
+                        k.execution_state.trim().to_ascii_lowercase().as_str(),
+                        "busy" | "starting"
+                    )
+                }) =>
+        {
+            "skipped_busy"
+        }
+        Ok(ref kernels) => {
+            let is_live_idle_kernel = |k: &crate::colab::JupyterKernelInfo| -> bool {
+                !k.id.trim().is_empty()
+                    && !matches!(
+                        k.execution_state.trim().to_ascii_lowercase().as_str(),
+                        "busy" | "starting" | "dead" | "terminating" | "restarting"
+                    )
+            };
+            let hint_live = kernel_hint
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .and_then(|h| kernels.iter().find(|k| is_live_idle_kernel(k) && k.id.trim() == h))
+                .map(|k| k.id.clone());
+            let idle_kid = hint_live.or_else(|| {
+                kernels
+                    .iter()
+                    .find(|k| is_live_idle_kernel(k))
+                    .map(|k| k.id.clone())
+            });
+            match idle_kid {
+                None => "skipped_no_kernel",
+                Some(kid) => {
+                    match execute_remote_kernel_ping(
+                        &cur_assignment,
+                        &kid,
+                        Some(tick_cancel.clone()),
+                    )
+                    .await
+                    {
+                        Ok(KernelPingOutcome::Ok) => "ok",
+                        Ok(KernelPingOutcome::NoKernel) => "skipped_no_kernel",
+                        Err(err) => {
+                            if tick_cancel.is_cancelled() {
+                                return None;
+                            }
+                            err_parts.push(err);
+                            "error"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    .to_string();
+
+    if tick_cancel.is_cancelled() || !is_tick_still_valid(app) {
+        return None;
+    }
 
     let overall_ok = tunnel_ok && kernel_ping_state != "error";
     let status = {
+        if app.is_deleting(vm_name) || app.current_keep_alive_epoch(vm_name) != start_epoch {
+            return None;
+        }
         let mut map = app.keep_alive.l();
-        let rt = map
-            .entry(vm_name.to_string())
-            .or_insert_with(|| VmKeepAliveRuntime::from_config(cfg, Some(cur_assignment.endpoint.clone())));
+        let rt = map.get_mut(vm_name)?;
+        if rt.in_flight_tick_id != Some(tick_id)
+            || rt.epoch != start_epoch
+            || rt.policy_version != start_policy_version
+            || rt.endpoint.as_deref() != Some(start_endpoint.as_str())
+            || (require_enabled && !rt.config.enabled)
+        {
+            return None;
+        }
         rt.in_flight = false;
+        rt.in_flight_tick_id = None;
+        rt.active_cancel = None;
         rt.last_attempt_at = Some(now_ts);
         rt.tunnel_ok = tunnel_ok;
-        rt.kernel_ping_state = kernel_ping_state;
+        rt.kernel_ping_state = kernel_ping_state.clone();
         if overall_ok {
             rt.last_ok_at = Some(now_ts);
+            rt.last_verified_endpoint = Some(start_endpoint);
             rt.success_count = rt.success_count.saturating_add(1);
             rt.consecutive_failures = 0;
             rt.last_error = None;
@@ -3339,12 +3754,46 @@ pub(crate) async fn run_keep_alive_tick_for_vm(
             rt.consecutive_failures = rt.consecutive_failures.saturating_add(1);
             rt.last_error = Some(err_parts.join("；"));
         }
-        rt.to_status()
+
+        if !require_enabled && !rt.config.enabled {
+            let mut probe_status = rt.to_status();
+            probe_status.enabled = false;
+            probe_status.kernel_ping_state = if !rt.config.kernel_ping {
+                "disabled".to_string()
+            } else {
+                kernel_ping_state
+            };
+            probe_status.last_error = if overall_ok {
+                None
+            } else {
+                rt.last_error.clone()
+            };
+            probe_status.state = if !overall_ok {
+                "error".to_string()
+            } else {
+                "paused".to_string()
+            };
+            probe_status
+        } else {
+            rt.to_status()
+        }
     };
     Some(status)
 }
 
-async fn run_keep_alive_scheduler_pass(app: &Arc<AppState>) -> bool {
+#[cfg(test)]
+pub(crate) async fn dispatch_keep_alive_scheduler_pass(app: &Arc<AppState>) -> usize {
+    dispatch_keep_alive_scheduler_pass_with(app, |_| async {}).await
+}
+
+async fn dispatch_keep_alive_scheduler_pass_with<F, Fut>(
+    app: &Arc<AppState>,
+    on_tick_done: F,
+) -> usize
+where
+    F: Fn(Arc<AppState>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     let ov_vms = {
         let ov = app.overview.read().await;
         ov.vms
@@ -3354,7 +3803,7 @@ async fn run_keep_alive_scheduler_pass(app: &Arc<AppState>) -> bool {
             .collect::<Vec<_>>()
     };
     if ov_vms.is_empty() {
-        return false;
+        return 0;
     }
 
     let cached_assignments = app
@@ -3368,46 +3817,135 @@ async fn run_keep_alive_scheduler_pass(app: &Arc<AppState>) -> bool {
         .map(|a| (a.endpoint.clone(), a))
         .collect();
     if assign_map.is_empty() {
-        return false;
+        return 0;
     }
 
-    let mut tasks = Vec::new();
+    let mut dispatched = 0usize;
     for (vm_name, ep, kid) in ov_vms {
+        if app.is_deleting(&vm_name) {
+            continue;
+        }
         let Some(a) = assign_map.get(&ep).cloned() else {
             continue;
         };
-        let should_run = {
-            let map = app.keep_alive.l();
-            match map.get(&vm_name) {
+        let claimed = {
+            let cur_epoch = app.current_keep_alive_epoch(&vm_name);
+            let mut map = app.keep_alive.l();
+            match map.get_mut(&vm_name) {
                 Some(rt) => {
-                    rt.config.enabled
+                    let handover = rt.endpoint.as_deref().is_some_and(|c| c != ep.as_str())
+                        || rt
+                            .last_verified_endpoint
+                            .as_deref()
+                            .is_some_and(|v| v != ep.as_str());
+                    if handover {
+                        rt.reset_verification(Some(ep.clone()));
+                        rt.epoch = app.bump_keep_alive_epoch(&vm_name);
+                    } else if rt.endpoint.is_none() {
+                        rt.endpoint = Some(ep.clone());
+                    }
+                    let due = rt.config.enabled
                         && !rt.in_flight
                         && rt
                             .last_attempt_instant
                             .map(|t| t.elapsed() >= Duration::from_secs(rt.config.interval_seconds))
-                            .unwrap_or(true)
+                            .unwrap_or(true);
+                    if (due && rt.epoch == cur_epoch) || (due && handover) {
+                        let tick_id = app.next_keep_alive_tick_id();
+                        let tick_cancel = tokio_util::sync::CancellationToken::new();
+                        rt.in_flight = true;
+                        rt.in_flight_tick_id = Some(tick_id);
+                        rt.active_cancel = Some(tick_cancel.clone());
+                        rt.last_attempt_instant = Some(Instant::now());
+                        Some((
+                            tick_id,
+                            tick_cancel,
+                            rt.config.clone(),
+                            rt.epoch,
+                            rt.policy_version,
+                            ep.clone(),
+                        ))
+                    } else {
+                        None
+                    }
                 }
-                None => false,
+                None => None,
             }
         };
-        if should_run {
-            let app_c = app.clone();
-            tasks.push(tokio::spawn(async move {
-                run_keep_alive_tick_for_vm(&app_c, &vm_name, &a, kid, false).await
-            }));
-        }
-    }
 
-    if tasks.is_empty() {
-        return false;
-    }
-    let mut ran_any = false;
-    for t in tasks {
-        if let Ok(Some(_)) = t.await {
-            ran_any = true;
+        if let Some((tick_id, tick_cancel, cfg, start_epoch, start_pv, start_ep)) = claimed {
+            dispatched += 1;
+            let guard = KeepAliveInFlightGuard {
+                app: app.clone(),
+                vm_name: vm_name.clone(),
+                tick_id,
+            };
+            let app_c = app.clone();
+            let on_done_c = on_tick_done.clone();
+            tokio::spawn(async move {
+                let res = run_keep_alive_tick_inner(
+                    &app_c,
+                    &vm_name,
+                    &a,
+                    kid,
+                    false,
+                    true,
+                    Some(start_epoch),
+                    Some((
+                        tick_id,
+                        tick_cancel,
+                        cfg,
+                        start_epoch,
+                        start_pv,
+                        start_ep,
+                        guard,
+                    )),
+                )
+                .await;
+                if res.is_some() {
+                    on_done_c(app_c).await;
+                }
+            });
         }
     }
-    ran_any
+    dispatched
+}
+
+fn record_profile_persistence_result(app: &AppState, name: &str, res: anyhow::Result<()>) {
+    let mut map = app.keep_alive.l();
+    if let Some(rt) = map.get_mut(name) {
+        match res {
+            Ok(()) => {
+                rt.profile_saved = true;
+                rt.persistence_error = None;
+            }
+            Err(e) => {
+                rt.profile_saved = false;
+                rt.persistence_error = Some(format!(
+                    "保活/会话档案持久化失败（重启后可能失效）: {e:#}"
+                ));
+            }
+        }
+    }
+}
+
+fn persist_relay_profile_before_alloc(
+    app: &AppState,
+    name: &str,
+    had_ws_entry: bool,
+    session_profile: &cli::SessionProfile,
+) -> Result<(), String> {
+    if let Err(e) = cli::save_session_profile(name, session_profile) {
+        if !had_ws_entry && !cli::read_sessions().contains_key(name) {
+            cli::remove_workspace_entry(name);
+        }
+        app.invalidate_keep_alive(name, true);
+        app.release_busy(name, "creating");
+        return Err(format!(
+            "保存接力会话档案失败，已取消创建（未申请云端实例）: {e:#}"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) async fn set_vm_keep_alive_inner(
@@ -3428,19 +3966,30 @@ pub(crate) async fn set_vm_keep_alive_inner(
         let entry = map
             .entry(clean_name.to_string())
             .or_insert_with(|| VmKeepAliveRuntime::from_config(validated.clone(), None));
+        let was_enabled = entry.config.enabled;
+        let policy_changed = entry.config != validated;
         entry.config = validated.clone();
+        entry.profile_saved = true;
+        entry.persistence_error = None;
+        if policy_changed {
+            entry.policy_version = entry.policy_version.saturating_add(1);
+        }
         if !validated.enabled {
+            entry.epoch = app.bump_keep_alive_epoch(clean_name);
+            if let Some(tok) = entry.active_cancel.take() {
+                tok.cancel();
+            }
+            entry.in_flight = false;
+            entry.in_flight_tick_id = None;
             entry.consecutive_failures = 0;
             entry.last_error = None;
             entry.kernel_ping_state = "disabled".into();
-        } else {
-            // 开启或修改保活策略后，重置间隔计时使下一次/本次立即生效
-            entry.last_attempt_instant = None;
-            if !validated.kernel_ping {
-                entry.kernel_ping_state = "disabled".into();
-            } else if entry.kernel_ping_state == "disabled" {
-                entry.kernel_ping_state = "pending".into();
-            }
+        } else if policy_changed || !was_enabled {
+            let cur_ep = entry.endpoint.clone();
+            entry.reset_verification(cur_ep);
+            entry.epoch = app.bump_keep_alive_epoch(clean_name);
+        } else if entry.epoch == 0 {
+            entry.epoch = app.current_keep_alive_epoch(clean_name);
         }
         entry.to_status()
     };
@@ -3455,8 +4004,9 @@ async fn set_vm_keep_alive(
     config: KeepAliveConfig,
 ) -> Result<KeepAliveStatus, String> {
     let app = state.inner().clone();
-    let status = set_vm_keep_alive_inner(&app, &name, config.clone()).await?;
-    if config.enabled {
+    let status = set_vm_keep_alive_inner(&app, &name, config).await?;
+    if status.enabled {
+        let expected_ep = app.current_keep_alive_epoch(name.trim());
         if let Some(a) = app.find_assignment_by_name(&name).await {
             let kid = app
                 .overview
@@ -3470,7 +4020,16 @@ async fn set_vm_keep_alive(
             let handle_bg = handle.clone();
             let name_bg = name.clone();
             tauri::async_runtime::spawn(async move {
-                let _ = run_keep_alive_tick_for_vm(&app_bg, &name_bg, &a, kid, true).await;
+                let _ = run_keep_alive_tick_for_vm(
+                    &app_bg,
+                    &name_bg,
+                    &a,
+                    kid,
+                    true,
+                    true,
+                    Some(expected_ep),
+                )
+                .await;
                 let ov = refresh_overview_opts(&app_bg, false, true).await;
                 emit_overview(&handle_bg, &ov);
             });
@@ -3480,15 +4039,12 @@ async fn set_vm_keep_alive(
     Ok(status)
 }
 
-#[tauri::command]
-async fn ping_vm_keep_alive(
-    handle: AppHandle,
-    state: AppStateRef<'_>,
-    name: String,
+pub(crate) async fn ping_vm_keep_alive_inner(
+    app: &Arc<AppState>,
+    name: &str,
 ) -> Result<KeepAliveStatus, String> {
-    let app = state.inner().clone();
     let a = app
-        .find_assignment_by_name(&name)
+        .find_assignment_by_name(name)
         .await
         .ok_or_else(|| format!("服务端未找到在线实例 [{name}]"))?;
     let kid = app
@@ -3499,28 +4055,20 @@ async fn ping_vm_keep_alive(
         .iter()
         .find(|v| v.name == name)
         .and_then(|v| v.kernel_id.clone());
-    // 若该实例此前未启用保活，点击“立即保活”时自动记录为开启并执行一次保活脉冲
-    let needs_enable = app
-        .keep_alive
-        .l()
-        .get(&name)
-        .map(|rt| !rt.config.enabled)
-        .unwrap_or(true);
-    if needs_enable {
-        let cfg = app
-            .keep_alive
-            .l()
-            .get(&name)
-            .map(|rt| KeepAliveConfig {
-                enabled: true,
-                ..rt.config.clone()
-            })
-            .unwrap_or_default();
-        let _ = set_vm_keep_alive_inner(&app, &name, cfg).await;
-    }
-    let status = run_keep_alive_tick_for_vm(&app, &name, &a, kid, true)
+    let expected_ep = app.current_keep_alive_epoch(name);
+    run_keep_alive_tick_for_vm(app, name, &a, kid, true, false, Some(expected_ep))
         .await
-        .ok_or_else(|| format!("实例 [{name}] 正在执行保活心跳中，请稍候"))?;
+        .ok_or_else(|| format!("实例 [{name}] 正在执行保活心跳或状态已变更，请稍候"))
+}
+
+#[tauri::command]
+async fn ping_vm_keep_alive(
+    handle: AppHandle,
+    state: AppStateRef<'_>,
+    name: String,
+) -> Result<KeepAliveStatus, String> {
+    let app = state.inner().clone();
+    let status = ping_vm_keep_alive_inner(&app, &name).await?;
     spawn_refresh(&app, &handle);
     Ok(status)
 }
@@ -4346,7 +4894,7 @@ pub(crate) fn validate_and_prepare_create_vm(
         return Err("未找到 colab-cli，可执行文件应位于 ~/.local/bin/colab".into());
     }
 
-    // 只要创建实例，统一校验并配置实例保活策略（缺省默认开启：每 90 秒隧道保活 + 忙时避让 Kernel 心跳）
+    // 只要创建实例，统一校验并配置实例保活策略（缺省默认开启：每 90 秒运行时连接检查 + 忙时避让 Kernel 心跳）
     let validated_keep_alive = req
         .keep_alive
         .clone()
@@ -4443,10 +4991,18 @@ async fn create_vm(
         return Err(format!("名称 [{name}] 已被占用"));
     }
     app.set_deploy_error(&name, None);
-    app.keep_alive.l().insert(
-        name.clone(),
-        VmKeepAliveRuntime::from_config(prep.validated_keep_alive.clone(), None),
-    );
+    let ep_init = app.bump_keep_alive_epoch(&name);
+    {
+        let mut map = app.keep_alive.l();
+        if let Some(old) = map.remove(&name) {
+            if let Some(tok) = old.active_cancel {
+                tok.cancel();
+            }
+        }
+        let mut rt = VmKeepAliveRuntime::from_config(prep.validated_keep_alive.clone(), None);
+        rt.epoch = ep_init;
+        map.insert(name.clone(), rt);
+    }
     let had_ws_entry = cli::has_workspace_entry(&name);
     cli::register_workspace_entry(
         &name,
@@ -4478,7 +5034,12 @@ async fn create_vm(
             grab_config: Some(prep.validated_grab_cfg.clone()),
             updated_at: None,
         };
-        let _ = cli::save_session_profile(&name, &session_profile);
+        if let Err(err_msg) =
+            persist_relay_profile_before_alloc(&app, &name, had_ws_entry, &session_profile)
+        {
+            spawn_refresh(&app, &handle);
+            return Err(err_msg);
+        }
         app.release_busy(&name, "creating");
         start_relay_inner(
             &app,
@@ -4553,7 +5114,7 @@ async fn create_vm(
             if !had_ws_entry && !cli::read_sessions().contains_key(&name) {
                 cli::remove_workspace_entry(&name);
             }
-            app.keep_alive.l().remove(&name);
+            app.invalidate_keep_alive(&name, true);
             app.release_busy(&name, "creating");
             spawn_refresh(&app, &handle);
             return Err(format!("{e:#}"));
@@ -4578,7 +5139,11 @@ async fn create_vm(
         grab_config: Some(prep.validated_grab_cfg.clone()),
         updated_at: None,
     };
-    let _ = cli::save_session_profile(&name, &session_profile);
+    record_profile_persistence_result(
+        &app,
+        &name,
+        cli::save_session_profile(&name, &session_profile),
+    );
 
     {
         let mut map = app.relays.l();
@@ -4646,7 +5211,16 @@ async fn create_vm(
 
         if ka_enabled && !app_bg.is_deleting(&name_bg) {
             if let Some(a) = app_bg.find_assignment_by_name(&name_bg).await {
-                let _ = run_keep_alive_tick_for_vm(&app_bg, &name_bg, &a, None, true).await;
+                let _ = run_keep_alive_tick_for_vm(
+                    &app_bg,
+                    &name_bg,
+                    &a,
+                    None,
+                    true,
+                    true,
+                    Some(ep_init),
+                )
+                .await;
             }
         }
 
@@ -4669,6 +5243,7 @@ async fn delete_vm(
         return Err("该虚拟机正在销毁中".into());
     }
     app.set_busy(&name, Some("deleting"));
+    app.invalidate_keep_alive(&name, true);
     spawn_refresh(&app, &handle);
     let r = hard_terminate(&app, &name, endpoint, true).await;
     app.release_busy(&name, "deleting");
@@ -4816,11 +5391,17 @@ fn start_relay_inner(
         .is_none()
     {
         let default_ka = KeepAliveConfig::default();
-        let _ = cli::save_session_keep_alive(name, &default_ka);
-        app.keep_alive
-            .l()
-            .entry(name.to_string())
-            .or_insert_with(|| VmKeepAliveRuntime::from_config(default_ka, None));
+        let res = cli::save_session_keep_alive(name, &default_ka);
+        {
+            let mut map = app.keep_alive.l();
+            let entry = map
+                .entry(name.to_string())
+                .or_insert_with(|| VmKeepAliveRuntime::from_config(default_ka, None));
+            if entry.epoch == 0 {
+                entry.epoch = app.current_keep_alive_epoch(name);
+            }
+        }
+        record_profile_persistence_result(app, name, res);
     }
     h.log("▶ 接力训练已开启");
     tauri::async_runtime::spawn(relay::run_relay(app.clone(), h.clone()));
@@ -6590,7 +7171,11 @@ impl Drop for ActiveChatGuard {
 
 #[tauri::command]
 async fn cancel_llm_chat(state: AppStateRef<'_>, request_id: String) -> Result<(), String> {
-    let tok = state.active_chats.l().get(&request_id).cloned();
+    let tok = state
+        .active_chats
+        .l()
+        .get(&request_id)
+        .map(|e| e.cancel.clone());
     if let Some(t) = tok {
         t.cancel();
     }
@@ -6605,9 +7190,13 @@ async fn stream_llm_chat(
 ) -> Result<LlmChatResponse, String> {
     let app = state.inner().clone();
     let chat_cancel = tokio_util::sync::CancellationToken::new();
-    app.active_chats
-        .l()
-        .insert(req.request_id.clone(), chat_cancel.clone());
+    app.active_chats.l().insert(
+        req.request_id.clone(),
+        ActiveChatEntry {
+            cancel: chat_cancel.clone(),
+            vm_name: None,
+        },
+    );
     let _guard = ActiveChatGuard {
         app: app.clone(),
         request_id: req.request_id.clone(),
@@ -6616,6 +7205,9 @@ async fn stream_llm_chat(
     let target = resolve_llm_target(&app, &req)
         .await
         .map_err(|e| e.to_string())?;
+    if let Some(entry) = app.active_chats.l().get_mut(&req.request_id) {
+        entry.vm_name = Some(target.vm_name.clone());
+    }
 
     let a = app
         .find_assignment_by_name(&target.vm_name)
@@ -7411,8 +8003,8 @@ fn record_window_state(
 }
 
 fn shutdown_child_processes(app: &AppState) {
-    for tok in app.active_chats.l().values() {
-        tok.cancel();
+    for entry in app.active_chats.l().values() {
+        entry.cancel.cancel();
     }
     for bridge in app.ssh_bridges.l().values() {
         bridge.shutdown();
@@ -7722,20 +8314,26 @@ pub fn run() {
             });
 
             // 后台每实例保活调度器：每 10 秒检查一次各在线实例是否到达保活周期（默认 90s），
-            // 自动发送 `/tun/m/keep-alive/{endpoint}` 与忙时避让的轻量 Jupyter Kernel `pass` 心跳
+            // 并发独立派发，不等待慢实例，避免推迟其他实例下一轮调度（#100）。
             let ka_state = app.state::<Arc<AppState>>().inner().clone();
             let ka_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(10));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                ticker.tick().await;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    ticker.tick().await;
                     let st = ka_state.clone();
                     let h = ka_handle.clone();
                     let res = tauri::async_runtime::spawn(async move {
-                        let ran = run_keep_alive_scheduler_pass(&st).await;
-                        if ran {
-                            let ov = refresh_overview_opts(&st, false, false).await;
-                            emit_overview(&h, &ov);
-                        }
+                        dispatch_keep_alive_scheduler_pass_with(&st, move |app_done| {
+                            let h_done = h.clone();
+                            async move {
+                                let ov = refresh_overview_opts(&app_done, false, false).await;
+                                emit_overview(&h_done, &ov);
+                            }
+                        })
+                        .await;
                     })
                     .await;
                     if let Err(e) = res {
@@ -9691,16 +10289,14 @@ sys.exit(rc)
     }
 
     #[tokio::test]
-    async fn keep_alive_engine_defaults_on_create_skips_busy_kernel_and_persists_toggle() {
+    async fn keep_alive_engine_checks_runtime_and_skips_busy_kernel() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let _env_guard = cli::TEST_ENV_LOCK.lock().await;
 
         let ka_hits = Arc::new(AtomicUsize::new(0));
-        let kernel_state_busy = Arc::new(AtomicBool::new(true));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let ka_hits_srv = ka_hits.clone();
-        let busy_srv = kernel_state_busy.clone();
 
         let srv = tokio::spawn(async move {
             loop {
@@ -9708,34 +10304,17 @@ sys.exit(rc)
                     break;
                 };
                 let hits = ka_hits_srv.clone();
-                let is_busy = busy_srv.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let n = sock.read(&mut buf).await.unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]).to_string();
                     let req_low = req.to_ascii_lowercase();
                     let first = req.lines().next().unwrap_or("");
-                    let (status, body) = if first.starts_with("GET /tun/m/keep-alive/m-s-ka-vm1") {
+                    let (status, body) = if first.starts_with("GET /api/kernels?")
+                        && req_low.contains("x-colab-runtime-proxy-token: proxy-tok")
+                    {
                         hits.fetch_add(1, Ordering::SeqCst);
-                        if req_low.contains("x-colab-tunnel: google") {
-                            ("200 OK", ")]}'\n{}")
-                        } else {
-                            ("400 Bad Request", "missing X-Colab-Tunnel")
-                        }
-                    } else if first.starts_with("GET /api/kernels") {
-                        let kstate = if is_busy.load(Ordering::SeqCst) {
-                            "busy"
-                        } else {
-                            "idle"
-                        };
-                        (
-                            "200 OK",
-                            if kstate == "busy" {
-                                r#"[{"id":"k-busy-1","name":"python3","execution_state":"busy","connections":1}]"#
-                            } else {
-                                r#"[{"id":"k-idle-1","name":"python3","execution_state":"idle","connections":0}]"#
-                            },
-                        )
+                        ("200 OK", r#"[{"id":"k-busy-1","name":"python3","execution_state":"busy","connections":1}]"#)
                     } else {
                         ("404 Not Found", "{}")
                     };
@@ -9826,7 +10405,7 @@ sys.exit(rc)
                 url: format!("http://{addr}"),
             },
         };
-        let st_tick = run_keep_alive_tick_for_vm(&app, "ka-vm1", &a, None, true)
+        let st_tick = run_keep_alive_tick_for_vm(&app, "ka-vm1", &a, None, true, true, None)
             .await
             .expect("forced keep-alive tick should run");
         assert_eq!(ka_hits.load(Ordering::SeqCst), 1);
@@ -9835,6 +10414,16 @@ sys.exit(rc)
         assert_eq!(st_tick.state, "active");
         assert_eq!(st_tick.success_count, 1);
         assert!(st_tick.last_ok_at.is_some());
+
+        let mut unreachable = a.clone();
+        unreachable.runtime_proxy_info.url.push_str("/unreachable");
+        let st_failed = run_keep_alive_tick_for_vm(&app, "ka-vm1", &unreachable, None, true, true, None)
+            .await
+            .expect("failed connection check should report keep-alive status");
+        assert!(st_failed.enabled);
+        assert!(!st_failed.tunnel_ok);
+        assert_eq!(st_failed.state, "error");
+        assert_eq!(st_failed.success_count, 1);
 
         // 4. Disabling keep-alive persists enabled=false and transitions to paused
         let st_off = set_vm_keep_alive_inner(
@@ -9851,7 +10440,7 @@ sys.exit(rc)
         assert!(!st_off.enabled);
         assert_eq!(st_off.state, "paused");
         assert!(
-            run_keep_alive_tick_for_vm(&app, "ka-vm1", &a, None, false)
+            run_keep_alive_tick_for_vm(&app, "ka-vm1", &a, None, false, true, None)
                 .await
                 .is_none(),
             "scheduled tick must skip paused keep-alive VM"
@@ -10134,6 +10723,1473 @@ sys.exit(0)
         *cli::TEST_CONFIG_DIR.l() = None;
         *cli::TEST_COLAB_BIN.l() = None;
         *cli::TEST_RCLONE_CONF.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn sha1_digest(data: &[u8]) -> [u8; 20] {
+        let mut msg = data.to_vec();
+        let bit_len = (data.len() as u64) * 8;
+        msg.push(0x80);
+        while (msg.len() % 64) != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+        let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+        for chunk in msg.chunks_exact(64) {
+            let mut w = [0u32; 80];
+            for i in 0..16 {
+                w[i] = u32::from_be_bytes([
+                    chunk[4 * i],
+                    chunk[4 * i + 1],
+                    chunk[4 * i + 2],
+                    chunk[4 * i + 3],
+                ]);
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+            let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+            for (i, &wi) in w.iter().enumerate() {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
+                    20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                    _ => (b ^ c ^ d, 0xCA62C1D6),
+                };
+                let temp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(wi);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = temp;
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+        }
+        let mut out = [0u8; 20];
+        for (i, val) in h.iter().enumerate() {
+            out[4 * i..4 * i + 4].copy_from_slice(&val.to_be_bytes());
+        }
+        out
+    }
+
+    async fn read_ws_frame(sock: &mut tokio::net::TcpStream) -> Option<(u8, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+        let mut hdr = [0u8; 2];
+        sock.read_exact(&mut hdr).await.ok()?;
+        let opcode = hdr[0] & 0x0f;
+        let masked = (hdr[1] & 0x80) != 0;
+        let mut len = (hdr[1] & 0x7f) as usize;
+        if len == 126 {
+            let mut ext = [0u8; 2];
+            sock.read_exact(&mut ext).await.ok()?;
+            len = u16::from_be_bytes(ext) as usize;
+        } else if len == 127 {
+            let mut ext = [0u8; 8];
+            sock.read_exact(&mut ext).await.ok()?;
+            len = u64::from_be_bytes(ext) as usize;
+        }
+        let mut mask = [0u8; 4];
+        if masked {
+            sock.read_exact(&mut mask).await.ok()?;
+        }
+        let mut payload = vec![0u8; len];
+        sock.read_exact(&mut payload).await.ok()?;
+        if masked {
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= mask[i % 4];
+            }
+        }
+        Some((opcode, payload))
+    }
+
+    async fn write_ws_frame(sock: &mut tokio::net::TcpStream, opcode: u8, payload: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let mut frame = Vec::with_capacity(payload.len() + 10);
+        frame.push(0x80 | (opcode & 0x0f));
+        let len = payload.len();
+        if len < 126 {
+            frame.push(len as u8);
+        } else if len <= 65535 {
+            frame.push(126);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            frame.push(127);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(payload);
+        let _ = sock.write_all(&frame).await;
+    }
+
+    #[tokio::test]
+    async fn test_issue_89_pause_and_delete_invalidate_inflight_and_queued_keep_alive() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _env_guard = cli::TEST_ENV_LOCK.lock().await;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let block_next = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits_s = hits.clone();
+        let block_s = block_next.clone();
+        let arrived_s = arrived.clone();
+        let release_s = release.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits_c = hits_s.clone();
+                let block_c = block_s.clone();
+                let arrived_c = arrived_s.clone();
+                let release_c = release_s.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    hits_c.fetch_add(1, Ordering::SeqCst);
+                    if block_c.load(Ordering::SeqCst) {
+                        arrived_c.notify_waiters();
+                        release_c.notified().await;
+                    }
+                    let body = r#"[{"id":"k-busy","name":"python3","execution_state":"busy","connections":1}]"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!("pilot_ka89_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("cfg");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let tok_path = cfg_dir.join("token.json");
+        std::fs::write(
+            &tok_path,
+            r#"{"token":"ka-oauth","refresh_token":"rt","client_id":"c","client_secret":"s","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir);
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_path);
+        let app = AppState::new_with(client, ws_dir);
+
+        let a = Assignment {
+            accelerator: "T4".into(),
+            endpoint: "m-s-89".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("STANDARD".into()),
+            runtime_proxy_info: crate::colab::RuntimeProxyInfo {
+                token: "proxy-89".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+
+        set_vm_keep_alive_inner(&app, "vm-89", KeepAliveConfig::default())
+            .await
+            .unwrap();
+        let ep1 = app.current_keep_alive_epoch("vm-89");
+
+        // 1. Pause while tick #1 is blocked in Stage 1 (/api/kernels) -> must cancel & return None
+        let app_t1 = app.clone();
+        let a_t1 = a.clone();
+        let t1 = tokio::spawn(async move {
+            run_keep_alive_tick_for_vm(&app_t1, "vm-89", &a_t1, None, true, true, Some(ep1)).await
+        });
+        arrived.notified().await;
+        set_vm_keep_alive_inner(
+            &app,
+            "vm-89",
+            KeepAliveConfig {
+                enabled: false,
+                interval_seconds: 90,
+                kernel_ping: true,
+            },
+        )
+        .await
+        .unwrap();
+        release.notify_waiters();
+        assert!(t1.await.unwrap().is_none(), "paused tick must abort and return None");
+        assert!(!app.keep_alive.l().get("vm-89").unwrap().in_flight);
+
+        // 2. Queued force=true tick with stale epoch from before pause must do 0 HTTP calls
+        let hits_before = hits.load(Ordering::SeqCst);
+        let stale_res = run_keep_alive_tick_for_vm(&app, "vm-89", &a, None, true, true, Some(ep1)).await;
+        assert!(stale_res.is_none());
+        assert_eq!(hits.load(Ordering::SeqCst), hits_before);
+
+        // 3. Re-enable and start tick #2, delete VM via cleanup_local_vm_artifacts while in flight -> must NOT re-insert!
+        set_vm_keep_alive_inner(&app, "vm-89", KeepAliveConfig::default())
+            .await
+            .unwrap();
+        let ep2 = app.current_keep_alive_epoch("vm-89");
+        let app_t2 = app.clone();
+        let a_t2 = a.clone();
+        let t2 = tokio::spawn(async move {
+            run_keep_alive_tick_for_vm(&app_t2, "vm-89", &a_t2, None, true, true, Some(ep2)).await
+        });
+        arrived.notified().await;
+        app.set_busy("vm-89", Some("deleting"));
+        cleanup_local_vm_artifacts(&app, "vm-89");
+        release.notify_waiters();
+        assert!(t2.await.unwrap().is_none(), "deleted VM tick must return None");
+        assert!(
+            !app.keep_alive.l().contains_key("vm-89"),
+            "late tick must NEVER re-insert deleted VM into app.keep_alive"
+        );
+        // snapshot_keep_alive_for_vm while deleting must also skip inserting
+        let snap_del = snapshot_keep_alive_for_vm(&app, "vm-89", Some("m-s-89"), &cli::read_session_profiles());
+        assert_eq!(snap_del.state, "paused");
+        assert!(!app.keep_alive.l().contains_key("vm-89"));
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_90_handover_and_reenable_reset_and_reject_stale_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _env_guard = cli::TEST_ENV_LOCK.lock().await;
+
+        let block_ep_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ep_a_arrived = Arc::new(tokio::sync::Notify::new());
+        let ep_a_release = Arc::new(tokio::sync::Notify::new());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let block_s = block_ep_a.clone();
+        let arrived_s = ep_a_arrived.clone();
+        let release_s = ep_a_release.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let block_c = block_s.clone();
+                let arrived_c = arrived_s.clone();
+                let release_c = release_s.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if req.contains("tok-a") && block_c.load(Ordering::SeqCst) {
+                        arrived_c.notify_waiters();
+                        release_c.notified().await;
+                    }
+                    let body = r#"[{"id":"k-busy","name":"python3","execution_state":"busy","connections":1}]"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!("pilot_ka90_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("cfg");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let tok_path = cfg_dir.join("token.json");
+        std::fs::write(
+            &tok_path,
+            r#"{"token":"ka-oauth","refresh_token":"rt","client_id":"c","client_secret":"s","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir);
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_path);
+        let app = AppState::new_with(client, ws_dir);
+
+        let assign_a = Assignment {
+            accelerator: "T4".into(),
+            endpoint: "m-s-A".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("STANDARD".into()),
+            runtime_proxy_info: crate::colab::RuntimeProxyInfo {
+                token: "tok-a".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+        let assign_b = Assignment {
+            accelerator: "T4".into(),
+            endpoint: "m-s-B".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("STANDARD".into()),
+            runtime_proxy_info: crate::colab::RuntimeProxyInfo {
+                token: "tok-b".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+
+        set_vm_keep_alive_inner(&app, "relay-90", KeepAliveConfig::default())
+            .await
+            .unwrap();
+        let st_a = run_keep_alive_tick_for_vm(&app, "relay-90", &assign_a, None, true, true, None)
+            .await
+            .unwrap();
+        assert_eq!(st_a.success_count, 1);
+        assert!(st_a.tunnel_ok);
+        assert!(st_a.last_ok_at.is_some());
+
+        // Start hanging tick on endpoint A, then switch VM to endpoint B via snapshot_keep_alive_for_vm
+        block_ep_a.store(true, Ordering::SeqCst);
+        let app_bg = app.clone();
+        let assign_a_bg = assign_a.clone();
+        let late_tick = tokio::spawn(async move {
+            run_keep_alive_tick_for_vm(&app_bg, "relay-90", &assign_a_bg, None, true, true, None)
+                .await
+        });
+        ep_a_arrived.notified().await;
+
+        let profiles = cli::read_session_profiles();
+        let snap_b = snapshot_keep_alive_for_vm(&app, "relay-90", Some("m-s-B"), &profiles);
+        assert_eq!(snap_b.state, "idle");
+        assert!(!snap_b.tunnel_ok);
+        assert!(snap_b.last_ok_at.is_none());
+        assert_eq!(snap_b.success_count, 0);
+
+        // Release old endpoint A response -> late tick must be discarded and NOT credit endpoint B
+        ep_a_release.notify_waiters();
+        assert!(late_tick.await.unwrap().is_none());
+        let snap_b_after = snapshot_keep_alive_for_vm(&app, "relay-90", Some("m-s-B"), &profiles);
+        assert_eq!(snap_b_after.state, "idle");
+        assert!(!snap_b_after.tunnel_ok);
+        assert!(snap_b_after.last_ok_at.is_none());
+        assert_eq!(snap_b_after.success_count, 0);
+
+        // Endpoint B's own tick activates it
+        let st_b = run_keep_alive_tick_for_vm(&app, "relay-90", &assign_b, None, true, true, None)
+            .await
+            .unwrap();
+        assert_eq!(st_b.state, "active");
+        assert_eq!(st_b.success_count, 1);
+        assert!(st_b.last_ok_at.is_some());
+
+        // Pause and re-enable must reset prior verification until re-verified
+        set_vm_keep_alive_inner(
+            &app,
+            "relay-90",
+            KeepAliveConfig {
+                enabled: false,
+                interval_seconds: 90,
+                kernel_ping: true,
+            },
+        )
+        .await
+        .unwrap();
+        let st_re = set_vm_keep_alive_inner(&app, "relay-90", KeepAliveConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(st_re.state, "idle");
+        assert!(!st_re.tunnel_ok);
+        assert!(st_re.last_ok_at.is_none());
+        assert_eq!(st_re.success_count, 0);
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_91_ping_preserves_paused_policy_and_reports_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _env_guard = cli::TEST_ENV_LOCK.lock().await;
+
+        let mode = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mode_s = mode.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let cur_mode = mode_s.load(Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let first = req.lines().next().unwrap_or("");
+                    let (status, body) = if first.starts_with("GET /tun/m/assignments") {
+                        (
+                            "200 OK".to_string(),
+                            format!(
+                                r#"{{"assignments":[{{"accelerator":"T4","endpoint":"m-s-91","variant":"GPU","machineShape":"STANDARD","runtimeProxyInfo":{{"token":"proxy-91","tokenExpiresInSeconds":3600,"url":"http://{addr}"}}}}]}}"#
+                            ),
+                        )
+                    } else if first.starts_with("GET /api/kernels") {
+                        if cur_mode == 0 {
+                            ("503 Service Unavailable".to_string(), "upstream 503".to_string())
+                        } else {
+                            (
+                                "200 OK".to_string(),
+                                r#"[{"id":"k-busy-91","name":"python3","execution_state":"busy","connections":1}]"#.to_string(),
+                            )
+                        }
+                    } else {
+                        ("404 Not Found".to_string(), "{}".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!("pilot_ka91_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("cfg");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let tok_path = cfg_dir.join("token.json");
+        std::fs::write(
+            &tok_path,
+            r#"{"token":"ka-oauth","refresh_token":"rt","client_id":"c","client_secret":"s","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cfg_dir.join("sessions.json"),
+            r#"{"vm-91":{"endpoint":"m-s-91"}}"#,
+        )
+        .unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir);
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_path);
+        let app = AppState::new_with(client, ws_dir);
+
+        let paused_cfg = KeepAliveConfig {
+            enabled: false,
+            interval_seconds: 120,
+            kernel_ping: true,
+        };
+        set_vm_keep_alive_inner(&app, "vm-91", paused_cfg.clone())
+            .await
+            .unwrap();
+
+        // 1. Ping against 503 -> preserves enabled=false AND reports real error
+        mode.store(0, Ordering::SeqCst);
+        let st_err = ping_vm_keep_alive_inner(&app, "vm-91")
+            .await
+            .expect("ping_vm_keep_alive_inner should return KeepAliveStatus");
+        assert!(!st_err.enabled, "manual ping must NEVER enable paused policy");
+        assert_eq!(st_err.state, "error");
+        assert!(!st_err.tunnel_ok);
+        assert_eq!(st_err.kernel_ping_state, "error");
+        assert!(st_err.last_error.is_some());
+        assert_eq!(
+            cli::get_session_profile("vm-91").and_then(|p| p.keep_alive),
+            Some(paused_cfg.clone())
+        );
+
+        // 2. Ping against 200 busy kernel -> preserves enabled=false & reports skipped_busy
+        mode.store(1, Ordering::SeqCst);
+        let st_ok = ping_vm_keep_alive_inner(&app, "vm-91")
+            .await
+            .expect("ping_vm_keep_alive_inner should return KeepAliveStatus");
+        assert!(!st_ok.enabled);
+        assert_eq!(st_ok.state, "paused");
+        assert!(st_ok.tunnel_ok);
+        assert_eq!(st_ok.kernel_ping_state, "skipped_busy");
+        assert!(st_ok.last_error.is_none());
+        assert_eq!(
+            cli::get_session_profile("vm-91").and_then(|p| p.keep_alive),
+            Some(paused_cfg)
+        );
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_92_93_99_remote_kernel_ping_ws_protocol_and_no_kernel_spawn() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _env_guard = cli::TEST_ENV_LOCK.lock().await;
+        let py = cli::colab_python_bin();
+        if !py.exists() {
+            return;
+        }
+
+        // mode: 0 = empty /api/kernels (#93), 1 = idle kernel ok (#99), 2 = idle kernel execute_reply error (#92)
+        let mode = Arc::new(AtomicUsize::new(0));
+        let post_kernel_spawns = Arc::new(AtomicUsize::new(0));
+        let recorded_executes = Arc::new(Mutex::new(Vec::<Value>::new()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mode_s = mode.clone();
+        let spawns_s = post_kernel_spawns.clone();
+        let execs_s = recorded_executes.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mode_c = mode_s.clone();
+                let spawns_c = spawns_s.clone();
+                let execs_c = execs_s.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&buf).to_string();
+                    let first = req.lines().next().unwrap_or("");
+                    let cur_mode = mode_c.load(Ordering::SeqCst);
+
+                    if req.to_ascii_lowercase().contains("upgrade: websocket") {
+                        let ws_key = req
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                if k.trim().eq_ignore_ascii_case("sec-websocket-key") {
+                                    Some(v.trim().to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        let accept_raw = format!("{ws_key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+                        use base64::Engine as _;
+                        let accept = base64::engine::general_purpose::STANDARD
+                            .encode(sha1_digest(accept_raw.as_bytes()));
+                        let hs = format!(
+                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                        );
+                        let _ = sock.write_all(hs.as_bytes()).await;
+
+                        while let Some((opcode, payload)) = read_ws_frame(&mut sock).await {
+                            if opcode == 0x8 {
+                                write_ws_frame(&mut sock, 0x8, &[]).await;
+                                break;
+                            }
+                            if opcode == 0x9 {
+                                write_ws_frame(&mut sock, 0xA, &payload).await;
+                                continue;
+                            }
+                            let json_slice: &[u8] = if payload.first() == Some(&b'{') {
+                                &payload
+                            } else if payload.len() >= 12 {
+                                let off0 = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+                                let off1 = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+                                if off0 <= off1 && off1 <= payload.len() {
+                                    &payload[off0..off1]
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                continue;
+                            };
+                            let Ok(msg) = serde_json::from_slice::<Value>(json_slice) else {
+                                continue;
+                            };
+                            let msg_type = msg["header"]["msg_type"].as_str().unwrap_or("");
+                            let parent_hdr = msg["header"].clone();
+                            if msg_type == "execute_request" {
+                                execs_c.l().push(msg["content"].clone());
+                                let busy_msg = serde_json::json!({
+                                    "channel": "iopub",
+                                    "msg_id": "m-busy",
+                                    "msg_type": "status",
+                                    "header": {"msg_id": "m-busy", "msg_type": "status"},
+                                    "parent_header": parent_hdr,
+                                    "metadata": {},
+                                    "content": {"execution_state": "busy"}
+                                });
+                                write_ws_frame(&mut sock, 0x1, busy_msg.to_string().as_bytes()).await;
+
+                                let idle_msg = serde_json::json!({
+                                    "channel": "iopub",
+                                    "msg_id": "m-idle",
+                                    "msg_type": "status",
+                                    "header": {"msg_id": "m-idle", "msg_type": "status"},
+                                    "parent_header": parent_hdr,
+                                    "metadata": {},
+                                    "content": {"execution_state": "idle"}
+                                });
+                                write_ws_frame(&mut sock, 0x1, idle_msg.to_string().as_bytes()).await;
+
+                                let reply_content = if cur_mode == 2 {
+                                    serde_json::json!({
+                                        "status": "error",
+                                        "ename": "PolicyError",
+                                        "evalue": "execution rejected"
+                                    })
+                                } else {
+                                    serde_json::json!({
+                                        "status": "ok",
+                                        "execution_count": 1
+                                    })
+                                };
+                                let reply_msg = serde_json::json!({
+                                    "channel": "shell",
+                                    "msg_id": "m-reply",
+                                    "msg_type": "execute_reply",
+                                    "header": {"msg_id": "m-reply", "msg_type": "execute_reply"},
+                                    "parent_header": parent_hdr,
+                                    "metadata": {},
+                                    "content": reply_content
+                                });
+                                write_ws_frame(&mut sock, 0x1, reply_msg.to_string().as_bytes()).await;
+                            }
+                        }
+                        return;
+                    }
+
+                    let (status, body) = if first.starts_with("POST /api/kernels") {
+                        spawns_c.fetch_add(1, Ordering::SeqCst);
+                        ("500 Internal Server Error", r#"{"error":"spawn forbidden"}"#)
+                    } else if first.starts_with("GET /api/kernels/k-idle-1") {
+                        if cur_mode == 0 {
+                            ("404 Not Found", r#"{"message":"not found"}"#)
+                        } else {
+                            ("200 OK", r#"{"id":"k-idle-1","name":"python3","execution_state":"idle","connections":0}"#)
+                        }
+                    } else if first.starts_with("GET /api/kernels") {
+                        if cur_mode == 0 {
+                            ("200 OK", r#"[]"#)
+                        } else {
+                            ("200 OK", r#"[{"id":"k-idle-1","name":"python3","execution_state":"idle","connections":0}]"#)
+                        }
+                    } else {
+                        ("404 Not Found", "{}")
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!("pilot_ka92_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("cfg");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let tok_path = cfg_dir.join("token.json");
+        std::fs::write(
+            &tok_path,
+            r#"{"token":"ka-oauth","refresh_token":"rt","client_id":"c","client_secret":"s","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir);
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_path);
+        let app = AppState::new_with(client, ws_dir);
+        set_vm_keep_alive_inner(&app, "vm-92", KeepAliveConfig::default())
+            .await
+            .unwrap();
+
+        let a = Assignment {
+            accelerator: "T4".into(),
+            endpoint: "m-s-92".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("STANDARD".into()),
+            runtime_proxy_info: crate::colab::RuntimeProxyInfo {
+                token: "proxy-92".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+
+        // 1. #93: Empty /api/kernels + stale kernel_hint -> skipped_no_kernel, 0 POST /api/kernels
+        mode.store(0, Ordering::SeqCst);
+        let st_empty = run_keep_alive_tick_for_vm(
+            &app,
+            "vm-92",
+            &a,
+            Some("retired-kid".into()),
+            true,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(st_empty.tunnel_ok);
+        assert_eq!(st_empty.kernel_ping_state, "skipped_no_kernel");
+        assert_eq!(st_empty.state, "active");
+        assert_eq!(post_kernel_spawns.load(Ordering::SeqCst), 0);
+
+        // Also test retired-kid direct call to execute_remote_kernel_ping returns NoKernel with 0 POST
+        let direct_retired = execute_remote_kernel_ping(&a, "k-idle-1", None)
+            .await
+            .expect("retired kernel must return Ok(NoKernel)");
+        assert_eq!(direct_retired, KernelPingOutcome::NoKernel);
+        assert_eq!(post_kernel_spawns.load(Ordering::SeqCst), 0);
+
+        // 2. #99: Idle kernel sends silent=True, store_history=False, allow_stdin=False and succeeds
+        mode.store(1, Ordering::SeqCst);
+        let st_ok = run_keep_alive_tick_for_vm(&app, "vm-92", &a, None, true, true, None)
+            .await
+            .unwrap();
+        assert!(st_ok.tunnel_ok);
+        assert_eq!(st_ok.kernel_ping_state, "ok");
+        assert_eq!(st_ok.state, "active");
+        {
+            let execs = recorded_executes.l();
+            assert_eq!(execs.len(), 1);
+            assert_eq!(execs[0]["code"], "pass");
+            assert_eq!(execs[0]["silent"], true);
+            assert_eq!(execs[0]["store_history"], false);
+            assert_eq!(execs[0]["allow_stdin"], false);
+        }
+
+        // 3. #92: execute_reply status="error" -> execute_remote_kernel_ping errors & state="error"
+        mode.store(2, Ordering::SeqCst);
+        let st_err = run_keep_alive_tick_for_vm(&app, "vm-92", &a, None, true, true, None)
+            .await
+            .unwrap();
+        assert!(st_err.tunnel_ok);
+        assert_eq!(st_err.kernel_ping_state, "error");
+        assert_eq!(st_err.state, "error");
+        assert!(st_err.last_error.as_deref().unwrap_or("").contains("PolicyError"));
+        assert_eq!(post_kernel_spawns.load(Ordering::SeqCst), 0);
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_93_dead_terminating_restarting_kernels_skipped_without_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _env_guard = cli::TEST_ENV_LOCK.lock().await;
+
+        let post_kernel_spawns = Arc::new(AtomicUsize::new(0));
+        let ws_attempts = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let spawns_s = post_kernel_spawns.clone();
+        let ws_s = ws_attempts.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let spawns_c = spawns_s.clone();
+                let ws_c = ws_s.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let first = req.lines().next().unwrap_or("");
+                    if req.to_ascii_lowercase().contains("upgrade: websocket") {
+                        ws_c.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let (status, body) = if first.starts_with("POST /api/kernels") {
+                        spawns_c.fetch_add(1, Ordering::SeqCst);
+                        ("500 Internal Server Error", r#"{"error":"spawn forbidden"}"#)
+                    } else if first.starts_with("GET /api/kernels") {
+                        (
+                            "200 OK",
+                            r#"[{"id":"k1","name":"python3","execution_state":"dead","connections":0},{"id":"k2","name":"python3","execution_state":"terminating","connections":0},{"id":"k3","name":"python3","execution_state":"restarting","connections":0}]"#,
+                        )
+                    } else {
+                        ("404 Not Found", "{}")
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!("pilot_ka93_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("cfg");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let tok_path = cfg_dir.join("token.json");
+        std::fs::write(
+            &tok_path,
+            r#"{"token":"ka-oauth","refresh_token":"rt","client_id":"c","client_secret":"s","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir);
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_path);
+        let app = AppState::new_with(client, ws_dir);
+        set_vm_keep_alive_inner(&app, "vm-93", KeepAliveConfig::default())
+            .await
+            .unwrap();
+
+        let a = Assignment {
+            accelerator: "T4".into(),
+            endpoint: "m-s-93".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("STANDARD".into()),
+            runtime_proxy_info: crate::colab::RuntimeProxyInfo {
+                token: "proxy-93".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+
+        let st = run_keep_alive_tick_for_vm(
+            &app,
+            "vm-93",
+            &a,
+            Some("k1".into()),
+            true,
+            true,
+            None,
+        )
+        .await
+        .expect("keep-alive tick should return status");
+        assert!(st.tunnel_ok);
+        assert_eq!(st.kernel_ping_state, "skipped_no_kernel");
+        assert_eq!(st.state, "active");
+        assert!(st.last_error.is_none());
+        assert_eq!(post_kernel_spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(ws_attempts.load(Ordering::SeqCst), 0);
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_95_active_chat_only_skips_target_vm() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _env_guard = cli::TEST_ENV_LOCK.lock().await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    // Return empty kernels so vm-b completes without needing Python WS,
+                    // whereas vm-a skips via local_busy ("skipped_busy") before kernel selection!
+                    let body = r#"[]"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!("pilot_ka95_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("cfg");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let tok_path = cfg_dir.join("token.json");
+        std::fs::write(
+            &tok_path,
+            r#"{"token":"ka-oauth","refresh_token":"rt","client_id":"c","client_secret":"s","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir);
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_path);
+        let app = AppState::new_with(client, ws_dir);
+
+        set_vm_keep_alive_inner(&app, "vm-a", KeepAliveConfig::default())
+            .await
+            .unwrap();
+        set_vm_keep_alive_inner(&app, "vm-b", KeepAliveConfig::default())
+            .await
+            .unwrap();
+
+        // Active chat ONLY on vm-a
+        app.active_chats.l().insert(
+            "req-1".into(),
+            ActiveChatEntry {
+                cancel: tokio_util::sync::CancellationToken::new(),
+                vm_name: Some("vm-a".into()),
+            },
+        );
+
+        let assign_a = Assignment {
+            accelerator: "T4".into(),
+            endpoint: "m-s-a".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("STANDARD".into()),
+            runtime_proxy_info: crate::colab::RuntimeProxyInfo {
+                token: "tok-a".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+        let assign_b = Assignment {
+            accelerator: "T4".into(),
+            endpoint: "m-s-b".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("STANDARD".into()),
+            runtime_proxy_info: crate::colab::RuntimeProxyInfo {
+                token: "tok-b".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+
+        let st_a = run_keep_alive_tick_for_vm(&app, "vm-a", &assign_a, None, true, true, None)
+            .await
+            .unwrap();
+        let st_b = run_keep_alive_tick_for_vm(&app, "vm-b", &assign_b, None, true, true, None)
+            .await
+            .unwrap();
+
+        assert_eq!(st_a.kernel_ping_state, "skipped_busy", "vm-a must skip due to active chat on vm-a");
+        assert_ne!(st_b.kernel_ping_state, "skipped_busy", "vm-b must NOT be suppressed by chat on vm-a");
+        assert_eq!(st_b.kernel_ping_state, "skipped_no_kernel");
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_96_disabled_keep_alive_normalizes_bad_interval() {
+        let _env_guard = cli::TEST_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("pilot_ka96_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("cfg");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let tok_path = cfg_dir.join("token.json");
+        std::fs::write(
+            &tok_path,
+            r#"{"token":"ka-oauth","refresh_token":"rt","client_id":"c","client_secret":"s","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let fake_colab = tmp.join("fake_colab.cmd");
+        std::fs::write(&fake_colab, "@echo off\r\nexit /b 0\r\n").unwrap();
+
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir);
+        *cli::TEST_COLAB_BIN.l() = Some(fake_colab);
+
+        let client = ColabClient::new_for_test("http://127.0.0.1:9".into(), tok_path);
+        let app = AppState::new_with(client, ws_dir);
+
+        // Disabled keep-alive with out-of-range intervals normalizes to 90s
+        let v_low = KeepAliveConfig {
+            enabled: false,
+            interval_seconds: 29,
+            kernel_ping: true,
+        }
+        .validate()
+        .expect("disabled keep-alive with 29s must normalize");
+        assert_eq!(v_low.interval_seconds, 90);
+
+        let v_high = KeepAliveConfig {
+            enabled: false,
+            interval_seconds: 601,
+            kernel_ping: false,
+        }
+        .validate()
+        .expect("disabled keep-alive with 601s must normalize");
+        assert_eq!(v_high.interval_seconds, 90);
+
+        // Disabled keep-alive with valid interval preserves it
+        let v_ok = KeepAliveConfig {
+            enabled: false,
+            interval_seconds: 180,
+            kernel_ping: true,
+        }
+        .validate()
+        .expect("disabled keep-alive with valid interval must pass");
+        assert_eq!(v_ok.interval_seconds, 180);
+
+        // Enabled keep-alive with out-of-range intervals still errors
+        assert!(KeepAliveConfig {
+            enabled: true,
+            interval_seconds: 29,
+            kernel_ping: true,
+        }
+        .validate()
+        .is_err());
+        assert!(KeepAliveConfig {
+            enabled: true,
+            interval_seconds: 601,
+            kernel_ping: true,
+        }
+        .validate()
+        .is_err());
+
+        // validate_and_prepare_create_vm succeeds with disabled stale interval=10
+        let prep = validate_and_prepare_create_vm(
+            &app,
+            &CreateVmRequest {
+                name: Some("vm-96".into()),
+                accelerator: "T4".into(),
+                boot_mode: Some("general".into()),
+                keep_alive: Some(KeepAliveConfig {
+                    enabled: false,
+                    interval_seconds: 10,
+                    kernel_ping: true,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("create_vm validation must not block disabled keep-alive");
+        assert!(!prep.validated_keep_alive.enabled);
+        assert_eq!(prep.validated_keep_alive.interval_seconds, 90);
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_97_profile_persistence_failure_surfaces_and_recovers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _env_guard = cli::TEST_ENV_LOCK.lock().await;
+        let mode = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mode_s = mode.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mode_c = mode_s.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&buf).to_string();
+                    let first = req.lines().next().unwrap_or("");
+                    let cur_mode = mode_c.load(Ordering::SeqCst);
+
+                    if req.to_ascii_lowercase().contains("upgrade: websocket") {
+                        let ws_key = req
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                if k.trim().eq_ignore_ascii_case("sec-websocket-key") {
+                                    Some(v.trim().to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        let accept_raw = format!("{ws_key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+                        use base64::Engine as _;
+                        let accept = base64::engine::general_purpose::STANDARD
+                            .encode(sha1_digest(accept_raw.as_bytes()));
+                        let hs = format!(
+                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                        );
+                        let _ = sock.write_all(hs.as_bytes()).await;
+
+                        while let Some((opcode, payload)) = read_ws_frame(&mut sock).await {
+                            if opcode == 0x8 {
+                                write_ws_frame(&mut sock, 0x8, &[]).await;
+                                break;
+                            }
+                            if opcode == 0x9 {
+                                write_ws_frame(&mut sock, 0xA, &payload).await;
+                                continue;
+                            }
+                            let json_slice: &[u8] = if payload.first() == Some(&b'{') {
+                                &payload
+                            } else if payload.len() >= 12 {
+                                let off0 = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+                                let off1 = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+                                if off0 <= off1 && off1 <= payload.len() {
+                                    &payload[off0..off1]
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                continue;
+                            };
+                            let Ok(msg) = serde_json::from_slice::<Value>(json_slice) else {
+                                continue;
+                            };
+                            let msg_type = msg["header"]["msg_type"].as_str().unwrap_or("");
+                            let parent_hdr = msg["header"].clone();
+                            if msg_type == "execute_request" {
+                                let busy_msg = serde_json::json!({
+                                    "channel": "iopub",
+                                    "msg_id": "m-busy-97",
+                                    "msg_type": "status",
+                                    "header": {"msg_id": "m-busy-97", "msg_type": "status"},
+                                    "parent_header": parent_hdr,
+                                    "metadata": {},
+                                    "content": {"execution_state": "busy"}
+                                });
+                                write_ws_frame(&mut sock, 0x1, busy_msg.to_string().as_bytes()).await;
+                                let idle_msg = serde_json::json!({
+                                    "channel": "iopub",
+                                    "msg_id": "m-idle-97",
+                                    "msg_type": "status",
+                                    "header": {"msg_id": "m-idle-97", "msg_type": "status"},
+                                    "parent_header": parent_hdr,
+                                    "metadata": {},
+                                    "content": {"execution_state": "idle"}
+                                });
+                                write_ws_frame(&mut sock, 0x1, idle_msg.to_string().as_bytes()).await;
+                                let reply_msg = serde_json::json!({
+                                    "channel": "shell",
+                                    "msg_id": "m-reply-97",
+                                    "msg_type": "execute_reply",
+                                    "header": {"msg_id": "m-reply-97", "msg_type": "execute_reply"},
+                                    "parent_header": parent_hdr,
+                                    "metadata": {},
+                                    "content": {"status": "ok", "execution_count": 1}
+                                });
+                                write_ws_frame(&mut sock, 0x1, reply_msg.to_string().as_bytes()).await;
+                            }
+                        }
+                        return;
+                    }
+
+                    let (status, body) = if first.starts_with("GET /tun/m/assignments") {
+                        (
+                            "200 OK".to_string(),
+                            format!(
+                                r#"{{"assignments":[{{"accelerator":"T4","endpoint":"m-s-97","variant":"GPU","machineShape":"STANDARD","runtimeProxyInfo":{{"token":"proxy-97","tokenExpiresInSeconds":3600,"url":"http://{addr}"}}}}]}}"#
+                            ),
+                        )
+                    } else if first.starts_with("GET /api/kernels/k-idle-97") {
+                        ("200 OK".to_string(), r#"{"id":"k-idle-97","name":"python3","execution_state":"idle","connections":0}"#.to_string())
+                    } else if first.starts_with("GET /api/kernels") {
+                        if cur_mode == 1 {
+                            ("503 Service Unavailable".to_string(), "upstream 503".to_string())
+                        } else {
+                            (
+                                "200 OK".to_string(),
+                                r#"[{"id":"k-idle-97","name":"python3","execution_state":"idle","connections":0}]"#.to_string(),
+                            )
+                        }
+                    } else {
+                        ("404 Not Found".to_string(), "{}".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!("pilot_ka97_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("cfg");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let tok_path = cfg_dir.join("token.json");
+        std::fs::write(
+            &tok_path,
+            r#"{"token":"ka-oauth","refresh_token":"rt","client_id":"c","client_secret":"s","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cfg_dir.join("sessions.json"),
+            r#"{"vm-97":{"endpoint":"m-s-97"}}"#,
+        )
+        .unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir);
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_path);
+        let app = AppState::new_with(client, ws_dir);
+
+        // Replace pilot_session_profiles.json with a directory so saving fails
+        let prof_path = cli::session_profiles_path();
+        std::fs::create_dir_all(&prof_path).unwrap();
+
+        // 1. Relay pre-alloc failure returns Err AND rolls back workspace / keep_alive / busy
+        app.try_claim_busy("relay-97", "creating");
+        app.keep_alive.l().insert(
+            "relay-97".into(),
+            VmKeepAliveRuntime::from_config(KeepAliveConfig::default(), None),
+        );
+        cli::register_workspace_entry("relay-97", "ws", None, None);
+        let err = persist_relay_profile_before_alloc(
+            &app,
+            "relay-97",
+            false,
+            &cli::SessionProfile::default(),
+        )
+        .expect_err("unwritable profiles path must fail pre-alloc relay creation");
+        assert!(err.contains("档案"));
+        assert!(!cli::has_workspace_entry("relay-97"));
+        assert!(!app.keep_alive.l().contains_key("relay-97"));
+        assert!(!app.busy.l().contains_key("relay-97"));
+
+        // 2. Post-alloc persistence failure surfaces independently without corrupting runtime state or last_error
+        app.keep_alive.l().insert(
+            "vm-97".into(),
+            VmKeepAliveRuntime::from_config(
+                KeepAliveConfig {
+                    enabled: false,
+                    interval_seconds: 90,
+                    kernel_ping: true,
+                },
+                None,
+            ),
+        );
+        let res = cli::save_session_profile("vm-97", &cli::SessionProfile::default());
+        record_profile_persistence_result(&app, "vm-97", res);
+        let st_fail = app.keep_alive.l().get("vm-97").unwrap().to_status();
+        assert!(!st_fail.profile_saved);
+        assert!(st_fail.persistence_error.is_some());
+        assert_eq!(st_fail.state, "paused", "persistence failure must keep paused state");
+        assert!(st_fail.last_error.is_none(), "persistence_error must not leak into last_error");
+
+        // 2b. Manual ping succeeding on paused VM with profile_saved=false keeps state="paused", last_error=None
+        if cli::colab_python_bin().exists() {
+            mode.store(0, Ordering::SeqCst);
+            let st_ping_ok = ping_vm_keep_alive_inner(&app, "vm-97")
+                .await
+                .expect("ping_vm_keep_alive_inner should succeed");
+            assert!(!st_ping_ok.enabled);
+            assert!(st_ping_ok.tunnel_ok);
+            assert_eq!(st_ping_ok.kernel_ping_state, "ok");
+            assert_eq!(st_ping_ok.state, "paused");
+            assert!(st_ping_ok.last_error.is_none());
+            assert!(!st_ping_ok.profile_saved);
+            assert!(st_ping_ok.persistence_error.is_some());
+        }
+
+        // 2c. Manual ping failing with 503 sets state="error" & last_error=Some(...) alongside persistence_error
+        mode.store(1, Ordering::SeqCst);
+        let st_ping_err = ping_vm_keep_alive_inner(&app, "vm-97")
+            .await
+            .expect("ping_vm_keep_alive_inner should return KeepAliveStatus on 503");
+        assert!(!st_ping_err.tunnel_ok);
+        assert_eq!(st_ping_err.state, "error");
+        assert!(st_ping_err.last_error.is_some());
+        assert!(!st_ping_err.profile_saved);
+        assert!(st_ping_err.persistence_error.is_some());
+
+        // 3. Restore writable file and call set_vm_keep_alive_inner -> clears persistence_error
+        std::fs::remove_dir_all(&prof_path).unwrap();
+        let st_ok = set_vm_keep_alive_inner(&app, "vm-97", KeepAliveConfig::default())
+            .await
+            .expect("retry set_vm_keep_alive_inner should succeed");
+        assert!(st_ok.profile_saved);
+        assert!(st_ok.persistence_error.is_none());
+        assert_eq!(st_ok.state, "idle");
+        assert!(st_ok.last_error.is_none());
+
+        *cli::TEST_CONFIG_DIR.l() = None;
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_100_slow_vm_does_not_delay_fast_vm_next_round() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _env_guard = cli::TEST_ENV_LOCK.lock().await;
+
+        let fast_hits = Arc::new(AtomicUsize::new(0));
+        let slow_hits = Arc::new(AtomicUsize::new(0));
+        let slow_arrived = Arc::new(tokio::sync::Notify::new());
+        let slow_release = Arc::new(tokio::sync::Notify::new());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fh = fast_hits.clone();
+        let sh = slow_hits.clone();
+        let sa = slow_arrived.clone();
+        let sr = slow_release.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let fh_c = fh.clone();
+                let sh_c = sh.clone();
+                let sa_c = sa.clone();
+                let sr_c = sr.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if req.contains("tok-slow") {
+                        sh_c.fetch_add(1, Ordering::SeqCst);
+                        sa_c.notify_waiters();
+                        sr_c.notified().await;
+                    } else {
+                        fh_c.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let body = r#"[{"id":"k-busy","name":"python3","execution_state":"busy","connections":1}]"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!("pilot_ka100_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("cfg");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let tok_path = cfg_dir.join("token.json");
+        std::fs::write(
+            &tok_path,
+            r#"{"token":"ka-oauth","refresh_token":"rt","client_id":"c","client_secret":"s","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir);
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), tok_path);
+        let app = AppState::new_with(client, ws_dir);
+
+        let fast_a = Assignment {
+            accelerator: "T4".into(),
+            endpoint: "m-s-fast".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("STANDARD".into()),
+            runtime_proxy_info: crate::colab::RuntimeProxyInfo {
+                token: "tok-fast".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+        let slow_a = Assignment {
+            accelerator: "T4".into(),
+            endpoint: "m-s-slow".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("STANDARD".into()),
+            runtime_proxy_info: crate::colab::RuntimeProxyInfo {
+                token: "tok-slow".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+
+        let cfg30 = KeepAliveConfig {
+            enabled: true,
+            interval_seconds: 30,
+            kernel_ping: true,
+        };
+        set_vm_keep_alive_inner(&app, "fast-vm", cfg30.clone())
+            .await
+            .unwrap();
+        set_vm_keep_alive_inner(&app, "slow-vm", cfg30)
+            .await
+            .unwrap();
+
+        *app.last_assignments.l() = Some((vec![fast_a, slow_a], Instant::now(), 1));
+        {
+            let mut ov = app.overview.write().await;
+            ov.vms = vec![
+                VmView {
+                    name: "fast-vm".into(),
+                    endpoint: Some("m-s-fast".into()),
+                    on_server: true,
+                    ..Default::default()
+                },
+                VmView {
+                    name: "slow-vm".into(),
+                    endpoint: Some("m-s-slow".into()),
+                    on_server: true,
+                    ..Default::default()
+                },
+            ];
+        }
+
+        // Round 1: dispatch must return immediately (< 100ms) while slow-vm stays blocked
+        let t0 = Instant::now();
+        let n1 = dispatch_keep_alive_scheduler_pass(&app).await;
+        assert_eq!(n1, 2);
+        assert!(t0.elapsed() < Duration::from_millis(100));
+        slow_arrived.notified().await;
+
+        // Wait briefly for fast-vm's round 1 task to finish
+        for _ in 0..50 {
+            if !app.keep_alive.l().get("fast-vm").unwrap().in_flight {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fast_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_hits.load(Ordering::SeqCst), 1);
+        assert!(app.keep_alive.l().get("slow-vm").unwrap().in_flight);
+
+        // Simulate next interval elapsed for fast-vm while slow-vm is still blocked
+        app.keep_alive.l().get_mut("fast-vm").unwrap().last_attempt_instant =
+            Some(Instant::now() - Duration::from_secs(31));
+
+        let n2 = dispatch_keep_alive_scheduler_pass(&app).await;
+        assert_eq!(n2, 1, "only fast-vm should be dispatched while slow-vm is in_flight");
+        for _ in 0..50 {
+            if fast_hits.load(Ordering::SeqCst) >= 2
+                && !app.keep_alive.l().get("fast-vm").unwrap().in_flight
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fast_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(slow_hits.load(Ordering::SeqCst), 1, "slow-vm must not be double-dispatched");
+
+        slow_release.notify_waiters();
+        for _ in 0..50 {
+            if !app.keep_alive.l().get("slow-vm").unwrap().in_flight {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!app.keep_alive.l().get("slow-vm").unwrap().in_flight);
+
+        *cli::TEST_CONFIG_DIR.l() = None;
         srv.abort();
         let _ = std::fs::remove_dir_all(&tmp);
     }

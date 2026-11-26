@@ -27,6 +27,7 @@ import {
   DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
   DEFAULT_RELAY_GRAB_RETRY_SECONDS,
   DEFAULT_VM_GRAB_RETRY_SECONDS,
+  KEEP_ALIVE_PRESET_INTERVALS,
   MAX_GRAB_RETRY_SECONDS,
   MAX_KEEP_ALIVE_INTERVAL_SECONDS,
   MAX_RELAY_SESSION_HOURS,
@@ -45,6 +46,7 @@ import {
   isValidKeepAliveInterval,
   isValidRelayGrabTimeoutMinutes,
   isValidRelaySessionHours,
+  normalizeKeepAliveConfig,
   parseFallbackGpuInput,
   requiresGdriveConfig,
   resolveEffectiveHighMem,
@@ -150,7 +152,7 @@ export function CreateVmDialog(props: {
   const [grabCfg, setGrabCfg] = useState<GrabConfig>({ ...DEFAULT_GRAB_CONFIG });
   const [grabFallbacksRaw, setGrabFallbacksRaw] = useState("");
 
-  // 实例保活策略（只要创建实例，默认启用每 90s 隧道保活 + 忙时避让 Kernel 脉冲）
+  // 新建实例默认每 90 秒检查运行时连接并在 Kernel 空闲时发送脉冲。
   const [keepAliveCfg, setKeepAliveCfg] = useState<KeepAliveConfig>({ ...DEFAULT_KEEP_ALIVE });
 
   // Colab 高级运行时环境配置（#67：通用模式下 syncRclone 默认 false）
@@ -264,7 +266,7 @@ export function CreateVmDialog(props: {
 
     setKeepAliveCfg(
       p?.keep_alive
-        ? { ...DEFAULT_KEEP_ALIVE, ...p.keep_alive }
+        ? normalizeKeepAliveConfig({ ...DEFAULT_KEEP_ALIVE, ...p.keep_alive })
         : { ...DEFAULT_KEEP_ALIVE },
     );
 
@@ -434,7 +436,7 @@ export function CreateVmDialog(props: {
     }
     if (!keepAliveIntervalOk) {
       setSubmitError(
-        `实例保活心跳间隔必须在 ${MIN_KEEP_ALIVE_INTERVAL_SECONDS} ~ ${MAX_KEEP_ALIVE_INTERVAL_SECONDS} 秒之间。`,
+        `连接检查间隔必须在 ${MIN_KEEP_ALIVE_INTERVAL_SECONDS} ~ ${MAX_KEEP_ALIVE_INTERVAL_SECONDS} 秒之间。`,
       );
       return;
     }
@@ -525,13 +527,7 @@ export function CreateVmDialog(props: {
           startup_script: startupScript.trim() || null,
           env_vars: envVars.trim() || null,
         },
-        keep_alive: {
-          enabled: keepAliveCfg.enabled,
-          interval_seconds: Number.isFinite(keepAliveCfg.interval_seconds)
-            ? Math.round(keepAliveCfg.interval_seconds)
-            : DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
-          kernel_ping: keepAliveCfg.kernel_ping,
-        },
+        keep_alive: normalizeKeepAliveConfig(keepAliveCfg),
         grab_config: {
           mode: grabCfg.mode,
           retry_seconds: Number.isFinite(grabCfg.retry_seconds)
@@ -1427,24 +1423,26 @@ export function CreateVmDialog(props: {
           <div className="cfg-panel-head">
             <span className="cfg-panel-title">
               <HeartPulse size={14} color={keepAliveCfg.enabled ? "var(--success)" : "var(--muted)"} />
-              实例保活策略（防止空闲 60–90 分钟被提前回收）
+              实例保活策略
             </span>
             <label className="ka-inline-switch">
               <input
                 type="checkbox"
                 checked={keepAliveCfg.enabled}
                 onChange={(e) =>
-                  setKeepAliveCfg((prev) => ({ ...prev, enabled: e.target.checked }))
+                  setKeepAliveCfg((prev) =>
+                    normalizeKeepAliveConfig({ ...prev, enabled: e.target.checked }),
+                  )
                 }
                 style={{ accentColor: "var(--success)" }}
               />
-              <span>{keepAliveCfg.enabled ? "开机后自动开启保活" : "暂不开启（手动控制）"}</span>
+              <span>{keepAliveCfg.enabled ? "开机后自动检查运行时连接" : "暂不开启（手动控制）"}</span>
             </label>
           </div>
 
           <div className="ka-create-row">
             <div className="field" style={{ minWidth: 165 }}>
-              <label>保活心跳间隔 ({MIN_KEEP_ALIVE_INTERVAL_SECONDS}~{MAX_KEEP_ALIVE_INTERVAL_SECONDS}s)</label>
+              <label>连接检查间隔 ({MIN_KEEP_ALIVE_INTERVAL_SECONDS}~{MAX_KEEP_ALIVE_INTERVAL_SECONDS}s)</label>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <input
                   type="number"
@@ -1461,7 +1459,7 @@ export function CreateVmDialog(props: {
                   }}
                 />
                 <div className="preset-pills">
-                  {[60, 90, 180, 300].map((sec) => (
+                  {KEEP_ALIVE_PRESET_INTERVALS.map((sec) => (
                     <button
                       type="button"
                       key={sec}
@@ -1494,7 +1492,7 @@ export function CreateVmDialog(props: {
               <div>
                 <div className="t">启用轻量 Jupyter Kernel 脉冲心跳（<code>pass</code>）</div>
                 <div className="d">
-                  仅在 Kernel 空闲时毫秒级刷新 <code>last_activity</code>，检测到任务运行中自动避让、绝不阻塞队列
+                  仅在 Kernel 空闲时发送脉冲，任务运行时自动跳过。
                 </div>
               </div>
             </label>
@@ -1502,14 +1500,14 @@ export function CreateVmDialog(props: {
 
           {!keepAliveIntervalOk && (
             <div className="field-err">
-              实例保活心跳间隔必须在 {MIN_KEEP_ALIVE_INTERVAL_SECONDS} ~ {MAX_KEEP_ALIVE_INTERVAL_SECONDS} 秒之间。
+              连接检查间隔必须在 {MIN_KEEP_ALIVE_INTERVAL_SECONDS} ~ {MAX_KEEP_ALIVE_INTERVAL_SECONDS} 秒之间。
             </div>
           )}
 
           <div className="field-hint" style={{ marginTop: 2 }}>
             {keepAliveCfg.enabled
-              ? `开机后将每 ${Number.isFinite(keepAliveCfg.interval_seconds) ? Math.round(keepAliveCfg.interval_seconds) : DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS} 秒自动续租 /tun/m/keep-alive 隧道并自动刷新 1h 代理令牌${keepAliveCfg.kernel_ping ? " + 忙时避让 Kernel 脉冲" : ""}；创建后可随时在实例卡片一键关闭。`
-              : "未开启保活时，若仅通过 SSH / 交互终端后台运行任务且 Jupyter Kernel 空闲，约 60–90 分钟可能触发 Colab 空闲回收。"}
+              ? `开机后每 ${Number.isFinite(keepAliveCfg.interval_seconds) ? Math.round(keepAliveCfg.interval_seconds) : DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS} 秒检查运行时连接${keepAliveCfg.kernel_ping ? "，并在 Kernel 空闲时发送脉冲" : ""}。`
+              : "可在实例卡片上开启运行时连接检查。"}
           </div>
         </div>
       )}

@@ -1289,8 +1289,20 @@ test("Per-instance Keep-Alive: default creation config, interval validation, bad
   });
   assert.equal(badgeBusy.tone, "ok");
   assert.match(badgeBusy.label, /保活运行中 \(90s\)/);
+  assert.match(badgeBusy.detail, /运行时连接正常/);
   assert.match(badgeBusy.detail, /忙时已自动避让/);
   assert.match(badgeBusy.detail, /累计 5 次/);
+
+  const badgeConnectionOnly = chatUtils.resolveKeepAliveBadge({
+    enabled: true,
+    state: "active",
+    interval_seconds: 90,
+    kernel_ping: false,
+    kernel_ping_state: "disabled",
+    last_ok_at: 1795400000,
+  });
+  assert.equal(badgeConnectionOnly.label, "连接检查运行中 (90s)");
+  assert.equal(badgeConnectionOnly.detail, "运行时连接正常 · Kernel 脉冲已关闭");
 
   const badgeErr = chatUtils.resolveKeepAliveBadge({
     enabled: true,
@@ -1300,7 +1312,7 @@ test("Per-instance Keep-Alive: default creation config, interval validation, bad
     last_ok_at: null,
     kernel_ping_state: "error",
     success_count: 0,
-    last_error: "隧道保活失败: HTTP 503",
+    last_error: "运行时连接检查失败: HTTP 503",
   });
   assert.equal(badgeErr.tone, "bad");
   assert.equal(badgeErr.label, "保活异常");
@@ -1354,7 +1366,7 @@ test("Per-instance Keep-Alive: default creation config, interval validation, bad
   );
   assert.match(createDlgSrc, /DEFAULT_KEEP_ALIVE/);
   assert.match(createDlgSrc, /实例保活策略/);
-  assert.match(createDlgSrc, /keep_alive:\s*\{/);
+  assert.match(createDlgSrc, /keep_alive:\s*normalizeKeepAliveConfig\(/);
 
   const vmCardSrc = fs.readFileSync(
     path.join(repoRoot, "src", "components", "VmCard.tsx"),
@@ -1445,4 +1457,488 @@ test("GPU grab policy modes, cancel_create_vm API, countdown formatter, and Rela
   );
   assert.match(relayPanelSrc, /抢卡策略/);
   assert.match(relayPanelSrc, /备选卡型/);
+});
+
+// ───────────────────── Issues #91, #96, #97, #98 & Historical Gap Closures ─────────────────────
+test("Issues #91, #96, #97, #98: ping outcome, disabled interval normalization, persistence surfacing, and card custom interval", () => {
+  // #91: evaluatePingKeepAliveOutcome must treat !tunnel_ok / kernel error / last_error as error even when state === "paused"
+  const pausedTunnelFail = chatUtils.evaluatePingKeepAliveOutcome("vm-paused", {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: null,
+    last_attempt_at: 1795400000,
+    tunnel_ok: false,
+    kernel_ping_state: "disabled",
+    success_count: 0,
+    consecutive_failures: 1,
+    last_error: null,
+  });
+  assert.equal(pausedTunnelFail.ok, false);
+  assert.equal(pausedTunnelFail.toastKind, "error");
+  assert.doesNotMatch(pausedTunnelFail.message, /运行时连接正常/);
+
+  const pausedKernelFail = chatUtils.evaluatePingKeepAliveOutcome("vm-paused", {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: null,
+    last_attempt_at: 1795400000,
+    tunnel_ok: true,
+    kernel_ping_state: "error",
+    success_count: 0,
+    consecutive_failures: 1,
+    last_error: null,
+  });
+  assert.equal(pausedKernelFail.ok, false);
+  assert.equal(pausedKernelFail.toastKind, "error");
+  assert.doesNotMatch(pausedKernelFail.message, /运行时连接正常/);
+
+  const pausedLastErr = chatUtils.evaluatePingKeepAliveOutcome("vm-paused", {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: null,
+    last_attempt_at: 1795400000,
+    tunnel_ok: true,
+    kernel_ping_state: "ok",
+    success_count: 0,
+    consecutive_failures: 1,
+    last_error: "502 Bad Gateway",
+  });
+  assert.equal(pausedLastErr.ok, false);
+  assert.equal(pausedLastErr.toastKind, "error");
+  assert.match(pausedLastErr.message, /502 Bad Gateway/);
+
+  const pausedSingleShotOk = chatUtils.evaluatePingKeepAliveOutcome("vm-paused", {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: 1795400000,
+    last_attempt_at: 1795400000,
+    tunnel_ok: true,
+    kernel_ping_state: "ok",
+    success_count: 1,
+    consecutive_failures: 0,
+    last_error: null,
+  });
+  assert.equal(pausedSingleShotOk.ok, true);
+  assert.equal(pausedSingleShotOk.toastKind, "success");
+  assert.match(pausedSingleShotOk.message, /单次检查正常/);
+  assert.match(pausedSingleShotOk.message, /自动保活仍为关闭状态/);
+
+  const enabledOk = chatUtils.evaluatePingKeepAliveOutcome("vm-on", {
+    enabled: true,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "active",
+    last_ok_at: 1795400000,
+    last_attempt_at: 1795400000,
+    tunnel_ok: true,
+    kernel_ping_state: "skipped_no_kernel",
+    success_count: 1,
+    consecutive_failures: 0,
+    last_error: null,
+  });
+  assert.equal(enabledOk.ok, true);
+  assert.equal(enabledOk.toastKind, "success");
+  assert.match(enabledOk.message, /运行时连接正常/);
+  assert.match(enabledOk.message, /暂无活跃 Kernel/);
+
+  // #91: resolveKeepAliveBadge distinguishes fresh paused vs paused single-shot failure
+  const freshPaused = chatUtils.resolveKeepAliveBadge({
+    enabled: false,
+    state: "paused",
+    tunnel_ok: false,
+    last_attempt_at: null,
+    last_error: null,
+  });
+  assert.equal(freshPaused.tone, "muted");
+  assert.equal(freshPaused.label, "保活未开启");
+
+  const pausedPingErrBadge = chatUtils.resolveKeepAliveBadge({
+    enabled: false,
+    state: "paused",
+    tunnel_ok: false,
+    last_attempt_at: 1795400000,
+    last_error: null,
+  });
+  assert.equal(pausedPingErrBadge.tone, "bad");
+  assert.match(pausedPingErrBadge.label, /单次检查异常/);
+
+  // #96: normalizeKeepAliveConfig normalizes invalid intervals when disabled, preserves when enabled
+  assert.deepEqual(
+    chatUtils.normalizeKeepAliveConfig({ enabled: false, interval_seconds: 29, kernel_ping: true }),
+    { enabled: false, interval_seconds: 90, kernel_ping: true },
+  );
+  assert.deepEqual(
+    chatUtils.normalizeKeepAliveConfig({ enabled: false, interval_seconds: 601, kernel_ping: false }),
+    { enabled: false, interval_seconds: 90, kernel_ping: false },
+  );
+  assert.deepEqual(
+    chatUtils.normalizeKeepAliveConfig({
+      enabled: false,
+      interval_seconds: Number.NaN,
+      kernel_ping: true,
+    }),
+    { enabled: false, interval_seconds: 90, kernel_ping: true },
+  );
+  assert.deepEqual(
+    chatUtils.normalizeKeepAliveConfig({ enabled: false, interval_seconds: 180, kernel_ping: true }),
+    { enabled: false, interval_seconds: 180, kernel_ping: true },
+  );
+  assert.deepEqual(
+    chatUtils.normalizeKeepAliveConfig({ enabled: true, interval_seconds: 29, kernel_ping: true }),
+    { enabled: true, interval_seconds: 29, kernel_ping: true },
+  );
+
+  // #97: resolveKeepAliveBadge surfaces persistence failures even when last_ok_at is set or enabled is false
+  const activePersistFail = chatUtils.resolveKeepAliveBadge({
+    enabled: true,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "active",
+    last_ok_at: 1795400000,
+    kernel_ping_state: "ok",
+    profile_saved: false,
+    persistence_error: "Permission denied writing pilot_session_profiles.json",
+  });
+  assert.equal(activePersistFail.tone, "warn");
+  assert.notEqual(activePersistFail.tone, "ok");
+  assert.match(activePersistFail.label, /档案未保存/);
+  assert.match(activePersistFail.persistenceError, /Permission denied/);
+
+  const pausedPersistFail = chatUtils.resolveKeepAliveBadge({
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: null,
+    profile_saved: false,
+    persistence_error: null,
+  });
+  assert.equal(pausedPersistFail.tone, "warn");
+  assert.notEqual(pausedPersistFail.tone, "muted");
+  assert.match(pausedPersistFail.label, /档案未保存/);
+  assert.ok(pausedPersistFail.persistenceError);
+
+  // #98: parseKeepAliveIntervalInput & KEEP_ALIVE_PRESET_INTERVALS
+  assert.deepEqual([...chatUtils.KEEP_ALIVE_PRESET_INTERVALS], [60, 90, 180, 300]);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("30"), 30);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("473"), 473);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("600"), 600);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("29"), null);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("601"), null);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("47.5"), null);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput(""), null);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("abc"), null);
+
+  // Source wiring checks for App.tsx, CreateVmDialog.tsx, VmCard.tsx, types.ts
+  const typesSrc = fs.readFileSync(path.join(repoRoot, "src", "types.ts"), "utf8");
+  assert.match(typesSrc, /profile_saved\?:\s*boolean/);
+  assert.match(typesSrc, /persistence_error\?:\s*string \| null/);
+
+  const appSrc = fs.readFileSync(path.join(repoRoot, "src", "App.tsx"), "utf8");
+  assert.match(appSrc, /evaluatePingKeepAliveOutcome/);
+  assert.match(appSrc, /profile_saved === false/);
+  assert.match(appSrc, /persistence_error/);
+
+  const createDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "CreateVmDialog.tsx"),
+    "utf8",
+  );
+  assert.match(createDlgSrc, /normalizeKeepAliveConfig/);
+
+  const vmCardSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "VmCard.tsx"),
+    "utf8",
+  );
+  assert.doesNotMatch(vmCardSrc, /<select[^>]*className="ka-select"/);
+  assert.match(vmCardSrc, /type="number"[\s\S]*?className=\{`ka-interval-input/);
+  assert.match(vmCardSrc, /KEEP_ALIVE_PRESET_INTERVALS/);
+  assert.match(vmCardSrc, /重试保存策略/);
+  assert.match(vmCardSrc, /单次保活/);
+});
+
+test("Historical gap closures (#48, #59, #64, #66, #71)", async () => {
+  // #64: isLlmVmReady returns false when deploy_error is set even if stale telemetry.llm.online is true
+  const failedWithStaleLlm = {
+    name: "llm-stale",
+    on_server: true,
+    busy: null,
+    deploy_error: "vLLM exited with code 1",
+    telemetry: {
+      llm: { online: true, backend_healthy: true, role: "active" },
+    },
+  };
+  assert.equal(chatUtils.isLlmVmReady(failedWithStaleLlm), false);
+
+  // #66: .modal-head and .modal-foot flex-shrink: 0, .modal-body min-height: 0 and overflow-y: auto
+  const css = fs.readFileSync(path.join(repoRoot, "src", "styles.css"), "utf8");
+  assert.match(css, /\.modal-head\s*\{[^}]*flex-shrink:\s*0/);
+  assert.match(css, /\.modal-foot\s*\{[^}]*flex-shrink:\s*0/);
+  assert.match(css, /\.modal-body\s*\{[^}]*min-height:\s*0[^}]*overflow-y:\s*auto/);
+
+  // #59: api.rotateLlmApiKey IPC & App.tsx empty-key guard
+  mockTauriCore.invokeCalls.length = 0;
+  await apiMod.api.rotateLlmApiKey("llm-blue", "sk-custom-123");
+  assert.deepEqual(mockTauriCore.invokeCalls[0], {
+    cmd: "rotate_llm_api_key",
+    args: { vmName: "llm-blue", customKey: "sk-custom-123" },
+  });
+  const appSrc = fs.readFileSync(path.join(repoRoot, "src", "App.tsx"), "utf8");
+  assert.match(appSrc, /!updated \|\| typeof updated\.api_key !== "string" \|\| !updated\.api_key\.trim\(\)/);
+
+  // #71 & #48: ScriptDialog scrollIntoView on confirmDiscard & DeleteVmDialog checks vm.llm_api
+  const scriptDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "ScriptDialog.tsx"),
+    "utf8",
+  );
+  assert.match(scriptDlgSrc, /confirmDiscardRef\.current\?\.scrollIntoView/);
+
+  const deleteDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "DeleteVmDialog.tsx"),
+    "utf8",
+  );
+  assert.match(deleteDlgSrc, /!!vm\.llm_api/);
+  assert.match(deleteDlgSrc, /vm\.busy === "deploying_llm"/);
+  assert.match(deleteDlgSrc, /vm\.telemetry\?\.threads\?\.llm_process/);
+});
+
+test("Iteration 2 regressions: resolveKeepAliveBadge combinatorial invariants, KeepAliveBar Escape/focus guards, and #48 explicit offline slot isolation", () => {
+  // 1) Explicit Challenger #91 / #97 badge regression cases
+  const activeLastOkWithTunnelAndKernelErr = chatUtils.resolveKeepAliveBadge({
+    enabled: true,
+    state: "active",
+    last_ok_at: 1699999900,
+    tunnel_ok: false,
+    last_attempt_at: 1700000000,
+    kernel_ping_state: "error",
+    last_error: "HTTP 503",
+  });
+  assert.equal(activeLastOkWithTunnelAndKernelErr.tone, "bad");
+  assert.match(activeLastOkWithTunnelAndKernelErr.detail, /HTTP 503/);
+
+  const activeLastOkWithLastErrorOnly = chatUtils.resolveKeepAliveBadge({
+    enabled: true,
+    state: "active",
+    last_ok_at: 1699999900,
+    tunnel_ok: true,
+    kernel_ping_state: "ok",
+    last_error: "HTTP 503",
+  });
+  assert.equal(activeLastOkWithLastErrorOnly.tone, "bad");
+  assert.match(activeLastOkWithLastErrorOnly.detail, /HTTP 503/);
+
+  const pausedKernelErrorOnly = chatUtils.resolveKeepAliveBadge({
+    enabled: false,
+    state: "paused",
+    tunnel_ok: true,
+    kernel_ping: true,
+    kernel_ping_state: "error",
+    last_error: null,
+  });
+  assert.equal(pausedKernelErrorOnly.tone, "bad");
+  assert.match(pausedKernelErrorOnly.label, /单次检查异常/);
+
+  const pausedFailAndPersistFail = chatUtils.resolveKeepAliveBadge({
+    enabled: false,
+    state: "error",
+    last_error: "503",
+    profile_saved: false,
+    persistence_error: "Permission denied",
+  });
+  assert.equal(pausedFailAndPersistFail.tone, "bad");
+  assert.match(pausedFailAndPersistFail.detail, /503/);
+  assert.match(pausedFailAndPersistFail.detail, /Permission denied/);
+  assert.equal(pausedFailAndPersistFail.persistenceError, "Permission denied");
+
+  const freshPaused = chatUtils.resolveKeepAliveBadge({
+    enabled: false,
+    state: "paused",
+    tunnel_ok: false,
+    last_attempt_at: null,
+    last_error: null,
+    kernel_ping_state: "disabled",
+  });
+  assert.equal(freshPaused.tone, "muted");
+  assert.equal(freshPaused.persistenceError, null);
+
+  // Combinatorial invariant check across failure & persistence matrix
+  for (const enabled of [true, false]) {
+    for (const state of ["active", "paused", "error", "idle"]) {
+      for (const tunnel_ok of [true, false]) {
+        for (const kernel_ping_state of ["ok", "error", "disabled", "skipped_busy"]) {
+          for (const last_error of [null, "HTTP 503"]) {
+            for (const last_attempt_at of [null, 1700000000]) {
+              for (const last_ok_at of [null, 1699999900]) {
+                for (const profile_saved of [true, false]) {
+                  for (const persistence_error of [null, "Permission denied"]) {
+                    const ka = {
+                      enabled,
+                      state,
+                      tunnel_ok,
+                      kernel_ping: true,
+                      kernel_ping_state,
+                      last_error,
+                      last_attempt_at,
+                      last_ok_at,
+                      profile_saved,
+                      persistence_error,
+                    };
+                    const badge = chatUtils.resolveKeepAliveBadge(ka);
+                    const expectedFail =
+                      state === "error" ||
+                      Boolean(last_error) ||
+                      kernel_ping_state === "error" ||
+                      (last_attempt_at !== null && tunnel_ok === false);
+                    const expectedPersistFail = !profile_saved || Boolean(persistence_error);
+                    if (expectedFail) {
+                      assert.equal(badge.tone, "bad", `Expected bad for ${JSON.stringify(ka)}`);
+                    }
+                    if (expectedPersistFail) {
+                      assert.notEqual(badge.tone, "ok");
+                      assert.notEqual(badge.tone, "muted");
+                      assert.ok(badge.persistenceError, `Expected persistenceError for ${JSON.stringify(ka)}`);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 2) KeepAliveBar Escape guard & intervalFocused reset when !enabled || busy || disabled
+  const vmCardSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "VmCard.tsx"),
+    "utf8",
+  );
+  assert.match(vmCardSrc, /const skipBlurCommitRef = useRef\(false\)/);
+  assert.match(
+    vmCardSrc,
+    /e\.key === "Escape"[\s\S]*?skipBlurCommitRef\.current = true;[\s\S]*?e\.currentTarget\.blur\(\)/,
+  );
+  assert.match(
+    vmCardSrc,
+    /onBlur=\{\(\) => \{[\s\S]*?if \(skipBlurCommitRef\.current\) \{[\s\S]*?skipBlurCommitRef\.current = false;[\s\S]*?return;/,
+  );
+  assert.match(
+    vmCardSrc,
+    /if \(!enabled \|\| busy \|\| disabled\) \{[\s\S]*?setIntervalFocused\(false\)/,
+  );
+
+  // 3) #48: explicit offline blue_session must NOT hijack `${prefix}-${slot}`
+  const customOfflineStatus = chatUtils.resolveBlueGreenStatus(
+    { session_prefix: "llm", blue_session: "custom-blue", active_slot: "blue" },
+    [
+      {
+        name: "llm-blue",
+        on_server: true,
+        telemetry: { llm: { online: true, backend_healthy: true, slot: "blue", role: "active" } },
+      },
+    ],
+  );
+  assert.equal(customOfflineStatus.blueVm, undefined);
+});
+
+test("M4 Tier-5 regressions: decoupled Rust KeepAliveStatus persistence_error vs runtime health (#97, #91)", () => {
+  // 1) Paused + never pinged + profile_saved: false -> warn badge (not error/bad), single persistence_error
+  const pausedNeverPingedUnsaved = {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: null,
+    last_attempt_at: null,
+    tunnel_ok: false,
+    kernel_ping_state: "disabled",
+    success_count: 0,
+    consecutive_failures: 0,
+    last_error: null,
+    profile_saved: false,
+    persistence_error: "disk read-only",
+  };
+  const badgePausedUnsaved = chatUtils.resolveKeepAliveBadge(pausedNeverPingedUnsaved);
+  assert.equal(badgePausedUnsaved.tone, "warn");
+  assert.equal(badgePausedUnsaved.label, "保活未开启 · 档案未保存");
+  assert.equal(badgePausedUnsaved.detail, "disk read-only");
+  assert.equal(badgePausedUnsaved.persistenceError, "disk read-only");
+
+  // 2) Paused + ping succeeded + profile_saved: false -> warn toast + warn badge without duplicating error
+  const pausedPingOkUnsaved = {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: 1732630500,
+    last_attempt_at: 1732630500,
+    tunnel_ok: true,
+    kernel_ping_state: "ok",
+    success_count: 1,
+    consecutive_failures: 0,
+    last_error: null,
+    profile_saved: false,
+    persistence_error: "disk read-only",
+  };
+  const pingWarnOutcome = chatUtils.evaluatePingKeepAliveOutcome("vm-97", pausedPingOkUnsaved);
+  assert.equal(pingWarnOutcome.ok, true);
+  assert.equal(pingWarnOutcome.toastKind, "warn");
+  assert.match(pingWarnOutcome.message, /单次检查正常/);
+  assert.match(pingWarnOutcome.message, /保活档案未保存（disk read-only）/);
+  const badgePausedPingOkUnsaved = chatUtils.resolveKeepAliveBadge(pausedPingOkUnsaved);
+  assert.equal(badgePausedPingOkUnsaved.tone, "warn");
+  assert.equal(badgePausedPingOkUnsaved.label, "保活未开启 · 档案未保存");
+  assert.equal(badgePausedPingOkUnsaved.detail, "disk read-only");
+
+  // 3) Enabled + ping succeeded + profile_saved: false -> warn toast + warn badge
+  const enabledPingOkUnsaved = {
+    ...pausedPingOkUnsaved,
+    enabled: true,
+    state: "active",
+  };
+  const enabledWarnOutcome = chatUtils.evaluatePingKeepAliveOutcome("vm-97", enabledPingOkUnsaved);
+  assert.equal(enabledWarnOutcome.ok, true);
+  assert.equal(enabledWarnOutcome.toastKind, "warn");
+  const badgeEnabledUnsaved = chatUtils.resolveKeepAliveBadge(enabledPingOkUnsaved);
+  assert.equal(badgeEnabledUnsaved.tone, "warn");
+  assert.equal(badgeEnabledUnsaved.label, "保活运行中 (90s) · 档案未保存");
+  assert.equal(badgeEnabledUnsaved.detail, "disk read-only");
+
+  // 4) Runtime ping fails + profile_saved: false -> error toast + bad badge with clean deduplication
+  const pingErrUnsaved = {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "error",
+    last_ok_at: null,
+    last_attempt_at: 1732630500,
+    tunnel_ok: false,
+    kernel_ping_state: "error",
+    success_count: 0,
+    consecutive_failures: 1,
+    last_error: "HTTP 503",
+    profile_saved: false,
+    persistence_error: "disk read-only",
+  };
+  const pingErrOutcome = chatUtils.evaluatePingKeepAliveOutcome("vm-97", pingErrUnsaved);
+  assert.equal(pingErrOutcome.ok, false);
+  assert.equal(pingErrOutcome.toastKind, "error");
+  const badgePingErrUnsaved = chatUtils.resolveKeepAliveBadge(pingErrUnsaved);
+  assert.equal(badgePingErrUnsaved.tone, "bad");
+  assert.equal(badgePingErrUnsaved.detail, "HTTP 503；disk read-only");
+  assert.equal(badgePingErrUnsaved.persistenceError, "disk read-only");
+
+  const identicalErrBadge = chatUtils.resolveKeepAliveBadge({
+    ...pingErrUnsaved,
+    last_error: "disk read-only",
+    persistence_error: "disk read-only",
+  });
+  assert.equal(identicalErrBadge.detail, "disk read-only");
 });

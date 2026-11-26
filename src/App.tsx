@@ -29,6 +29,7 @@ import type {
 import { fmtSnapshotTime, formatRealtimeTps, num, numOrNull, str } from "./format";
 import {
   buildPresetFromRecentSession,
+  evaluatePingKeepAliveOutcome,
   isLlmVmReady,
   isOverviewServerListUnknown,
   mergeOverviewSnapshot,
@@ -354,7 +355,7 @@ function Dashboard() {
   }, []);
 
   const refresh = useCallback(
-    async (manual = false) => {
+    async (manual = false): Promise<Overview | null> => {
       setRefreshing(true);
       try {
         const next = await api.refreshNow();
@@ -366,8 +367,10 @@ function Dashboard() {
             "warn",
           );
         }
+        return next;
       } catch (e) {
         toast(`刷新查询失败：${errText(e)}`, "error");
+        return null;
       } finally {
         setRefreshing(false);
       }
@@ -460,7 +463,15 @@ function Dashboard() {
       } else {
         toast(`实例 [${createdName}] 已分配就绪，正在后台配置监控与免密 SSH`, "success");
       }
-      await refresh(false);
+      const refreshed = await refresh(false);
+      const createdVm = refreshed?.vms?.find((v) => v.name === createdName);
+      const ka = createdVm?.keep_alive;
+      if (ka && (ka.profile_saved === false || Boolean(ka.persistence_error?.trim()))) {
+        toast(
+          `[${createdName}] 实例已创建，但保活档案保存失败（${ka.persistence_error?.trim() || "重启后配置可能失效"}），请在卡片上点击「重试保存策略」`,
+          "warn",
+        );
+      }
     } catch (e) {
       const msg = errText(e);
       if (!msg.includes("放弃抢卡")) {
@@ -569,13 +580,20 @@ function Dashboard() {
 
   const handleSetKeepAlive = async (name: string, config: KeepAliveConfig) => {
     try {
-      await api.setVmKeepAlive(name, config);
-      toast(
-        config.enabled
-          ? `已开启 [${name}] 实例保活（每 ${config.interval_seconds}s${config.kernel_ping ? " · 含忙时避让 Kernel 脉冲" : " · 仅隧道续租"}）`
-          : `已关闭 [${name}] 的自动保活`,
-        config.enabled ? "success" : "info",
-      );
+      const updated = await api.setVmKeepAlive(name, config);
+      if (updated?.profile_saved === false || Boolean(updated?.persistence_error?.trim())) {
+        toast(
+          `[${name}] 运行时保活策略已更新，但档案持久化失败：${updated.persistence_error?.trim() || "重启后可能失效"}`,
+          "warn",
+        );
+      } else {
+        toast(
+          config.enabled
+            ? `已开启 [${name}] 的运行时连接检查（每 ${config.interval_seconds} 秒${config.kernel_ping ? "，含空闲 Kernel 脉冲" : ""}）`
+            : `已关闭 [${name}] 的自动连接检查和 Kernel 脉冲`,
+          config.enabled ? "success" : "info",
+        );
+      }
       await refresh(false);
     } catch (e) {
       toast(`更新实例保活失败：${errText(e)}`, "error");
@@ -585,17 +603,11 @@ function Dashboard() {
   const handlePingKeepAlive = async (name: string) => {
     try {
       const st = await api.pingVmKeepAlive(name);
-      if (st.state === "error") {
-        toast(`[${name}] 保活心跳异常：${st.last_error || "请检查网络连接"}`, "error");
-      } else {
-        toast(
-          `[${name}] 保活心跳成功（隧道正常 · ${st.kernel_ping_state === "skipped_busy" ? "Kernel 忙时已自动避让" : st.kernel_ping ? "Kernel 脉冲正常" : "仅隧道续租"}）`,
-          "success",
-        );
-      }
+      const outcome = evaluatePingKeepAliveOutcome(name, st);
+      toast(outcome.message, outcome.toastKind);
       await refresh(false);
     } catch (e) {
-      toast(`触发立即保活失败：${errText(e)}`, "error");
+      toast(`运行时连接检查失败（${errText(e)}）`, "error");
     }
   };
 

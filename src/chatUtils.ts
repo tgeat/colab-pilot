@@ -4,6 +4,8 @@ import type {
   EnvStatus,
   GrabConfig,
   GrabStatus,
+  KeepAliveConfig,
+  KeepAliveStatus,
   LlmBlueGreenState,
   Overview,
   RecentSessionView,
@@ -102,6 +104,7 @@ export function isLlmVmReady(vm: VmView | null | undefined): boolean {
   if (vm.busy === "creating" || vm.busy === "deploying_llm" || vm.busy === "deleting") {
     return false;
   }
+  if (vm.deploy_error) return false;
   const llm = vm.telemetry?.llm;
   if (llm) {
     if (str(llm.role).trim().toLowerCase() === "warming") {
@@ -112,7 +115,6 @@ export function isLlmVmReady(vm: VmView | null | undefined): boolean {
     }
     return Boolean(llm.online || llm.backend_healthy);
   }
-  if (vm.deploy_error) return false;
   return Boolean(vm.telemetry?.threads?.llm_process);
 }
 
@@ -350,7 +352,7 @@ export function resolveBlueGreenStatus(
         if (byEp) return byEp;
       }
       // 显式指定了该槽位真实会话名但当前不在线时，不串槽劫持无关实例
-      return onlineOrKnownVms.find((v) => v.name === `${prefix}-${slot}`);
+      return undefined;
     }
 
     const slotEndpoint = str(bg?.slots?.[slot]?.endpoint).trim();
@@ -1128,6 +1130,7 @@ export function resolveVmStatusPillSpec(
 export const MIN_KEEP_ALIVE_INTERVAL_SECONDS = 30;
 export const MAX_KEEP_ALIVE_INTERVAL_SECONDS = 600;
 export const DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS = 90;
+export const KEEP_ALIVE_PRESET_INTERVALS = [60, 90, 180, 300] as const;
 
 export function isValidKeepAliveInterval(seconds: number): boolean {
   return (
@@ -1137,19 +1140,97 @@ export function isValidKeepAliveInterval(seconds: number): boolean {
   );
 }
 
+export function parseKeepAliveIntervalInput(raw: string): number | null {
+  const trimmed = String(raw ?? "").trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const parsed = Number(trimmed);
+  return isValidKeepAliveInterval(parsed) ? parsed : null;
+}
+
+export function normalizeKeepAliveConfig(cfg: KeepAliveConfig): KeepAliveConfig {
+  const finite = Number.isFinite(cfg.interval_seconds);
+  if (!cfg.enabled) {
+    const rounded = finite ? Math.round(cfg.interval_seconds) : DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS;
+    return {
+      enabled: false,
+      interval_seconds: isValidKeepAliveInterval(rounded)
+        ? rounded
+        : DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
+      kernel_ping: Boolean(cfg.kernel_ping),
+    };
+  }
+  return {
+    enabled: true,
+    interval_seconds: finite ? Math.round(cfg.interval_seconds) : cfg.interval_seconds,
+    kernel_ping: Boolean(cfg.kernel_ping),
+  };
+}
+
 export function describeKeepAliveKernelState(state?: string | null): string {
   switch ((state ?? "").trim().toLowerCase()) {
     case "ok":
       return "Kernel 脉冲正常";
     case "skipped_busy":
       return "Kernel 忙时已自动避让";
+    case "skipped_no_kernel":
+      return "暂无活跃 Kernel（已跳过脉冲）";
     case "disabled":
-      return "仅隧道保活";
+      return "Kernel 脉冲已关闭";
     case "error":
       return "Kernel 心跳异常";
     default:
       return "等待首轮脉冲";
   }
+}
+
+export function evaluatePingKeepAliveOutcome(
+  name: string,
+  st: KeepAliveStatus,
+): { ok: boolean; toastKind: "success" | "warn" | "error"; message: string } {
+  const lastErr = st.last_error?.trim() ?? "";
+  const failed =
+    st.state === "error" ||
+    !st.tunnel_ok ||
+    st.kernel_ping_state === "error" ||
+    Boolean(lastErr);
+
+  if (failed) {
+    const reason =
+      lastErr ||
+      (!st.tunnel_ok
+        ? "运行时连接异常"
+        : st.kernel_ping_state === "error"
+          ? "Kernel 心跳异常"
+          : "请检查网络连接");
+    return {
+      ok: false,
+      toastKind: "error",
+      message: `[${name}] ${st.enabled ? "检查失败" : "单次检查失败"}（${reason}）`,
+    };
+  }
+
+  const kernelState = describeKeepAliveKernelState(
+    (st.kernel_ping ?? true) ? st.kernel_ping_state : "disabled",
+  );
+  const baseMessage = st.enabled
+    ? `[${name}] 运行时连接正常 · ${kernelState}`
+    : `[${name}] 单次检查正常 · ${kernelState}（自动保活仍为关闭状态）`;
+
+  const persistErr = st.persistence_error?.trim() ?? "";
+  const persistenceFailed = st.profile_saved === false || Boolean(persistErr);
+  if (persistenceFailed) {
+    return {
+      ok: true,
+      toastKind: "warn",
+      message: `${baseMessage}；注意：保活档案未保存（${persistErr || "重启后可能失效"}）`,
+    };
+  }
+
+  return {
+    ok: true,
+    toastKind: "success",
+    message: baseMessage,
+  };
 }
 
 export function resolveKeepAliveBadge(ka?: {
@@ -1159,31 +1240,106 @@ export function resolveKeepAliveBadge(ka?: {
   kernel_ping?: boolean;
   kernel_ping_state?: string;
   last_ok_at?: number | null;
+  last_attempt_at?: number | null;
+  tunnel_ok?: boolean;
   success_count?: number;
   last_error?: string | null;
+  profile_saved?: boolean;
+  persistence_error?: string | null;
 } | null): {
   tone: "ok" | "warn" | "bad" | "muted";
   label: string;
   detail: string;
+  persistenceError: string | null;
 } {
+  const lastErr = str(ka?.last_error).trim();
+  const persistErr = str(ka?.persistence_error).trim();
+  const persistenceFailed = Boolean(
+    ka && (ka.profile_saved === false || Boolean(persistErr)),
+  );
+  const persistenceMsg = persistenceFailed
+    ? persistErr || "保活/会话档案持久化失败（重启后可能失效），请重试保存"
+    : null;
+  const hasFailure = Boolean(
+    ka &&
+      (ka.state === "error" ||
+        Boolean(lastErr) ||
+        ka.kernel_ping_state === "error" ||
+        (ka.last_attempt_at != null && ka.tunnel_ok === false)),
+  );
+
   if (!ka || !ka.enabled) {
+    if (hasFailure) {
+      const failureReason =
+        lastErr ||
+        (ka?.kernel_ping_state === "error"
+          ? "Kernel 脉冲异常"
+          : "上次单次运行时连接检查失败");
+      const detailParts = [
+        failureReason,
+        persistenceMsg && persistenceMsg !== failureReason ? persistenceMsg : null,
+      ].filter(Boolean);
+      return {
+        tone: "bad",
+        label: persistenceFailed
+          ? "保活未开启（单次检查异常 · 档案未保存）"
+          : "保活未开启（单次检查异常）",
+        detail: detailParts.join("；"),
+        persistenceError: persistenceMsg,
+      };
+    }
+    if (persistenceFailed && persistenceMsg) {
+      return {
+        tone: "warn",
+        label: "保活未开启 · 档案未保存",
+        detail: persistenceMsg,
+        persistenceError: persistenceMsg,
+      };
+    }
     return {
       tone: "muted",
       label: "保活未开启",
-      detail: "开启后将按周期续租 Colab 隧道并发送空闲 Kernel 脉冲心跳",
+      detail: "开启后定期检查运行时连接，可选空闲 Kernel 脉冲（支持单次检查）",
+      persistenceError: null,
     };
   }
+
   const interval = ka.interval_seconds ?? DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS;
-  const kDesc = ka.kernel_ping
-    ? describeKeepAliveKernelState(ka.kernel_ping_state)
-    : "仅隧道保活";
-  if (ka.state === "error") {
+  const kernelPing = ka.kernel_ping ?? true;
+  const action = kernelPing ? "保活" : "连接检查";
+  const kDesc = describeKeepAliveKernelState(kernelPing ? ka.kernel_ping_state : "disabled");
+
+  if (hasFailure) {
+    const failureReason =
+      lastErr ||
+      (ka.kernel_ping_state === "error"
+        ? "Kernel 脉冲异常"
+        : ka.last_attempt_at != null && ka.tunnel_ok === false
+          ? "运行时连接异常"
+          : "");
+    const detailParts = [
+      failureReason,
+      persistenceMsg && persistenceMsg !== failureReason ? persistenceMsg : null,
+    ].filter(Boolean);
     return {
       tone: "bad",
-      label: "保活异常",
-      detail: ka.last_error || `每 ${interval}s · ${kDesc}`,
+      label: persistenceFailed ? `${action}异常 · 档案未保存` : `${action}异常`,
+      detail: detailParts.join("；") || `每 ${interval}s · ${kDesc}`,
+      persistenceError: persistenceMsg,
     };
   }
+
+  if (persistenceFailed && persistenceMsg) {
+    return {
+      tone: "warn",
+      label: ka.last_ok_at
+        ? `${action}运行中 (${interval}s) · 档案未保存`
+        : `${action}已启用 (${interval}s) · 档案未保存`,
+      detail: persistenceMsg,
+      persistenceError: persistenceMsg,
+    };
+  }
+
   if (ka.last_ok_at) {
     const countText =
       typeof ka.success_count === "number" && ka.success_count > 0
@@ -1191,14 +1347,17 @@ export function resolveKeepAliveBadge(ka?: {
         : "";
     return {
       tone: "ok",
-      label: `保活运行中 (${interval}s)`,
-      detail: `隧道正常 · ${kDesc}${countText}`,
+      label: `${action}运行中 (${interval}s)`,
+      detail: `运行时连接正常 · ${kDesc}${countText}`,
+      persistenceError: null,
     };
   }
+
   return {
     tone: "warn",
-    label: `保活已启用 (${interval}s)`,
-    detail: `即将发送首轮保活 · ${kDesc}`,
+    label: `${action}已启用 (${interval}s)`,
+    detail: `等待首轮运行时连接检查 · ${kDesc}`,
+    persistenceError: null,
   };
 }
 

@@ -1225,6 +1225,564 @@ print(f"PARSED_OK valid={len(payload['valid'])} invalid={len(payload['invalid'])
         )
         self.assertIn("PARSED_OK", proc.stdout)
 
+    def test_issue_88_gateway_per_instance_keepalive_policy_and_runtime_check(self):
+        with tempfile.TemporaryDirectory() as td:
+            st_file = os.path.join(td, "llm_bluegreen_state.json")
+            sess_file = os.path.join(td, "sessions.json")
+            keys_file = os.path.join(td, "llm_api_keys.json")
+            prof_file = os.path.join(td, "pilot_session_profiles.json")
+
+            recorded_gets = {"ordinary": [], "blue": [], "green": [], "standalone": []}
+            standalone_expected_tok = {"tok": "fresh-standalone-tok"}
+
+            def make_kernel_srv(bucket: str, kernels_payload, expected_tok_fn):
+                class KernelHandler(BaseHTTPRequestHandler):
+                    def log_message(self, fmt, *args):
+                        pass
+
+                    def do_GET(self):
+                        parsed_u = urllib.request.urlsplit(self.path)
+                        qs = dict(urllib.parse.parse_qsl(parsed_u.query)) if hasattr(urllib, "parse") else {}
+                        hdr_tok = self.headers.get("X-Colab-Runtime-Proxy-Token")
+                        agent = self.headers.get("X-Colab-Client-Agent")
+                        recorded_gets[bucket].append(
+                            {
+                                "path": parsed_u.path,
+                                "query_token": qs.get("colab-runtime-proxy-token"),
+                                "header_token": hdr_tok,
+                                "agent": agent,
+                            }
+                        )
+                        exp_tok = expected_tok_fn()
+                        if hdr_tok != exp_tok or qs.get("colab-runtime-proxy-token") != exp_tok:
+                            self.send_response(401)
+                            self.end_headers()
+                            return
+                        body = (")]}'\n" + json.dumps(kernels_payload)).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+
+                srv = HTTPServer(("127.0.0.1", 0), KernelHandler)
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                return srv
+
+            import urllib.parse
+
+            srv_ord = make_kernel_srv("ordinary", [{"id": "kid-ord", "execution_state": "idle"}], lambda: "tok-ord")
+            srv_blue = make_kernel_srv("blue", [{"id": "kid-blue", "execution_state": "idle"}], lambda: "tok-blue")
+            srv_green = make_kernel_srv("green", [{"id": "kid-green", "execution_state": "idle"}], lambda: "tok-green")
+            srv_std = make_kernel_srv(
+                "standalone",
+                [{"id": "kid-std", "execution_state": "idle"}],
+                lambda: standalone_expected_tok["tok"],
+            )
+
+            Path(st_file).write_text(
+                json.dumps(
+                    {
+                        "session_prefix": "llm",
+                        "active_slot": "blue",
+                        "blue_session": "llm-blue",
+                        "green_session": "llm-green",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(keys_file).write_text(
+                json.dumps(
+                    {
+                        "vms": {
+                            "standalone-g4": {
+                                "vm_name": "standalone-g4",
+                                "slot": "standalone",
+                                "local_port": 18083,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(sess_file).write_text(
+                json.dumps(
+                    {
+                        "ordinary-vm": {
+                            "endpoint": "m-s-ord",
+                            "url": f"http://127.0.0.1:{srv_ord.server_port}",
+                            "token": "tok-ord",
+                            "kernel_id": "kid-ord",
+                        },
+                        "llm-blue": {
+                            "endpoint": "m-s-blue",
+                            "url": f"http://127.0.0.1:{srv_blue.server_port}",
+                            "token": "tok-blue",
+                            "kernel_id": "kid-blue",
+                        },
+                        "llm-green": {
+                            "endpoint": "m-s-green",
+                            "url": f"http://127.0.0.1:{srv_green.server_port}",
+                            "token": "tok-green",
+                            "kernel_id": "kid-green",
+                        },
+                        "standalone-g4": {
+                            "endpoint": "m-s-std",
+                            "url": f"http://127.0.0.1:{srv_std.server_port}",
+                            "token": "stale-standalone-tok",
+                            "kernel_id": "kid-std",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(prof_file).write_text(
+                json.dumps(
+                    {
+                        "ordinary-vm": {"keep_alive": {"enabled": True, "interval_seconds": 30, "kernel_ping": True}},
+                        "llm-blue": {"keep_alive": {"enabled": False, "interval_seconds": 30, "kernel_ping": True}},
+                        "llm-green": {"keep_alive": {"enabled": True, "interval_seconds": 120, "kernel_ping": False}},
+                        "standalone-g4": {"keep_alive": {"enabled": True, "interval_seconds": 30, "kernel_ping": True}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            pass_calls = []
+            list_assign_calls = {"n": 0}
+
+            class FakeClient:
+                colab_domain = "https://colab.research.google.com"
+
+                class session:
+                    @staticmethod
+                    def request(*args, **kwargs):
+                        raise AssertionError(f"Legacy /tun/m/keep-alive must never be called: {args} {kwargs}")
+
+                @staticmethod
+                def list_assignments():
+                    list_assign_calls["n"] += 1
+                    std_tok = "stale-standalone-tok" if list_assign_calls["n"] <= 1 else "fresh-standalone-tok"
+                    return [
+                        types.SimpleNamespace(
+                            endpoint="m-s-green",
+                            runtime_proxy_info=types.SimpleNamespace(
+                                url=f"http://127.0.0.1:{srv_green.server_port}",
+                                token="tok-green",
+                            ),
+                        ),
+                        types.SimpleNamespace(
+                            endpoint="m-s-std",
+                            runtime_proxy_info=types.SimpleNamespace(
+                                url=f"http://127.0.0.1:{srv_std.server_port}",
+                                token=std_tok,
+                            ),
+                        ),
+                    ]
+
+            fake_common = types.ModuleType("colab_cli.common")
+            fake_common.state = types.SimpleNamespace(client=FakeClient())
+
+            class FakeColabRuntime:
+                def __init__(self, url, token, kernel_id=None, session_id=None):
+                    self.url = url
+                    self.token = token
+                    self.kernel_id = kernel_id
+
+                def execute_code(self, code, output_hook=None, timeout=300):
+                    pass_calls.append((self.url, self.token, self.kernel_id, code))
+
+                def stop(self):
+                    pass
+
+            fake_colab = types.ModuleType("colab_cli")
+            fake_rt = types.ModuleType("colab_cli.runtime")
+            fake_rt.ColabRuntime = FakeColabRuntime
+
+            with (
+                mock.patch.object(gateway_mod, "state_path", return_value=st_file),
+                mock.patch.object(gateway_mod, "sessions_path", return_value=sess_file),
+                mock.patch.dict(
+                    sys.modules,
+                    {"colab_cli": fake_colab, "colab_cli.common": fake_common, "colab_cli.runtime": fake_rt},
+                ),
+            ):
+                try:
+                    gateway_mod._LAST_KEEPALIVE_AT.clear()
+                    gateway_mod._LAST_TOKEN_REFRESH_AT = 0.0
+                    gateway_mod._LAST_ON_DEMAND_REFRESH = 0.0
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+
+                    # On-demand token refresh must NEVER call /api/kernels or ColabRuntime
+                    gateway_mod.maybe_refresh_tokens_now(min_interval=0.0)
+                    self.assertEqual(sum(len(v) for v in recorded_gets.values()), 0)
+                    self.assertEqual(len(pass_calls), 0)
+
+                    # Reset call counter so t=1000 sees stale token first -> 401 -> refresh -> 200 retry
+                    list_assign_calls["n"] = 0
+                    gateway_mod._LAST_ON_DEMAND_REFRESH = 0.0
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True, respect_interval=True, now=1000.0)
+                    self.assertEqual(len(recorded_gets["ordinary"]), 0)
+                    self.assertEqual(len(recorded_gets["blue"]), 0)
+                    self.assertEqual(len(recorded_gets["green"]), 1)
+                    # standalone: 1st attempt 401 + retry 200 = 2 GETs, 1 pass
+                    self.assertEqual(len(recorded_gets["standalone"]), 2)
+                    self.assertEqual(len(pass_calls), 1)
+                    self.assertEqual(pass_calls[0][2], "kid-std")
+                    self.assertEqual(pass_calls[0][1], "fresh-standalone-tok")
+
+                    # t=1020: neither 30s nor 120s elapsed
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True, respect_interval=True, now=1020.0)
+                    self.assertEqual(len(recorded_gets["green"]), 1)
+                    self.assertEqual(len(recorded_gets["standalone"]), 2)
+                    self.assertEqual(len(pass_calls), 1)
+
+                    # t=1035: standalone (30s) due, green (120s) not due
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True, respect_interval=True, now=1035.0)
+                    self.assertEqual(len(recorded_gets["green"]), 1)
+                    self.assertEqual(len(recorded_gets["standalone"]), 3)
+                    self.assertEqual(len(pass_calls), 2)
+
+                    # t=1125: both green (120s) and standalone (30s) due; green has kernel_ping=False
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True, respect_interval=True, now=1125.0)
+                    self.assertEqual(len(recorded_gets["green"]), 2)
+                    self.assertEqual(len(recorded_gets["standalone"]), 4)
+                    self.assertEqual(len(pass_calls), 3)
+                    self.assertEqual(len(recorded_gets["ordinary"]), 0)
+                    self.assertEqual(len(recorded_gets["blue"]), 0)
+
+                    for rec in recorded_gets["green"] + recorded_gets["standalone"]:
+                        self.assertEqual(rec["path"], "/api/kernels")
+                        self.assertEqual(rec["header_token"], rec["query_token"])
+                        self.assertEqual(rec["agent"], "colab-cli")
+                finally:
+                    gateway_mod._LAST_KEEPALIVE_AT.clear()
+                    gateway_mod._LAST_TOKEN_REFRESH_AT = 0.0
+                    gateway_mod._LAST_ON_DEMAND_REFRESH = 0.0
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+                    srv_ord.shutdown()
+                    srv_ord.server_close()
+                    srv_blue.shutdown()
+                    srv_blue.server_close()
+                    srv_green.shutdown()
+                    srv_green.server_close()
+                    srv_std.shutdown()
+                    srv_std.server_close()
+
+    def test_issue_93_gateway_never_spawns_kernel_on_empty_or_retired_kernel_list(self):
+        with tempfile.TemporaryDirectory() as td:
+            st_file = os.path.join(td, "llm_bluegreen_state.json")
+            sess_file = os.path.join(td, "sessions.json")
+            prof_file = os.path.join(td, "pilot_session_profiles.json")
+
+            kernels_state = {"items": []}
+
+            class KernelHandler(BaseHTTPRequestHandler):
+                def log_message(self, fmt, *args):
+                    pass
+
+                def do_GET(self):
+                    body = json.dumps(kernels_state["items"]).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            srv = HTTPServer(("127.0.0.1", 0), KernelHandler)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+            Path(st_file).write_text(
+                json.dumps({"session_prefix": "llm", "active_slot": "blue", "blue_session": "llm-blue"}),
+                encoding="utf-8",
+            )
+            Path(prof_file).write_text(
+                json.dumps({"llm-blue": {"keep_alive": {"enabled": True, "interval_seconds": 30, "kernel_ping": True}}}),
+                encoding="utf-8",
+            )
+
+            rt_calls = []
+
+            class FakeColabRuntime:
+                def __init__(self, url, token, kernel_id=None, session_id=None):
+                    rt_calls.append({"url": url, "token": token, "kernel_id": kernel_id, "session_id": session_id})
+
+                def execute_code(self, code, output_hook=None, timeout=300):
+                    pass
+
+                def stop(self):
+                    pass
+
+            fake_colab = types.ModuleType("colab_cli")
+            fake_common = types.ModuleType("colab_cli.common")
+            fake_common.state = types.SimpleNamespace(
+                client=types.SimpleNamespace(list_assignments=lambda: [])
+            )
+            fake_rt = types.ModuleType("colab_cli.runtime")
+            fake_rt.ColabRuntime = FakeColabRuntime
+
+            with (
+                mock.patch.object(gateway_mod, "state_path", return_value=st_file),
+                mock.patch.object(gateway_mod, "sessions_path", return_value=sess_file),
+                mock.patch.dict(
+                    sys.modules,
+                    {"colab_cli": fake_colab, "colab_cli.common": fake_common, "colab_cli.runtime": fake_rt},
+                ),
+            ):
+                try:
+                    gateway_mod._LAST_KEEPALIVE_AT.clear()
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+
+                    # 1. Empty /api/kernels with retired kernel_id -> 0 ColabRuntime calls across 2 rounds
+                    Path(sess_file).write_text(
+                        json.dumps(
+                            {
+                                "llm-blue": {
+                                    "endpoint": "m-s-b93",
+                                    "url": f"http://127.0.0.1:{srv.server_port}",
+                                    "token": "tok-b93",
+                                    "kernel_id": "retired-kid",
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(rt_calls, [])
+
+                    # 2. Empty /api/kernels with kernel_id=None -> 0 ColabRuntime calls
+                    Path(sess_file).write_text(
+                        json.dumps(
+                            {
+                                "llm-blue": {
+                                    "endpoint": "m-s-b93",
+                                    "url": f"http://127.0.0.1:{srv.server_port}",
+                                    "token": "tok-b93",
+                                    "kernel_id": None,
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(rt_calls, [])
+
+                    # 3. Live kernel present while sessions.json has retired kernel_id -> uses live-kid
+                    Path(sess_file).write_text(
+                        json.dumps(
+                            {
+                                "llm-blue": {
+                                    "endpoint": "m-s-b93",
+                                    "url": f"http://127.0.0.1:{srv.server_port}",
+                                    "token": "tok-b93",
+                                    "kernel_id": "retired-kid",
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    kernels_state["items"] = [{"id": "live-kid", "execution_state": "idle"}]
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(len(rt_calls), 1)
+                    self.assertEqual(rt_calls[0]["kernel_id"], "live-kid")
+
+                    # 4. Cached kernel_id present in multi-kernel live list -> prefers preferred-kid
+                    Path(sess_file).write_text(
+                        json.dumps(
+                            {
+                                "llm-blue": {
+                                    "endpoint": "m-s-b93",
+                                    "url": f"http://127.0.0.1:{srv.server_port}",
+                                    "token": "tok-b93",
+                                    "kernel_id": "preferred-kid",
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    kernels_state["items"] = [
+                        {"id": "other-kid", "execution_state": "idle"},
+                        {"id": "preferred-kid", "execution_state": "idle"},
+                    ]
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(len(rt_calls), 2)
+                    self.assertEqual(rt_calls[1]["kernel_id"], "preferred-kid")
+                finally:
+                    gateway_mod._LAST_KEEPALIVE_AT.clear()
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+                    srv.shutdown()
+                    srv.server_close()
+
+    def test_issue_95_gateway_per_session_busy_does_not_block_other_idle_slot(self):
+        with tempfile.TemporaryDirectory() as td:
+            st_file = os.path.join(td, "llm_bluegreen_state.json")
+            sess_file = os.path.join(td, "sessions.json")
+            prof_file = os.path.join(td, "pilot_session_profiles.json")
+
+            blue_kernels = {"items": [{"id": "kid-blue", "execution_state": "idle"}], "gets": 0}
+            green_kernels = {"items": [{"id": "kid-green", "execution_state": "idle"}], "gets": 0}
+
+            def make_srv(state_ref):
+                class Handler(BaseHTTPRequestHandler):
+                    def log_message(self, fmt, *args):
+                        pass
+
+                    def do_GET(self):
+                        state_ref["gets"] += 1
+                        body = json.dumps(state_ref["items"]).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+
+                srv = HTTPServer(("127.0.0.1", 0), Handler)
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                return srv
+
+            srv_blue = make_srv(blue_kernels)
+            srv_green = make_srv(green_kernels)
+
+            Path(st_file).write_text(
+                json.dumps(
+                    {
+                        "session_prefix": "llm",
+                        "active_slot": "blue",
+                        "blue_session": "llm-blue",
+                        "green_session": "llm-green",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(sess_file).write_text(
+                json.dumps(
+                    {
+                        "llm-blue": {
+                            "endpoint": "m-s-b95",
+                            "url": f"http://127.0.0.1:{srv_blue.server_port}",
+                            "token": "tok-b95",
+                            "kernel_id": "kid-blue",
+                        },
+                        "llm-green": {
+                            "endpoint": "m-s-g95",
+                            "url": f"http://127.0.0.1:{srv_green.server_port}",
+                            "token": "tok-g95",
+                            "kernel_id": "kid-green",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(prof_file).write_text(
+                json.dumps(
+                    {
+                        "llm-blue": {"keep_alive": {"enabled": True, "interval_seconds": 30, "kernel_ping": True}},
+                        "llm-green": {"keep_alive": {"enabled": True, "interval_seconds": 30, "kernel_ping": True}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            stream_started = threading.Event()
+            release_stream = threading.Event()
+            pass_kernels = []
+
+            class FakeColabRuntime:
+                def __init__(self, url, token, kernel_id=None, session_id=None):
+                    self.url = url
+                    self.kernel_id = kernel_id
+
+                def execute_code(self, code, output_hook=None, timeout=300):
+                    if code == "pass":
+                        pass_kernels.append(self.kernel_id)
+                        return
+                    stream_started.set()
+                    release_stream.wait(timeout=5.0)
+                    meta = gateway_mod.META_PREFIX + json.dumps({"status": 200, "ctype": "text/event-stream"}) + "\n"
+                    chunk = 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+                    output_hook({"output_type": "stream", "text": meta + chunk})
+
+                def stop(self):
+                    pass
+
+            fake_colab = types.ModuleType("colab_cli")
+            fake_common = types.ModuleType("colab_cli.common")
+            fake_common.state = types.SimpleNamespace(
+                client=types.SimpleNamespace(list_assignments=lambda: [])
+            )
+            fake_rt = types.ModuleType("colab_cli.runtime")
+            fake_rt.ColabRuntime = FakeColabRuntime
+
+            with (
+                mock.patch.object(gateway_mod, "state_path", return_value=st_file),
+                mock.patch.object(gateway_mod, "sessions_path", return_value=sess_file),
+                mock.patch.dict(
+                    sys.modules,
+                    {"colab_cli": fake_colab, "colab_cli.common": fake_common, "colab_cli.runtime": fake_rt},
+                ),
+            ):
+                gw_srv = gateway_mod.ThreadedHTTPServer(("127.0.0.1", 0), gateway_mod.make_gateway_handler("blue"))
+                threading.Thread(target=gw_srv.serve_forever, daemon=True).start()
+                stream_result = {}
+
+                def _do_chat():
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{gw_srv.server_port}/v1/chat/completions",
+                        data=json.dumps({"stream": True, "messages": [{"role": "user", "content": "hi"}]}).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        stream_result["body"] = resp.read().decode("utf-8")
+
+                chat_thread = threading.Thread(target=_do_chat, daemon=True)
+                try:
+                    gateway_mod._LAST_KEEPALIVE_AT.clear()
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+
+                    chat_thread.start()
+                    self.assertTrue(stream_started.wait(timeout=5.0))
+                    counts = gateway_mod.get_active_gateway_counts()
+                    self.assertEqual(counts["by_session"], {"llm-blue": 1})
+                    self.assertEqual(counts["total"], 1)
+
+                    # While llm-blue has an active SSE stream, idle llm-green still receives pass!
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(blue_kernels["gets"], 1)
+                    self.assertEqual(green_kernels["gets"], 1)
+                    self.assertEqual(pass_kernels, ["kid-green"])
+                finally:
+                    release_stream.set()
+                    chat_thread.join(timeout=5.0)
+                    gw_srv.shutdown()
+                    gw_srv.server_close()
+
+                self.assertIn("data: [DONE]", stream_result.get("body", ""))
+                self.assertEqual(gateway_mod.get_active_gateway_counts()["by_session"], {})
+
+                # Also verify live /api/kernels execution_state=="busy"/"starting" skips only that slot
+                try:
+                    pass_kernels.clear()
+                    blue_kernels["items"] = [{"id": "kid-blue", "execution_state": "busy"}]
+                    green_kernels["items"] = [{"id": "kid-green", "execution_state": "idle"}]
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(pass_kernels, ["kid-green"])
+
+                    pass_kernels.clear()
+                    blue_kernels["items"] = [{"id": "kid-blue", "execution_state": "starting"}]
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(pass_kernels, ["kid-green"])
+                finally:
+                    gateway_mod._LAST_KEEPALIVE_AT.clear()
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+                    srv_blue.shutdown()
+                    srv_blue.server_close()
+                    srv_green.shutdown()
+                    srv_green.server_close()
+
 
 class IssueRegressionTests(unittest.TestCase):
     def test_issue_44_default_gdrive_isolation_active_lock_and_train_temp_prefix(self):
@@ -2991,6 +3549,296 @@ class IssueRegressionTests(unittest.TestCase):
                 )
             self.assertEqual(rc, 0)
             self.assertEqual(tried_gpus, ["A100", "G4"])
+
+
+class Issue94ProfileLockTests(unittest.TestCase):
+    @staticmethod
+    def _spawn_external_lock_writer(
+        prof_file: str,
+        ready_flag: str,
+        hold_seconds: float,
+        update_payload: dict | None = None,
+    ) -> subprocess.Popen:
+        child_code = """
+import json, os, sys, time
+prof_file, ready_flag, hold_s, payload_raw = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
+lock_file = f"{prof_file}.lock"
+os.makedirs(os.path.dirname(os.path.abspath(prof_file)), exist_ok=True)
+lf = open(lock_file, "a+b")
+try:
+    if os.name == "nt":
+        import msvcrt
+        lf.seek(0)
+        msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    with open(ready_flag, "w", encoding="utf-8") as rf:
+        rf.write("LOCKED")
+    time.sleep(hold_s)
+    if payload_raw != "null":
+        patch = json.loads(payload_raw)
+        data = {}
+        if os.path.exists(prof_file):
+            with open(prof_file, "r", encoding="utf-8") as f:
+                raw_txt = f.read().strip()
+                if raw_txt:
+                    data = json.loads(raw_txt)
+        for k, v in patch.items():
+            cur = data.get(k) if isinstance(data.get(k), dict) else {}
+            cur.update(v)
+            data[k] = cur
+        tmp = f"{prof_file}.{os.getpid()}.ext.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, prof_file)
+finally:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            lf.seek(0)
+            msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    lf.close()
+"""
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                child_code,
+                prof_file,
+                ready_flag,
+                str(hold_seconds),
+                json.dumps(update_payload),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def test_issue_94_concurrent_external_lock_preserves_other_instance_updates(self):
+        for label, mod in (("dl_relay_runner", runner_mod), ("llm_bluegreen_manager", manager_mod)):
+            with self.subTest(module=label):
+                with tempfile.TemporaryDirectory() as td:
+                    cfg_dir = os.path.join(td, "cfg")
+                    os.makedirs(cfg_dir, exist_ok=True)
+                    prof_file = os.path.join(cfg_dir, "pilot_session_profiles.json")
+                    ready_flag = os.path.join(td, "locked.flag")
+
+                    Path(prof_file).write_text(
+                        json.dumps(
+                            {
+                                "vm-existing": {
+                                    "boot_mode": "relay",
+                                    "accelerator": "G4",
+                                    "keep_alive": {"enabled": True, "interval_seconds": 90, "kernel_ping": True},
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    proc = self._spawn_external_lock_writer(
+                        prof_file,
+                        ready_flag,
+                        hold_seconds=0.30,
+                        update_payload={
+                            "vm-existing": {
+                                "keep_alive": {"enabled": False, "interval_seconds": 600, "kernel_ping": False}
+                            }
+                        },
+                    )
+                    try:
+                        deadline = time.monotonic() + 5.0
+                        while time.monotonic() < deadline and not os.path.exists(ready_flag):
+                            time.sleep(0.01)
+                        self.assertTrue(os.path.exists(ready_flag), "External lock writer did not signal readiness")
+
+                        t0 = time.monotonic()
+                        with mock.patch.object(mod, "colab_cfg_dir", return_value=cfg_dir):
+                            ok = mod.ensure_session_keep_alive_profile("vm-new")
+                        elapsed = time.monotonic() - t0
+                        out, err = proc.communicate(timeout=5)
+                        self.assertEqual(proc.returncode, 0, f"Child failed: {out}\n{err}")
+                        self.assertTrue(ok)
+                        self.assertGreaterEqual(elapsed, 0.15)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.communicate()
+
+                    final_data = json.loads(Path(prof_file).read_text(encoding="utf-8"))
+                    self.assertEqual(final_data["vm-existing"]["boot_mode"], "relay")
+                    self.assertEqual(final_data["vm-existing"]["accelerator"], "G4")
+                    self.assertEqual(
+                        final_data["vm-existing"]["keep_alive"],
+                        {"enabled": False, "interval_seconds": 600, "kernel_ping": False},
+                    )
+                    self.assertEqual(
+                        final_data["vm-new"]["keep_alive"],
+                        {"enabled": True, "interval_seconds": 90, "kernel_ping": True},
+                    )
+
+    def test_issue_94_real_multiprocess_stress_across_runner_manager_and_external_writer(self):
+        with tempfile.TemporaryDirectory() as td:
+            home_dir = os.path.join(td, "home")
+            cfg_dir = os.path.join(home_dir, ".config", "colab-cli")
+            os.makedirs(cfg_dir, exist_ok=True)
+            prof_file = os.path.join(cfg_dir, "pilot_session_profiles.json")
+            Path(prof_file).write_text(
+                json.dumps(
+                    {
+                        "vm-paused": {
+                            "boot_mode": "llm",
+                            "keep_alive": {"enabled": True, "interval_seconds": 90, "kernel_ping": True},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env["HOME"] = home_dir
+            env["USERPROFILE"] = home_dir
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+            runner_path = str(REPO_ROOT / ".agents" / "skills" / "colab-dl-relay" / "scripts" / "dl_relay_runner.py")
+            manager_path = str(REPO_ROOT / ".agents" / "skills" / "colab-llm-bluegreen" / "scripts" / "llm_bluegreen_manager.py")
+
+            py_worker_code = """
+import importlib.util, sys
+mod_path, sess = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location("wmod", mod_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok = mod.ensure_session_keep_alive_profile(sess)
+sys.exit(0 if ok else 2)
+"""
+            ext_worker_code = """
+import json, os, sys, time
+prof_file = sys.argv[1]
+lock_file = f"{prof_file}.lock"
+lf = open(lock_file, "a+b")
+try:
+    if os.name == "nt":
+        import msvcrt
+        lf.seek(0)
+        msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    time.sleep(0.05)
+    with open(prof_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    cur = data.get("vm-paused") or {}
+    cur["keep_alive"] = {"enabled": False, "interval_seconds": 600, "kernel_ping": False}
+    data["vm-paused"] = cur
+    tmp = f"{prof_file}.{os.getpid()}.ext.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, prof_file)
+finally:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            lf.seek(0)
+            msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    lf.close()
+"""
+            procs = []
+            for i in range(4):
+                procs.append(
+                    subprocess.Popen(
+                        [sys.executable, "-c", py_worker_code, runner_path, f"dl-vm-{i}"],
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                )
+                procs.append(
+                    subprocess.Popen(
+                        [sys.executable, "-c", py_worker_code, manager_path, f"llm-vm-{i}"],
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                )
+            procs.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", ext_worker_code, prof_file],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+
+            try:
+                for p in procs:
+                    out, err = p.communicate(timeout=20)
+                    self.assertEqual(p.returncode, 0, f"Worker failed rc={p.returncode}: {out}\n{err}")
+            finally:
+                for p in procs:
+                    if p.poll() is None:
+                        p.kill()
+                        p.communicate()
+
+            final_data = json.loads(Path(prof_file).read_text(encoding="utf-8"))
+            for i in range(4):
+                self.assertIn(f"dl-vm-{i}", final_data)
+                self.assertIn(f"llm-vm-{i}", final_data)
+            self.assertEqual(final_data["vm-paused"]["boot_mode"], "llm")
+            self.assertEqual(
+                final_data["vm-paused"]["keep_alive"],
+                {"enabled": False, "interval_seconds": 600, "kernel_ping": False},
+            )
+
+    def test_issue_94_lock_timeout_and_corrupt_file_fail_closed(self):
+        for label, mod in (("dl_relay_runner", runner_mod), ("llm_bluegreen_manager", manager_mod)):
+            with self.subTest(module=label):
+                with tempfile.TemporaryDirectory() as td:
+                    cfg_dir = os.path.join(td, "cfg")
+                    os.makedirs(cfg_dir, exist_ok=True)
+                    prof_file = os.path.join(cfg_dir, "pilot_session_profiles.json")
+                    ready_flag = os.path.join(td, "locked.flag")
+                    seed_raw = json.dumps({"vm-safe": {"keep_alive": {"enabled": False, "interval_seconds": 180}}})
+                    Path(prof_file).write_text(seed_raw, encoding="utf-8")
+
+                    proc = self._spawn_external_lock_writer(prof_file, ready_flag, hold_seconds=0.6, update_payload=None)
+                    try:
+                        deadline = time.monotonic() + 5.0
+                        while time.monotonic() < deadline and not os.path.exists(ready_flag):
+                            time.sleep(0.01)
+                        self.assertTrue(os.path.exists(ready_flag))
+
+                        with mock.patch.object(mod, "colab_cfg_dir", return_value=cfg_dir):
+                            with self.assertRaises(TimeoutError):
+                                with mod._session_profiles_lock(prof_file, timeout=0.15):
+                                    pass
+                            ok_timeout = mod.ensure_session_keep_alive_profile("vm-timeout", lock_timeout=0.15)
+                        self.assertFalse(ok_timeout)
+                        self.assertEqual(Path(prof_file).read_text(encoding="utf-8"), seed_raw)
+                    finally:
+                        proc.communicate(timeout=5)
+
+                    # Corrupt non-empty JSON must fail closed without overwriting
+                    corrupt_raw = "{broken-json-not-closed"
+                    Path(prof_file).write_text(corrupt_raw, encoding="utf-8")
+                    with mock.patch.object(mod, "colab_cfg_dir", return_value=cfg_dir):
+                        ok_corrupt = mod.ensure_session_keep_alive_profile("vm-corrupt", lock_timeout=1.0)
+                    self.assertFalse(ok_corrupt)
+                    self.assertEqual(Path(prof_file).read_text(encoding="utf-8"), corrupt_raw)
 
 
 if __name__ == "__main__":

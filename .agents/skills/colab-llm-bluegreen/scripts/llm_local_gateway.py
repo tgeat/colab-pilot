@@ -13,6 +13,8 @@ Colab Pilot — 本机蓝绿零中断 OpenAI 网关守护进程 (llm_local_gatew
 import argparse
 import atexit
 import base64
+import contextlib
+import errno
 import importlib.util
 import json
 import os
@@ -26,7 +28,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 SLOT_PORTS = {
     "blue": 18081,
@@ -56,6 +58,17 @@ _LAST_ON_DEMAND_REFRESH: float = 0.0
 _DYNAMIC_VM_SERVERS: Dict[int, str] = {}
 _DYNAMIC_LOCK = threading.Lock()
 
+DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS = 90
+MIN_KEEP_ALIVE_INTERVAL_SECONDS = 30
+MAX_KEEP_ALIVE_INTERVAL_SECONDS = 600
+KEEPALIVE_SCHEDULER_TICK_SECONDS = 5.0
+TOKEN_REFRESH_INTERVAL_SECONDS = 90.0
+
+_LAST_KEEPALIVE_AT: Dict[str, Tuple[str, float]] = {}
+_LAST_TOKEN_REFRESH_AT: float = 0.0
+_KEEPALIVE_STATE_LOCK = threading.Lock()
+_PROFILES_THREAD_LOCK = threading.Lock()
+
 
 def cfg_dir() -> str:
     d = os.path.expanduser("~/.config/colab-cli")
@@ -73,6 +86,10 @@ def sessions_path() -> str:
 
 def api_keys_path() -> str:
     return os.path.join(os.path.dirname(state_path()), "llm_api_keys.json")
+
+
+def session_profiles_path() -> str:
+    return os.path.join(os.path.dirname(state_path()), "pilot_session_profiles.json")
 
 
 def gateway_pid_path() -> str:
@@ -142,6 +159,103 @@ def read_api_keys() -> Dict[str, Any]:
         except Exception:
             pass
     return {}
+
+
+@contextlib.contextmanager
+def _session_profiles_lock(prof_file: str, timeout: float = 2.0):
+    parent = os.path.dirname(os.path.abspath(prof_file))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    lock_file = f"{prof_file}.lock"
+    deadline = time.monotonic() + max(0.05, float(timeout))
+    retry_errnos = {errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLOCK", 36)}
+
+    with _PROFILES_THREAD_LOCK:
+        lf = open(lock_file, "a+b")
+        locked = False
+        try:
+            fd = lf.fileno()
+            while True:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        lf.seek(0)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in retry_errnos and not isinstance(exc, BlockingIOError):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Timed out waiting for lock: {lock_file}") from exc
+                    time.sleep(0.01)
+            yield
+        finally:
+            if locked:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        lf.seek(0)
+                        msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            lf.close()
+
+
+def read_session_profiles() -> Dict[str, Any]:
+    p = session_profiles_path()
+    if not os.path.exists(p) and not os.path.exists(f"{p}.lock"):
+        return {}
+    try:
+        with _session_profiles_lock(p, timeout=2.0):
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    raw_txt = f.read()
+                if not raw_txt.strip():
+                    return {}
+                data = json.loads(raw_txt)
+                return data if isinstance(data, dict) else {}
+    except (TimeoutError, OSError, ValueError):
+        pass
+    return {}
+
+
+def get_session_keep_alive_policy(
+    session_name: str,
+    profiles: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    prof_map = profiles if isinstance(profiles, dict) else read_session_profiles()
+    entry = prof_map.get(session_name) if isinstance(prof_map, dict) else None
+    ka = entry.get("keep_alive") if isinstance(entry, dict) else None
+    if not isinstance(ka, dict):
+        return {
+            "enabled": False,
+            "interval_seconds": DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
+            "kernel_ping": True,
+        }
+    enabled = bool(ka.get("enabled", True))
+    raw_interval = ka.get("interval_seconds", DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS)
+    try:
+        interval_val = int(raw_interval)
+    except (TypeError, ValueError):
+        interval_val = DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS
+    interval_val = max(MIN_KEEP_ALIVE_INTERVAL_SECONDS, min(MAX_KEEP_ALIVE_INTERVAL_SECONDS, interval_val))
+    kernel_ping = bool(ka.get("kernel_ping", True))
+    return {
+        "enabled": enabled,
+        "interval_seconds": interval_val,
+        "kernel_ping": kernel_ping,
+    }
 
 
 def resolve_vm_by_bearer_or_header(auth_header: Optional[str], vm_header: Optional[str]) -> Optional[str]:
@@ -322,6 +436,63 @@ def resolve_slot_session(
     return slot, merged_st, _apply_token_override(sess, resolved_name)
 
 
+def iter_managed_llm_sessions() -> List[Dict[str, Any]]:
+    """收集所有受网关管理的大模型实例会话（blue/green 槽位、state 显式会话、llm_api_keys['vms']），绝不混入普通非 LLM 会话。"""
+    st = read_state()
+    sessions = read_sessions()
+    vms_raw = read_api_keys().get("vms")
+    vms_cfg: Dict[str, Any] = vms_raw if isinstance(vms_raw, dict) else {}
+
+    out: List[Dict[str, Any]] = []
+    seen_names = set()
+    seen_eps = set()
+
+    def _add_candidate(sess: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(sess, dict):
+            return
+        sname = str(sess.get("session_name") or "").strip()
+        url = str(sess.get("url") or "").strip()
+        tok = str(sess.get("token") or "").strip()
+        if not sname or not url or not tok:
+            return
+        ep = str(sess.get("endpoint") or "").strip()
+        if sname in seen_names or (ep and ep in seen_eps):
+            return
+        seen_names.add(sname)
+        if ep:
+            seen_eps.add(ep)
+        out.append(sess)
+
+    for sl in (None, "blue", "green"):
+        _, _, sess = resolve_slot_session(forced_slot=sl)
+        _add_candidate(sess)
+
+    for state_key in ("active_session", "standby_session", "blue_session", "green_session"):
+        cand_name = st.get(state_key)
+        if isinstance(cand_name, str) and cand_name.strip():
+            cname = cand_name.strip()
+            raw_sess = sessions.get(cname)
+            if isinstance(raw_sess, dict):
+                _add_candidate(_apply_token_override(raw_sess, cname))
+
+    slots = st.get("slots")
+    if isinstance(slots, dict):
+        for slot_info in slots.values():
+            if isinstance(slot_info, dict):
+                cand_name = slot_info.get("session_name")
+                if isinstance(cand_name, str) and cand_name.strip():
+                    cname = cand_name.strip()
+                    raw_sess = sessions.get(cname)
+                    if isinstance(raw_sess, dict):
+                        _add_candidate(_apply_token_override(raw_sess, cname))
+
+    for vm_name in list(vms_cfg.keys()):
+        _, _, sess = resolve_slot_session(forced_vm=vm_name)
+        _add_candidate(sess)
+
+    return out
+
+
 def decode_contents_payload(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """解析 Jupyter Contents API 返回的 JSON / text / base64 内容 (H-5)。"""
     content = data.get("content")
@@ -415,12 +586,91 @@ def get_cached_llm_state(slot: str, sess: Optional[Dict[str, Any]]) -> Optional[
     return None
 
 
-def refresh_tokens_and_keepalive(send_kernel_ping: bool = True) -> bool:
-    """刷新 Colab `runtimeProxyInfo.token` 至内存 `_TOKEN_OVERRIDES` 并维持隧道/Kernel 活跃 (H-6)。"""
+def _query_runtime_kernels_once(url: str, token: str, timeout: float = 10.0) -> List[Dict[str, Any]]:
+    base = url.rstrip("/")
+    qs = urlencode({"authuser": "0", "colab-runtime-proxy-token": token})
+    req_url = f"{base}/api/kernels?{qs}"
+    req = urllib.request.Request(
+        req_url,
+        headers={
+            "X-Colab-Runtime-Proxy-Token": token,
+            "X-Colab-Client-Agent": "colab-cli",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw_txt = resp.read().decode("utf-8", errors="replace").lstrip()
+    if raw_txt.startswith(")]}'"):
+        raw_txt = raw_txt[4:].lstrip("\r\n")
+    parsed = json.loads(raw_txt)
+    if not isinstance(parsed, list):
+        raise ValueError("Unexpected /api/kernels payload")
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def fetch_runtime_kernels(sess: Dict[str, Any], timeout: float = 10.0) -> Optional[List[Dict[str, Any]]]:
+    url = str(sess.get("url") or "").strip()
+    token = str(sess.get("token") or "").strip()
+    session_name = str(sess.get("session_name") or "").strip()
+    if not url or not token:
+        return None
+    try:
+        return _query_runtime_kernels_once(url, token, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        try:
+            e.close()
+        except Exception:
+            pass
+        if e.code in (401, 403):
+            maybe_refresh_tokens_now(min_interval=5.0)
+            latest_sessions = read_sessions()
+            base_sess = latest_sessions.get(session_name) if isinstance(latest_sessions.get(session_name), dict) else sess
+            refreshed_sess = _apply_token_override(base_sess, session_name)
+            new_url = str(refreshed_sess.get("url") or "").strip()
+            new_tok = str(refreshed_sess.get("token") or "").strip()
+            if new_url and new_tok and (new_tok != token or new_url != url):
+                try:
+                    return _query_runtime_kernels_once(new_url, new_tok, timeout=timeout)
+                except Exception:
+                    return None
+        return None
+    except Exception:
+        return None
+
+
+def _select_idle_kernel_id(
+    kernels: List[Dict[str, Any]],
+    kernel_hint: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    for k in kernels:
+        state_str = str(k.get("execution_state") or "").strip().lower()
+        if state_str in {"busy", "starting"}:
+            return (True, None)
+
+    idle_ids: List[str] = []
+    for k in kernels:
+        kid = str(k.get("id") or "").strip()
+        state_str = str(k.get("execution_state") or "").strip().lower()
+        if kid and state_str not in {"busy", "starting", "dead", "terminating"}:
+            idle_ids.append(kid)
+
+    if not idle_ids:
+        return (False, None)
+    hint = str(kernel_hint or "").strip()
+    if hint and hint in idle_ids:
+        return (False, hint)
+    return (False, idle_ids[0])
+
+
+def refresh_token_overrides(now: Optional[float] = None) -> bool:
+    """仅刷新 Colab `runtimeProxyInfo.token` 至内存 `_TOKEN_OVERRIDES`，绝不触发保活探测或 Kernel `pass`。"""
+    global _LAST_TOKEN_REFRESH_AT
     sessions = read_sessions()
     if not sessions:
         return False
 
+    cur_now = float(now) if now is not None else time.time()
     refreshed_any = False
     try:
         from colab_cli.common import state as colab_state
@@ -442,56 +692,97 @@ def refresh_tokens_and_keepalive(send_kernel_ping: bool = True) -> bool:
                     elif new_tok:
                         _TOKEN_OVERRIDES.pop(ep, None)
                         refreshed_any = True
-                try:
-                    ka_url = f"{colab_state.client.colab_domain}/tun/m/keep-alive/{ep}"
-                    colab_state.client.session.request(
-                        "GET",
-                        ka_url,
-                        params={"authuser": "0"},
-                        headers={
-                            "Accept": "application/json",
-                            "X-Colab-Client-Agent": "colab-cli",
-                            "X-Colab-Tunnel": "Google",
-                        },
-                        timeout=10,
-                    )
-                except Exception:
-                    pass
         with _TOKEN_LOCK:
             for stale_ep in [e for e in _TOKEN_OVERRIDES if e not in ep_map]:
                 _TOKEN_OVERRIDES.pop(stale_ep, None)
+        with _KEEPALIVE_STATE_LOCK:
+            _LAST_TOKEN_REFRESH_AT = cur_now
     except Exception:
         return False
+    return refreshed_any
 
-    if send_kernel_ping:
+
+def refresh_tokens_and_keepalive(
+    send_kernel_ping: bool = True,
+    respect_interval: bool = False,
+    now: Optional[float] = None,
+) -> bool:
+    """刷新 Colab `runtimeProxyInfo.token` 至内存 `_TOKEN_OVERRIDES`，并按实例策略执行认证 `GET /api/kernels` 与空闲 Kernel 心跳。"""
+    if not send_kernel_ping:
+        return refresh_token_overrides(now=now)
+
+    cur_now = float(now) if now is not None else time.time()
+    managed = iter_managed_llm_sessions()
+    profiles = read_session_profiles()
+
+    due_targets: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+    managed_names = set()
+    for sess in managed:
+        sname = str(sess.get("session_name") or "").strip()
+        if not sname:
+            continue
+        managed_names.add(sname)
+        policy = get_session_keep_alive_policy(sname, profiles=profiles)
+        if not policy["enabled"]:
+            with _KEEPALIVE_STATE_LOCK:
+                _LAST_KEEPALIVE_AT.pop(sname, None)
+            continue
+        ep_key = str(sess.get("endpoint") or sess.get("url") or "")
+        if respect_interval:
+            with _KEEPALIVE_STATE_LOCK:
+                prev = _LAST_KEEPALIVE_AT.get(sname)
+            if prev is not None and prev[0] == ep_key and (cur_now - prev[1]) < float(policy["interval_seconds"]):
+                continue
+        due_targets.append((sname, sess, policy))
+
+    with _KEEPALIVE_STATE_LOCK:
+        for stale_name in [k for k in _LAST_KEEPALIVE_AT if k not in managed_names]:
+            _LAST_KEEPALIVE_AT.pop(stale_name, None)
+        token_due = (cur_now - _LAST_TOKEN_REFRESH_AT) >= TOKEN_REFRESH_INTERVAL_SECONDS
+
+    refreshed_any = False
+    if (not respect_interval) or due_targets or (managed and token_due):
+        refreshed_any = refresh_token_overrides(now=cur_now)
+
+    for sname, orig_sess, policy in due_targets:
+        target_sess = _apply_token_override(orig_sess, sname)
+        ep_key = str(target_sess.get("endpoint") or target_sess.get("url") or "")
+        with _KEEPALIVE_STATE_LOCK:
+            _LAST_KEEPALIVE_AT[sname] = (ep_key, cur_now)
+
+        kernels = fetch_runtime_kernels(target_sess, timeout=10.0)
+        if kernels is None:
+            continue
+        if not policy["kernel_ping"]:
+            continue
+
         with _ACTIVE_LOCK:
-            busy = _ACTIVE_STREAMS > 0
-        if not busy:
-            pinged_eps = set()
-            candidates: List[Dict[str, Any]] = []
-            for sl in (None, "blue", "green"):
-                _, _, sess = resolve_slot_session(sl)
-                if sess and sess.get("url") and sess.get("token"):
-                    ep_k = sess.get("endpoint") or sess.get("url")
-                    if ep_k not in pinged_eps:
-                        pinged_eps.add(ep_k)
-                        candidates.append(sess)
-            for target_sess in candidates:
-                try:
-                    from colab_cli.runtime import ColabRuntime
+            session_busy = _ACTIVE_BY_SESSION.get(sname, 0) > 0
+        if session_busy:
+            continue
 
-                    rt = ColabRuntime(
-                        target_sess["url"],
-                        target_sess["token"],
-                        kernel_id=target_sess.get("kernel_id"),
-                        session_id=None,
-                    )
-                    try:
-                        rt.execute_code("pass", timeout=15)
-                    finally:
-                        rt.stop()
-                except Exception:
-                    pass
+        kernel_busy, selected_kid = _select_idle_kernel_id(kernels, target_sess.get("kernel_id"))
+        if kernel_busy or not selected_kid:
+            continue
+
+        latest_sessions = read_sessions()
+        base_sess = latest_sessions.get(sname) if isinstance(latest_sessions.get(sname), dict) else orig_sess
+        exec_sess = _apply_token_override(base_sess, sname)
+        try:
+            from colab_cli.runtime import ColabRuntime
+
+            rt = ColabRuntime(
+                exec_sess["url"],
+                exec_sess["token"],
+                kernel_id=selected_kid,
+                session_id=None,
+            )
+            try:
+                rt.execute_code("pass", timeout=15)
+            finally:
+                rt.stop()
+        except Exception:
+            pass
 
     return refreshed_any
 
@@ -504,7 +795,7 @@ def maybe_refresh_tokens_now(min_interval: float = 5.0) -> bool:
         if (now - _LAST_ON_DEMAND_REFRESH) < min_interval:
             return False
         _LAST_ON_DEMAND_REFRESH = now
-    return refresh_tokens_and_keepalive(send_kernel_ping=False)
+    return refresh_token_overrides(now=now)
 
 
 def build_remote_proxy_code(remote_port: int, req_path: str, req_b64: str) -> str:
@@ -1056,18 +1347,20 @@ def _sync_dynamic_vm_servers() -> None:
 
 def _keepalive_worker() -> None:
     """
-    后台保活与代理令牌自动续期线程（启动即刻执行首轮，随后每 90 秒循环，H-6）：
-    1. 调用 Colab `/tun/m/assignments` 自动刷新 `runtimeProxyInfo.token`（防止 3600s 令牌过期），
-       刷新结果仅保存在进程内 `_TOKEN_OVERRIDES`，不回写 `sessions.json`（避免与 colab-cli 竞争写入）
-    2. 调用 `/tun/m/keep-alive/{endpoint}` (带 `X-Colab-Tunnel: Google` 头) 维持 Google Colab 隧道租约
-    3. 通过 `ColabRuntime` 向云端 Jupyter Kernel 发送轻量心跳 (`pass`)，刷新 Kernel `last_activity`。
+    后台保活与代理令牌自动续期调度线程（每 5 秒检查一次各受管实例的 `pilot_session_profiles.json` 策略）：
+    1. 按需调用 Colab `/tun/m/assignments` 自动刷新 `runtimeProxyInfo.token` 至内存 `_TOKEN_OVERRIDES`，
+       不回写 `sessions.json`（避免与 colab-cli 竞争写入）
+    2. 仅针对 `keep_alive.enabled == True` 且到达各自 `interval_seconds` (30–600s) 的受管 LLM 实例，
+       发起带认证的 `GET /api/kernels` 运行时连接检查（401/403 时自动刷新令牌重试一次）
+    3. 当 `kernel_ping == True` 且该实例当前无进行中的流式请求 (`_ACTIVE_BY_SESSION`) 或 busy/starting Kernel 时，
+       仅复用 `GET /api/kernels` 返回的现存空闲 Kernel 发送轻量 `pass` 心跳（绝不新建 Kernel）。
     """
     while True:
         try:
-            refresh_tokens_and_keepalive(send_kernel_ping=True)
+            refresh_tokens_and_keepalive(send_kernel_ping=True, respect_interval=True)
         except Exception:
             pass
-        time.sleep(90.0)
+        time.sleep(KEEPALIVE_SCHEDULER_TICK_SECONDS)
 
 
 def _metrics_poller_worker() -> None:

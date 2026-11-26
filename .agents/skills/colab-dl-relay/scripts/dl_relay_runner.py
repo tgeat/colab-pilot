@@ -12,13 +12,16 @@ Colab Pilot — 深度学习串行接力守护进程 (dl_relay_runner.py)
 
 import argparse
 import ast
+import contextlib
 import ctypes
+import errno
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -338,49 +341,114 @@ def release_gdrive_dir_lock(gdrive_dir: str, session_name: str) -> None:
         pass
 
 
+_PROFILES_THREAD_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _session_profiles_lock(prof_file: str, timeout: float = 15.0):
+    parent = os.path.dirname(os.path.abspath(prof_file))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    lock_file = f"{prof_file}.lock"
+    deadline = time.monotonic() + max(0.05, float(timeout))
+    retry_errnos = {errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLOCK", 36)}
+
+    with _PROFILES_THREAD_LOCK:
+        lf = open(lock_file, "a+b")
+        locked = False
+        try:
+            fd = lf.fileno()
+            while True:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        lf.seek(0)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in retry_errnos and not isinstance(exc, BlockingIOError):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Timed out waiting for lock: {lock_file}") from exc
+                    time.sleep(0.01)
+            yield
+        finally:
+            if locked:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        lf.seek(0)
+                        msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            lf.close()
+
+
 def ensure_session_keep_alive_profile(
     session_name: str,
     enabled: bool = True,
     interval_seconds: int = 90,
     kernel_ping: bool = True,
-) -> None:
+    lock_timeout: float = 15.0,
+) -> bool:
     """在 pilot_session_profiles.json 中为新建实例默认登记保活策略（不覆盖用户已手动修改过的配置）。"""
     clean_name = (session_name or "").strip()
     if not clean_name:
-        return
+        return False
     cfg_dir = colab_cfg_dir()
     prof_file = os.path.join(cfg_dir, "pilot_session_profiles.json")
-    data: Dict[str, Any] = {}
-    if os.path.exists(prof_file):
-        try:
-            with open(prof_file, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, dict):
-                data = raw
-        except Exception:
-            data = {}
-    entry = data.get(clean_name)
-    if not isinstance(entry, dict):
-        entry = {}
-    if not isinstance(entry.get("keep_alive"), dict):
-        entry["keep_alive"] = {
-            "enabled": bool(enabled),
-            "interval_seconds": max(30, min(600, int(interval_seconds))),
-            "kernel_ping": bool(kernel_ping),
-        }
-        entry["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        data[clean_name] = entry
-        tmp = f"{prof_file}.{os.getpid()}.tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, prof_file)
-        except Exception:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
+    try:
+        with _session_profiles_lock(prof_file, timeout=lock_timeout):
+            data: Dict[str, Any] = {}
+            if os.path.exists(prof_file):
+                try:
+                    with open(prof_file, "r", encoding="utf-8") as f:
+                        raw_txt = f.read()
+                    if raw_txt.strip():
+                        raw = json.loads(raw_txt)
+                        if not isinstance(raw, dict):
+                            return False
+                        data = raw
+                except (OSError, ValueError):
+                    return False
+
+            entry = data.get(clean_name)
+            if not isinstance(entry, dict):
+                entry = {}
+            if not isinstance(entry.get("keep_alive"), dict):
+                entry["keep_alive"] = {
+                    "enabled": bool(enabled),
+                    "interval_seconds": max(30, min(600, int(interval_seconds))),
+                    "kernel_ping": bool(kernel_ping),
+                }
+                entry["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                data[clean_name] = entry
+                tmp = f"{prof_file}.{os.getpid()}.{threading.get_ident()}.tmp"
+                try:
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    os.replace(tmp, prof_file)
+                except Exception:
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
+                    return False
+            return True
+    except (TimeoutError, OSError):
+        return False
 
 
 def register_workspace(session_name: str, workspace_dir: str, script_name: str, description: str) -> None:

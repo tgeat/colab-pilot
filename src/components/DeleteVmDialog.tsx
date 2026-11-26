@@ -26,7 +26,12 @@ export function DeleteVmDialog(props: {
 
   if (!props.vm) return null;
   const vm = props.vm;
-  const isLlm = !!vm.telemetry?.llm || vm.name.startsWith("llm-");
+  const isLlm =
+    !!vm.telemetry?.llm ||
+    !!vm.telemetry?.threads?.llm_process ||
+    !!vm.llm_api ||
+    vm.busy === "deploying_llm" ||
+    vm.name.startsWith("llm-");
   const isTraining = !!vm.telemetry?.training || !!vm.relay?.running;
 
   const run = async () => {

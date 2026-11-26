@@ -333,11 +333,21 @@ export interface KeepAliveStatus {
   state: "active" | "paused" | "error" | "idle" | string;
   last_ok_at: number | null;
   last_attempt_at: number | null;
+  /** Result of the authenticated runtime connection check. */
   tunnel_ok: boolean;
-  kernel_ping_state: "ok" | "skipped_busy" | "disabled" | "error" | "pending" | string;
+  kernel_ping_state:
+    | "ok"
+    | "skipped_busy"
+    | "skipped_no_kernel"
+    | "disabled"
+    | "error"
+    | "pending"
+    | string;
   success_count: number;
   consecutive_failures: number;
   last_error: string | null;
+  profile_saved?: boolean;
+  persistence_error?: string | null;
 }
 
 export interface CreateVmRequest {

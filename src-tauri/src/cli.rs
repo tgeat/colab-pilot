@@ -201,6 +201,10 @@ pub fn session_profiles_path() -> PathBuf {
     colab_config_dir().join("pilot_session_profiles.json")
 }
 
+pub fn session_profiles_lock_path() -> PathBuf {
+    colab_config_dir().join("pilot_session_profiles.json.lock")
+}
+
 pub fn llm_api_keys_path() -> PathBuf {
     colab_config_dir().join("llm_api_keys.json")
 }
@@ -814,6 +818,28 @@ pub struct SessionProfile {
 
 static PROFILES_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn open_profiles_lock(shared: bool) -> Result<std::fs::File> {
+    let lock_path = session_profiles_lock_path();
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建锁目录 `{}` 失败", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("打开档案锁文件 `{}` 失败", lock_path.display()))?;
+    if shared {
+        file.lock_shared()
+            .with_context(|| format!("获取档案共享锁 `{}` 失败", lock_path.display()))?;
+    } else {
+        file.lock()
+            .with_context(|| format!("获取档案独占锁 `{}` 失败", lock_path.display()))?;
+    }
+    Ok(file)
+}
+
 pub fn normalize_auth_mode(auth_mode: Option<&str>) -> Option<String> {
     match auth_mode.map(str::trim).unwrap_or("").to_ascii_lowercase().as_str() {
         "adc" => Some("adc".into()),
@@ -824,7 +850,13 @@ pub fn normalize_auth_mode(auth_mode: Option<&str>) -> Option<String> {
 
 pub fn read_session_profiles() -> HashMap<String, SessionProfile> {
     let _lock = PROFILES_IO_LOCK.l();
-    std::fs::read_to_string(session_profiles_path())
+    let path = session_profiles_path();
+    let _flock = if path.exists() || session_profiles_lock_path().exists() {
+        open_profiles_lock(true).ok()
+    } else {
+        None
+    };
+    std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str::<HashMap<String, SessionProfile>>(&s).ok())
         .unwrap_or_default()
@@ -839,8 +871,9 @@ pub fn save_session_profile(session_name: &str, profile: &SessionProfile) -> Res
         return Ok(());
     }
     let _lock = PROFILES_IO_LOCK.l();
+    let _flock = open_profiles_lock(false)?;
     let path = session_profiles_path();
-    let mut map: HashMap<String, SessionProfile> = std::fs::read_to_string(&path)
+    let mut map: HashMap<String, Value> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
@@ -848,28 +881,36 @@ pub fn save_session_profile(session_name: &str, profile: &SessionProfile) -> Res
     if entry.updated_at.is_none() {
         entry.updated_at = Some(iso_utc_now());
     }
-    map.insert(session_name.to_string(), entry);
+    map.insert(session_name.to_string(), serde_json::to_value(&entry)?);
     let raw = serde_json::to_string_pretty(&map)?;
     atomic_write_file(&path, &raw)?;
     invalidate_recent_sessions_cache();
     Ok(())
 }
 
-/// 独立更新某个实例的持久化保活策略（不覆盖既有的 boot_mode / 硬件 / 认证记录）
+/// 独立更新某个实例的持久化保活策略（不覆盖既有的 boot_mode / 硬件 / 认证记录，且跨进程互斥合并）
 pub fn save_session_keep_alive(session_name: &str, cfg: &crate::KeepAliveConfig) -> Result<()> {
     let name = session_name.trim();
     if name.is_empty() {
         return Ok(());
     }
     let _lock = PROFILES_IO_LOCK.l();
+    let _flock = open_profiles_lock(false)?;
     let path = session_profiles_path();
-    let mut map: HashMap<String, SessionProfile> = std::fs::read_to_string(&path)
+    let mut map: HashMap<String, Value> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    let entry = map.entry(name.to_string()).or_default();
-    entry.keep_alive = Some(cfg.clone());
-    entry.updated_at = Some(iso_utc_now());
+    let entry_val = map
+        .entry(name.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !entry_val.is_object() {
+        *entry_val = serde_json::json!({});
+    }
+    if let Some(obj) = entry_val.as_object_mut() {
+        obj.insert("keep_alive".to_string(), serde_json::to_value(cfg)?);
+        obj.insert("updated_at".to_string(), Value::String(iso_utc_now()));
+    }
     let raw = serde_json::to_string_pretty(&map)?;
     atomic_write_file(&path, &raw)?;
     invalidate_recent_sessions_cache();
@@ -3127,5 +3168,158 @@ mod tests {
         assert!(!out_bi.timed_out);
         assert_eq!(out_bi.code, 0);
         assert!(out_bi.stdout.contains("READ_OK=4194304"));
+    }
+
+    #[tokio::test]
+    async fn test_issue_94_cross_process_sidecar_lock_preserves_concurrent_updates() {
+        let _env_guard = TEST_ENV_LOCK.lock().await;
+        let py = {
+            let p = colab_python_bin();
+            if p.exists() {
+                Some(p)
+            } else {
+                which("python").or_else(|| which("python3"))
+            }
+        };
+        let Some(py_bin) = py else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("pilot_lock94_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev_cfg = TEST_CONFIG_DIR.l().clone();
+        *TEST_CONFIG_DIR.l() = Some(tmp.clone());
+
+        // Seed initial entry with extra unknown sibling field to verify lossless merge
+        let prof_path = session_profiles_path();
+        std::fs::write(
+            &prof_path,
+            serde_json::json!({
+                "vm-seed": {
+                    "boot_mode": "general",
+                    "accelerator": "T4",
+                    "custom_meta": "keep-me",
+                    "keep_alive": { "enabled": false, "interval_seconds": 120, "kernel_ping": true }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let py_script = r#"
+import json, os, sys, time
+prof_file = sys.argv[1]
+lock_file = prof_file + ".lock"
+ready_file = sys.argv[2]
+
+with open(lock_file, "a+b") as lf:
+    fd = lf.fileno()
+    if os.name == "nt":
+        import msvcrt
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                lf.seek(0)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("lock timeout")
+                time.sleep(0.01)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with open(ready_file, "w", encoding="utf-8") as rf:
+            rf.write("locked")
+        data = {}
+        if os.path.exists(prof_file):
+            with open(prof_file, "r", encoding="utf-8") as pf:
+                data = json.load(pf)
+        # Hold the sidecar lock while Rust concurrently attempts to write vm-rust
+        time.sleep(0.25)
+        entry = data.get("vm-py", {})
+        if not isinstance(entry, dict):
+            entry = {}
+        entry["keep_alive"] = {"enabled": True, "interval_seconds": 90, "kernel_ping": True}
+        entry["py_tag"] = "from-python"
+        data["vm-py"] = entry
+        tmp = f"{prof_file}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as tf:
+            json.dump(data, tf, indent=2)
+        os.replace(tmp, prof_file)
+    finally:
+        if os.name == "nt":
+            lf.seek(0)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+"#;
+        let ready_file = tmp.join("py_locked.flag");
+        let mut child = std::process::Command::new(&py_bin)
+            .args([
+                "-c",
+                py_script,
+                &prof_path.to_string_lossy(),
+                &ready_file.to_string_lossy(),
+            ])
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .spawn()
+            .expect("spawn python sidecar lock writer");
+
+        // Wait up to 3s for Python to acquire the sidecar .lock first
+        let wait_start = Instant::now();
+        while !ready_file.exists() && wait_start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready_file.exists(), "python writer should acquire sidecar lock");
+
+        // Concurrently run multiple Rust profile updates while Python holds the lock
+        let h1 = std::thread::spawn(|| {
+            save_session_keep_alive(
+                "vm-rust",
+                &crate::KeepAliveConfig {
+                    enabled: false,
+                    interval_seconds: 180,
+                    kernel_ping: false,
+                },
+            )
+            .expect("save_session_keep_alive vm-rust must wait cleanly and succeed");
+        });
+        let h2 = std::thread::spawn(|| {
+            save_session_keep_alive(
+                "vm-rust-2",
+                &crate::KeepAliveConfig {
+                    enabled: true,
+                    interval_seconds: 60,
+                    kernel_ping: true,
+                },
+            )
+            .expect("save_session_keep_alive vm-rust-2 must wait cleanly and succeed");
+        });
+
+        let status = child.wait().expect("wait python writer");
+        assert!(status.success(), "python sidecar lock writer failed");
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        let raw = std::fs::read_to_string(&prof_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["vm-seed"]["custom_meta"], "keep-me");
+        assert_eq!(v["vm-seed"]["keep_alive"]["enabled"], false);
+        assert_eq!(v["vm-py"]["py_tag"], "from-python");
+        assert_eq!(v["vm-py"]["keep_alive"]["enabled"], true);
+        assert_eq!(v["vm-rust"]["keep_alive"]["enabled"], false);
+        assert_eq!(v["vm-rust"]["keep_alive"]["interval_seconds"], 180);
+        assert_eq!(v["vm-rust-2"]["keep_alive"]["enabled"], true);
+        assert!(session_profiles_lock_path().exists(), "sidecar lock file should remain intact");
+
+        let parsed = read_session_profiles();
+        assert!(parsed.contains_key("vm-seed"));
+        assert!(parsed.contains_key("vm-py"));
+        assert!(parsed.contains_key("vm-rust"));
+        assert!(parsed.contains_key("vm-rust-2"));
+
+        *TEST_CONFIG_DIR.l() = prev_cfg;
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

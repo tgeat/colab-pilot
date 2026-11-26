@@ -1,4 +1,4 @@
-import { type MutableRefObject, useCallback, useEffect, useState } from "react";
+import { type MutableRefObject, useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Loader2, RefreshCw, Save } from "lucide-react";
 import { ColabIcon, Modal, useToast } from "./ui";
 import { api, errText } from "../api";
@@ -24,6 +24,13 @@ export function ScriptDialog(props: {
   const [saving, setSaving] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [reloadNonce, setReloadNonce] = useState(0);
+  const confirmDiscardRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (confirmDiscard) {
+      confirmDiscardRef.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [confirmDiscard]);
 
   const targetWs = props.workspacePath ?? null;
   const targetVm = props.vmName ?? null;
@@ -206,7 +213,7 @@ export function ScriptDialog(props: {
       )}
 
       {confirmDiscard && (
-        <div className="banner banner-warn" role="alert" style={{ margin: 0, alignItems: "center" }}>
+        <div ref={confirmDiscardRef} className="banner banner-warn" role="alert" style={{ margin: 0, alignItems: "center" }}>
           <AlertTriangle size={16} style={{ flexShrink: 0 }} />
           <div style={{ flex: 1 }}>
             <b>有未保存的修改，确定放弃编辑并关闭吗？</b>

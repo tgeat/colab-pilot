@@ -162,5 +162,5 @@ done
 
 # 训练全部结束后，将最终权重从网盘拉回本机备份
 echo "📥 正在将最终训练好的 checkpoint.pt 下载回本机当前目录..."
-rclone copy -- "${GDRIVE_DIR}/checkpoint.pt" ./ --multi-thread-streams=16 -P
+rclone copy --multi-thread-streams=16 -P -- "${GDRIVE_DIR}/checkpoint.pt" ./
 echo "✅ 全部流程执行完毕！"

@@ -2,10 +2,10 @@
 //!
 //! 实现了：
 //! - OAuth2 双源凭证读取（优先 `token.json`，回退 OS Keyring `google-colab-cli/oauth_token`）与 `refresh_token` 自动续期回写
-//! - `/tun/m/ccu-info`      账户计算单元余额与计费速率
-//! - `/tun/m/assignments`   服务端真实计费实例列表（删除核验的唯一可信来源）
-//! - `/tun/m/unassign/{ep}` 服务端释放实例（停止计费）
-//! - Jupyter Contents API  读写云端 /content 文件（携带 `X-Colab-Runtime-Proxy-Token` 请求头与瞬态重试）
+//! - `/tun/m/ccu-info`        账户计算单元余额与计费速率
+//! - `/tun/m/assignments`     服务端真实计费实例列表（删除核验的唯一可信来源）
+//! - `/tun/m/unassign/{ep}`   服务端释放实例（停止计费）
+//! - Jupyter Contents / Kernels API 读写云端文件与查询 Kernel 忙闲态（携带 `X-Colab-Runtime-Proxy-Token` 请求头与瞬态重试）
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
@@ -30,10 +30,13 @@ static KEYRING_AUTH_CACHE: std::sync::Mutex<Option<(bool, Instant)>> = std::sync
 struct TokenFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+    #[serde(default)]
     refresh_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token_uri: Option<String>,
+    #[serde(default)]
     client_id: String,
+    #[serde(default)]
     client_secret: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expiry: Option<String>,
@@ -209,6 +212,19 @@ struct AssignmentList {
     assignments: Vec<Assignment>,
 }
 
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct JupyterKernelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub execution_state: String,
+    #[serde(default)]
+    pub last_activity: Option<String>,
+    #[serde(default)]
+    pub connections: u64,
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
 pub struct Ccu {
     #[serde(rename(deserialize = "currentBalance"), default)]
@@ -237,11 +253,7 @@ pub struct ColabClient {
 }
 
 pub fn token_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".config")
-        .join("colab-cli")
-        .join("token.json")
+    crate::cli::colab_config_dir().join("token.json")
 }
 
 /// 判断 Contents API 错误是否由过期的 `runtimeProxyInfo.token`（HTTP 401 / 403）触发
@@ -343,6 +355,26 @@ impl ColabClient {
         ok
     }
 
+    pub fn is_client_authorized(&self) -> bool {
+        if let Some(ref p) = self.token_file_path {
+            if p.exists() {
+                return true;
+            }
+            #[cfg(test)]
+            if let Some(ref store) = self.keyring_override {
+                return store
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .and_then(|raw| serde_json::from_str::<TokenFile>(&raw).ok())
+                    .map(|tf| !tf.refresh_token.trim().is_empty())
+                    .unwrap_or(false);
+            }
+            return false;
+        }
+        Self::is_authorized()
+    }
+
     fn effective_token_path(&self) -> PathBuf {
         self.token_file_path.clone().unwrap_or_else(token_path)
     }
@@ -378,7 +410,7 @@ impl ColabClient {
 
         if self.token_file_path.is_some() {
             return Err(anyhow!(
-                "未找到 Colab 授权文件 {}，请先运行 `colab auth login` 完成授权",
+                "未找到 Colab 授权文件 {}，请先运行 `colab auth` 完成授权",
                 path.display()
             ));
         }
@@ -406,7 +438,7 @@ impl ColabClient {
 
         set_keyring_auth_cache(false);
         Err(anyhow!(
-            "未检测到 Colab 授权凭证（~/.config/colab-cli/token.json 或系统密钥环），请先在终端运行 `colab status` 或 `colab auth login` 完成 Google 登录"
+            "未检测到 Colab 授权凭证（~/.config/colab-cli/token.json 或系统密钥环），请先在终端运行 `colab auth` 或 `colab status` 完成 Google 登录"
         ))
     }
 
@@ -539,6 +571,11 @@ impl ColabClient {
 
     /// 向 Google OAuth 端点 POST refresh_token，返回 (access_token, 有效秒数)
     async fn refresh_access_token(&self, tf: &TokenFile) -> Result<(String, u64)> {
+        if tf.refresh_token.trim().is_empty() {
+            return Err(anyhow!(
+                "Colab OAuth 令牌已过期且缺少 refresh_token，请在终端运行 `colab auth` 或 `colab status` 重新授权"
+            ));
+        }
         #[derive(Deserialize)]
         struct RefreshResp {
             access_token: String,
@@ -643,6 +680,41 @@ impl ColabClient {
         Ok(())
     }
 
+    /// 查询云端 Jupyter Server 活跃内核状态（用于保活忙时避让与复用空闲 kernel_id）
+    pub async fn list_kernels(&self, a: &Assignment) -> Result<Vec<JupyterKernelInfo>> {
+        let url = format!("{}/api/kernels", a.runtime_proxy_info.url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .get(&url)
+            .header(
+                "X-Colab-Runtime-Proxy-Token",
+                a.runtime_proxy_info.token.as_str(),
+            )
+            .header("X-Colab-Client-Agent", "colab-cli")
+            .query(&[
+                ("authuser", "0"),
+                ("colab-runtime-proxy-token", a.runtime_proxy_info.token.as_str()),
+            ])
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("查询 /api/kernels 失败")?;
+        let st = resp.status();
+        if matches!(st, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(anyhow!("ProxyAuth HTTP {} /api/kernels", st.as_u16()));
+        }
+        let text = resp.text().await.map_err(reqwest::Error::without_url)?;
+        if !st.is_success() {
+            return Err(anyhow!(
+                "查询 /api/kernels 失败 HTTP {st}: {}",
+                truncate(&text, 200)
+            ));
+        }
+        let body = text.strip_prefix(XSSI_PREFIX).unwrap_or(&text);
+        serde_json::from_str(body).context("解析 /api/kernels 列表失败")
+    }
+
     fn contents_url(a: &Assignment, path: &str) -> String {
         format!(
             "{}/api/contents/{}",
@@ -674,7 +746,8 @@ impl ColabClient {
                 ])
                 .timeout(Duration::from_secs(12))
                 .send()
-                .await;
+                .await
+                .map_err(reqwest::Error::without_url);
             let resp = match send_res {
                 Ok(r) => r,
                 Err(e) => {
@@ -696,7 +769,7 @@ impl ColabClient {
             if !st.is_success() {
                 return Err(anyhow!("Contents API HTTP {st}"));
             }
-            let v: Value = match resp.json().await {
+            let v: Value = match resp.json().await.map_err(reqwest::Error::without_url) {
                 Ok(val) => val,
                 Err(e) => {
                     last_err = Some(anyhow!("Contents API JSON 解析失败: {e}"));
@@ -754,7 +827,8 @@ impl ColabClient {
                 .json(&payload)
                 .timeout(Duration::from_secs(120))
                 .send()
-                .await;
+                .await
+                .map_err(reqwest::Error::without_url);
             let resp = match send_res {
                 Ok(r) => r,
                 Err(e) => {
@@ -766,7 +840,11 @@ impl ColabClient {
             if st.is_success() {
                 return Ok(());
             }
-            let t = resp.text().await.unwrap_or_default();
+            let t = resp
+                .text()
+                .await
+                .map_err(reqwest::Error::without_url)
+                .unwrap_or_default();
             if st == StatusCode::UNAUTHORIZED || st == StatusCode::FORBIDDEN {
                 return Err(anyhow!(
                     "上传 {remote_path} 失败 ProxyAuth HTTP {st}: {}",
@@ -1103,5 +1181,141 @@ mod tests {
 
         srv.abort();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn list_kernels_authenticates_and_parses_runtime_states() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let req_low = req.to_ascii_lowercase();
+                    let first = req.lines().next().unwrap_or("");
+                    let (status, body) = if first.starts_with("GET /api/kernels?") {
+                        if req_low.contains("x-colab-runtime-proxy-token: proxy-ka-tok")
+                            && first.contains("colab-runtime-proxy-token=proxy-ka-tok")
+                        {
+                            (
+                                "200 OK",
+                                r#"[{"id":"kern-01","name":"python3","execution_state":"idle","connections":0},{"id":"kern-02","name":"python3","execution_state":"busy","connections":1}]"#,
+                            )
+                        } else {
+                            ("403 Forbidden", "missing proxy token")
+                        }
+                    } else {
+                        ("404 Not Found", "nope")
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), PathBuf::new());
+        let a = Assignment {
+            accelerator: "A100".into(),
+            endpoint: "m-s-ka01".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("HIGH_RAM".into()),
+            runtime_proxy_info: RuntimeProxyInfo {
+                token: "proxy-ka-tok".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+        let kernels = client.list_kernels(&a).await.expect("list_kernels should parse");
+        assert_eq!(kernels.len(), 2);
+        assert_eq!(kernels[0].id, "kern-01");
+        assert_eq!(kernels[0].execution_state, "idle");
+        assert_eq!(kernels[1].execution_state, "busy");
+
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn list_kernels_auth_errors_empty_body_and_redaction() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mode = Arc::new(AtomicUsize::new(0));
+        let mode_srv = mode.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let cur_mode = mode_srv.load(Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let (status, body) = match cur_mode {
+                        0 => ("401 Unauthorized", "unauthorized"),
+                        1 => ("403 Forbidden", "forbidden"),
+                        _ => ("200 OK", ""),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let client = ColabClient::new_for_test(format!("http://{addr}"), PathBuf::new());
+        let a = Assignment {
+            accelerator: "T4".into(),
+            endpoint: "m-s-ka-err".into(),
+            variant: Value::String("GPU".into()),
+            machine_shape: Value::String("STANDARD".into()),
+            runtime_proxy_info: RuntimeProxyInfo {
+                token: "super-secret-tok".into(),
+                token_expires_in_seconds: 3600,
+                url: format!("http://{addr}"),
+            },
+        };
+
+        mode.store(0, Ordering::SeqCst);
+        let err_401 = client.list_kernels(&a).await.expect_err("401 must fail");
+        assert!(is_proxy_auth_error(&err_401), "401 should be proxy auth error: {err_401:#}");
+
+        mode.store(1, Ordering::SeqCst);
+        let err_403 = client.list_kernels(&a).await.expect_err("403 must fail");
+        assert!(is_proxy_auth_error(&err_403), "403 should be proxy auth error: {err_403:#}");
+
+        mode.store(2, Ordering::SeqCst);
+        let err_empty = client.list_kernels(&a).await.expect_err("empty 200 body must fail");
+        assert!(!is_proxy_auth_error(&err_empty));
+
+        srv.abort();
+
+        // Closed port transport error must redact colab-runtime-proxy-token
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+        let mut closed_a = a.clone();
+        closed_a.runtime_proxy_info.url = format!("http://{closed_addr}");
+        let err_net = client
+            .list_kernels(&closed_a)
+            .await
+            .expect_err("closed port must error");
+        let msg = format!("{err_net:#}");
+        assert!(
+            !msg.contains("super-secret-tok"),
+            "transport error leaked proxy token: {msg}"
+        );
     }
 }

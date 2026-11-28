@@ -9,6 +9,121 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+pub fn default_vm_grab_mode() -> String {
+    "fast".into()
+}
+
+pub fn default_vm_grab_retry_seconds() -> u64 {
+    15
+}
+
+pub fn default_relay_grab_mode() -> String {
+    "budget".into()
+}
+
+pub fn default_relay_grab_timeout_minutes() -> u32 {
+    60
+}
+
+pub fn default_relay_grab_retry_seconds() -> u64 {
+    20
+}
+
+/// 实例创建时的抢卡策略配置
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct GrabConfig {
+    /// "fast"（单次探卡·没卡立报）| "standard"（标准重试 3 次）| "persistent"（一直抢卡·蹲守直到成功或放弃）
+    #[serde(default = "default_vm_grab_mode")]
+    pub mode: String,
+    /// 重试冷却秒数（5..=300，默认 15）
+    #[serde(default = "default_vm_grab_retry_seconds")]
+    pub retry_seconds: u64,
+    /// 可选备选加速器列表（默认空，绝不静默篡改用户指定卡型）
+    #[serde(default)]
+    pub fallback_gpus: Vec<String>,
+}
+
+impl Default for GrabConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_vm_grab_mode(),
+            retry_seconds: default_vm_grab_retry_seconds(),
+            fallback_gpus: Vec::new(),
+        }
+    }
+}
+
+/// 实时抢卡状态（供创建弹窗、实例卡片与接力面板统一展示）
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct GrabStatus {
+    pub active: bool,
+    pub mode: String,
+    pub attempt: u32,
+    pub max_attempts: Option<u32>,
+    pub budget_minutes: Option<u32>,
+    pub retry_seconds: u64,
+    pub started_at: i64,
+    pub next_retry_at: Option<i64>,
+    pub target_gpu: String,
+    /// "requesting" | "waiting_retry" | "allocated" | "cancelled" | "failed"
+    pub phase: String,
+    pub last_error: Option<String>,
+}
+
+pub fn is_valid_accelerator_code(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_uppercase().as_str(),
+        "CPU" | "T4" | "L4" | "G4" | "A100" | "H100" | "V5E1" | "V6E1"
+    )
+}
+
+pub fn validate_grab_config(cfg: &GrabConfig) -> Result<GrabConfig> {
+    let mode_norm = {
+        let m = cfg.mode.trim().to_lowercase();
+        if m.is_empty() {
+            default_vm_grab_mode()
+        } else {
+            m
+        }
+    };
+    if !matches!(mode_norm.as_str(), "fast" | "standard" | "persistent") {
+        return Err(anyhow!(
+            "不支持的开机抢卡模式 `{}`（仅支持 fast / standard / persistent）",
+            cfg.mode
+        ));
+    }
+    let retry_secs = if mode_norm == "fast" && cfg.retry_seconds == 0 {
+        default_vm_grab_retry_seconds()
+    } else {
+        cfg.retry_seconds
+    };
+    if !(5..=300).contains(&retry_secs) {
+        return Err(anyhow!("抢卡重试间隔必须在 5 ~ 300 秒之间"));
+    }
+    if cfg.fallback_gpus.len() > 8 {
+        return Err(anyhow!("备选卡型最多配置 8 个"));
+    }
+    let mut clean_fb = Vec::new();
+    for g in &cfg.fallback_gpus {
+        let trimmed = g.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !is_valid_accelerator_code(trimmed) {
+            return Err(anyhow!("不支持的备选硬件加速器型号：{trimmed}"));
+        }
+        let u = trimmed.to_uppercase();
+        if !clean_fb.contains(&u) {
+            clean_fb.push(u);
+        }
+    }
+    Ok(GrabConfig {
+        mode: mode_norm,
+        retry_seconds: retry_secs,
+        fallback_gpus: clean_fb,
+    })
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct RelayConfig {
     pub gpu_type: String,
@@ -18,6 +133,18 @@ pub struct RelayConfig {
     pub backup_interval_minutes: f64,
     pub total_epochs: u32,
     pub reset_done_flag: bool,
+    /// 换棒/首棒抢卡策略："budget"（按时间预算蹲守，默认 60 分钟）| "persistent"（一直抢卡直到有卡或手动停止）| "fast"（单次尝试）| "standard"（标准 3 次）
+    #[serde(default = "default_relay_grab_mode")]
+    pub grab_mode: String,
+    /// 当 grab_mode == "budget" 时每棒最长抢卡等待时间（分钟，1..=1440，默认 60 分钟；排队期间旧实例已销毁，0 CU 计费）
+    #[serde(default = "default_relay_grab_timeout_minutes")]
+    pub grab_timeout_minutes: u32,
+    /// 每次抢卡失败后的冷却重试秒数（5..=300，默认 20 秒）
+    #[serde(default = "default_relay_grab_retry_seconds")]
+    pub grab_retry_seconds: u64,
+    /// 可选换棒备选加速器列表（默认空，绝不擅自换卡 #52；仅在用户显式配置时轮询）
+    #[serde(default)]
+    pub fallback_gpus: Vec<String>,
 }
 
 impl Default for RelayConfig {
@@ -30,17 +157,63 @@ impl Default for RelayConfig {
             backup_interval_minutes: 30.0,
             total_epochs: 500,
             reset_done_flag: false,
+            grab_mode: default_relay_grab_mode(),
+            grab_timeout_minutes: default_relay_grab_timeout_minutes(),
+            grab_retry_seconds: default_relay_grab_retry_seconds(),
+            fallback_gpus: Vec::new(),
         }
     }
 }
 
+pub const DEFAULT_BARE_GDRIVE_DIR: &str = "gdrive:colab_relay";
+
+pub fn sanitize_vm_segment(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(['-', '_', '.']);
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn normalize_gdrive_dir(raw: &str) -> String {
+    raw.trim().trim_end_matches('/').to_string()
+}
+
+/// 当 `gdrive_dir` 为默认裸值 `"gdrive:colab_relay"`（去首尾空白与末尾斜杠后相等）时，
+/// 自动按实例名隔离为 `gdrive:colab_relay/<sanitized_vm_name>`，防止多接力任务互相覆盖断点与完成标记。
+pub fn resolve_isolated_gdrive_dir(raw: &str, vm_name: &str) -> String {
+    let norm = normalize_gdrive_dir(raw);
+    if norm == DEFAULT_BARE_GDRIVE_DIR {
+        format!("{DEFAULT_BARE_GDRIVE_DIR}/{}", sanitize_vm_segment(vm_name))
+    } else {
+        norm
+    }
+}
+
+/// 计算单棒云端 `colab exec --timeout` 秒数与本机流式等待超时：
+/// 确保完整覆盖 `max_session_hours * 3600 + 缓冲时间`，同时不超过云端 86400s (24h) 与本机 90000s 安全上限。
+pub(crate) fn compute_relay_timeouts(max_session_hours: f64) -> (u64, Duration) {
+    let max_secs = (max_session_hours.clamp(0.1, 23.5) * 3600.0).ceil() as u64;
+    let exec_timeout_secs = (max_secs + 1800).clamp(600, 86_400);
+    let local_wait_secs = (exec_timeout_secs + 600).min(90_000);
+    (exec_timeout_secs, Duration::from_secs(local_wait_secs))
+}
+
 /// 严格校验接力配置：杜绝 rclone `--flag` 参数注入、Windows 盘符误传、路径穿越与非法数值
 pub fn validate_relay_config(cfg: &RelayConfig) -> Result<()> {
-    let gpu = cfg.gpu_type.trim().to_uppercase();
-    if !matches!(
-        gpu.as_str(),
-        "CPU" | "T4" | "L4" | "G4" | "A100" | "H100" | "V5E1" | "V6E1"
-    ) {
+    if !is_valid_accelerator_code(&cfg.gpu_type) {
         return Err(anyhow!("不支持的硬件加速器型号：{}", cfg.gpu_type));
     }
 
@@ -78,8 +251,10 @@ pub fn validate_relay_config(cfg: &RelayConfig) -> Result<()> {
         ));
     }
 
-    if !cfg.max_session_hours.is_finite() || !(0.05..=48.0).contains(&cfg.max_session_hours) {
-        return Err(anyhow!("单棒上限时长必须在 0.05 ~ 48.0 小时之间"));
+    if !cfg.max_session_hours.is_finite() || !(0.1..=23.5).contains(&cfg.max_session_hours) {
+        return Err(anyhow!(
+            "单棒上限时长必须在 0.1 ~ 23.5 小时之间（受限于 Colab 单次最长 24 小时执行期限）"
+        ));
     }
     if !cfg.backup_interval_minutes.is_finite()
         || !(0.5..=1440.0).contains(&cfg.backup_interval_minutes)
@@ -88,6 +263,38 @@ pub fn validate_relay_config(cfg: &RelayConfig) -> Result<()> {
     }
     if cfg.total_epochs == 0 || cfg.total_epochs > 1_000_000 {
         return Err(anyhow!("总训练轮次必须在 1 ~ 1,000,000 之间"));
+    }
+
+    let gm = {
+        let m = cfg.grab_mode.trim().to_lowercase();
+        if m.is_empty() {
+            "budget".to_string()
+        } else {
+            m
+        }
+    };
+    if !matches!(gm.as_str(), "budget" | "persistent" | "fast" | "standard") {
+        return Err(anyhow!(
+            "不支持的接力抢卡模式 `{}`（支持 budget / persistent / fast / standard）",
+            cfg.grab_mode
+        ));
+    }
+    if gm == "budget" && (cfg.grab_timeout_minutes == 0 || cfg.grab_timeout_minutes > 1440) {
+        return Err(anyhow!(
+            "接力抢卡等待上限必须在 1 ~ 1440 分钟（24 小时）之间"
+        ));
+    }
+    if gm != "fast" && !(5..=300).contains(&cfg.grab_retry_seconds) {
+        return Err(anyhow!("抢卡重试间隔必须在 5 ~ 300 秒之间"));
+    }
+    if cfg.fallback_gpus.len() > 8 {
+        return Err(anyhow!("备选加速器列表最多配置 8 个"));
+    }
+    for fb in &cfg.fallback_gpus {
+        let t = fb.trim();
+        if !t.is_empty() && !is_valid_accelerator_code(t) {
+            return Err(anyhow!("不支持的备选硬件加速器型号：{t}"));
+        }
     }
     Ok(())
 }
@@ -159,7 +366,7 @@ pub(crate) fn classify_training_round(out: &cli::RunOutput, remote_done: bool) -
     ))
 }
 
-#[derive(Clone, Serialize, Debug, Default)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct RelayStatus {
     pub vm_name: String,
     pub running: bool,
@@ -171,16 +378,40 @@ pub struct RelayStatus {
     pub config: RelayConfig,
     pub logs: Vec<String>,
     pub child_pid: Option<u32>,
+    #[serde(default)]
+    pub training_completed: bool,
+    #[serde(default)]
+    pub weights_downloaded: bool,
+    #[serde(default)]
+    pub download_error: Option<String>,
+    #[serde(default)]
+    pub local_weights_path: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub grab_status: Option<GrabStatus>,
 }
 
 pub struct RelayHandle {
     pub status: Mutex<RelayStatus>,
     pub cancel: Mutex<CancellationToken>,
     pub child_pid: Mutex<Option<u32>>,
+    /// 绑定的本地工作区目录（上传 train.py / requirements.txt 及保存最终权重均使用该目录）
+    pub workspace_dir: Mutex<Option<std::path::PathBuf>>,
+    /// 会话授权策略（oauth2 / adc），后续 colab 子命令沿用
+    pub auth_mode: Mutex<Option<String>>,
     /// 记录 provisioning 发起前服务端已有的计费 endpoint 集合，用于在取消分配时精准识别刚诞生的残留孤儿实例
     pub pre_provision_endpoints: Mutex<std::collections::HashSet<String>>,
+    /// 标记 `pre_provision_endpoints` 快照是否无效/尚未在本次 `colab new` 前成功拉取（无效时严禁猜测残留孤儿 #77）
+    pub pre_provision_snapshot_invalid: AtomicBool,
     /// 标记最近一次 stop 是否发生在 provisioning（colab new）阶段
     pub stopped_during_provisioning: AtomicBool,
+    /// 标记本次接力的 `gdrive_dir` 是否由默认裸值 `gdrive:colab_relay` 自动隔离而来（用于旧断点迁移保护 #80）
+    pub auto_isolated_gdrive: AtomicBool,
+    /// 用户显式确认的旧版根目录断点处理动作：`Some("migrate")` | `Some("ignore")` | `None` (#80)
+    pub legacy_gdrive_action: Mutex<Option<String>>,
+    /// 标记最近一次停止/完成后是否已由服务端实时查询确认该会话无在跑计费实例 (#78)
+    pub cloud_unassign_verified: AtomicBool,
     /// 后台监工任务是否仍在执行（stop 后到任务真正退出之间仍为 true，用于拒绝重复启动）
     pub task_alive: AtomicBool,
     /// 手动停止接力时是否保留当前云端实例（仅 `stop_relay(..., destroy_vm=false)` 时置 true）
@@ -200,8 +431,14 @@ impl RelayHandle {
             }),
             cancel: Mutex::new(CancellationToken::new()),
             child_pid: Mutex::new(None),
+            workspace_dir: Mutex::new(None),
+            auth_mode: Mutex::new(None),
             pre_provision_endpoints: Mutex::new(std::collections::HashSet::new()),
+            pre_provision_snapshot_invalid: AtomicBool::new(false),
             stopped_during_provisioning: AtomicBool::new(false),
+            auto_isolated_gdrive: AtomicBool::new(false),
+            legacy_gdrive_action: Mutex::new(None),
+            cloud_unassign_verified: AtomicBool::new(false),
             task_alive: AtomicBool::new(false),
             keep_vm_on_stop: AtomicBool::new(false),
             gen: AtomicU64::new(0),
@@ -255,6 +492,11 @@ impl RelayHandle {
         st.running = false;
         st.phase = "stopped".into();
         st.phase_label = "已手动停止接力".into();
+        if let Some(ref mut gs) = st.grab_status {
+            gs.active = false;
+            gs.phase = "cancelled".into();
+            gs.next_retry_at = None;
+        }
     }
 }
 
@@ -287,18 +529,30 @@ pub(crate) fn gpu_args(gpu: &str, high_mem: bool) -> Vec<String> {
     v
 }
 
+pub(crate) fn normalize_hw_label(gpu: &str) -> String {
+    let u = gpu.trim().to_uppercase();
+    if u.is_empty() || u == "NONE" {
+        "CPU".to_string()
+    } else {
+        u
+    }
+}
+
+/// 根据硬件类型返回 `(COLAB_CLI_REQUEST_TIMEOUT 秒字符串, 单次子进程总超时)`：
+/// - TPU (`V5E1`/`V6E1`) 切片冷启动可能需要 3~5 分钟，设置 300s 避免被默认 120s 误杀为 ReadTimeout；
+/// - GPU / CPU 正常 5~35s 返回 200 或 503，设置 60s 单次 HTTP 超时并配合 `COLAB_CLI_ASSIGN_RETRIES=0` 消除 3 分 15 秒静默退避。
+pub fn colab_assign_env_for_gpu(gpu: &str) -> (&'static str, Duration) {
+    match normalize_hw_label(gpu).as_str() {
+        "V5E1" | "V6E1" => ("300", Duration::from_secs(360)),
+        _ => ("60", Duration::from_secs(150)),
+    }
+}
+
 pub(crate) fn format_colab_new_failure(gpu: &str, raw_output: &str) -> String {
     let cleaned = cli::strip_colab_cli_banners(raw_output);
     let tail = cli::last_meaningful_cli_line(&cleaned, "未知错误");
     let lower = cleaned.to_ascii_lowercase();
-    let hw = {
-        let u = gpu.trim().to_uppercase();
-        if u.is_empty() || u == "NONE" {
-            "CPU".to_string()
-        } else {
-            u
-        }
-    };
+    let hw = normalize_hw_label(gpu);
     if lower.contains("503")
         || lower.contains("service unavailable")
         || lower.contains("allocation refused")
@@ -312,10 +566,24 @@ pub(crate) fn format_colab_new_failure(gpu: &str, raw_output: &str) -> String {
         || lower.contains("unauthorized")
         || lower.contains("not logged in")
     {
-        format!("Colab 授权凭证已过期或无效（{tail}），请在终端执行 `colab auth login` 重新授权")
+        format!("Colab 授权凭证已过期或无效（{tail}），请在终端执行 `colab auth`（或 `colab status`）重新授权")
+    } else if lower.contains("readtimeout")
+        || lower.contains("read timed out")
+        || lower.contains("connecttimeout")
+    {
+        format!("连接云端 [{hw}] 分配接口响应超时（{tail}），通常表示该卡型当前排队拥堵或冷启动较慢")
     } else {
         format!("创建实例失败：{tail}")
     }
+}
+
+pub(crate) fn is_fatal_colab_new_error(raw_output: &str) -> bool {
+    let lower = cli::strip_colab_cli_banners(raw_output).to_ascii_lowercase();
+    lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("not logged in")
+        || lower.contains("invalid_grant")
+        || lower.contains("no such option")
 }
 
 /// 构造 `colab [--auth <mode>] new -s <name> [--gpu <G> | --tpu <t>] [--high-mem]` 参数序列：
@@ -338,8 +606,15 @@ pub(crate) fn build_colab_new_args(
     args
 }
 
-/// 通过 colab-cli 创建实例（支持硬件内存形态自适配、400 自动降级重试、取消与 PID 树跟踪）
-pub async fn colab_new_with_opts(
+#[derive(Debug, Clone)]
+pub struct SingleAttemptError {
+    pub message: String,
+    pub fatal: bool,
+    pub cancelled: bool,
+}
+
+/// 执行单次受控 `colab new`（`COLAB_CLI_ASSIGN_RETRIES=0`，不含 Python 内部静默指数退避，保留 HTTP 400 High-RAM 自动降级）
+pub async fn colab_new_single_attempt(
     name: &str,
     gpu: &str,
     high_mem: bool,
@@ -347,11 +622,15 @@ pub async fn colab_new_with_opts(
     cancel: Option<CancellationToken>,
     pid_slot: Option<&Mutex<Option<u32>>>,
     log: &(dyn Fn(&str) + Send + Sync),
-) -> Result<()> {
+) -> std::result::Result<(), SingleAttemptError> {
     let mut validated_auth: Option<String> = None;
     if let Some(m) = auth_mode.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()) {
         if m != "oauth2" && m != "adc" {
-            return Err(anyhow!("非法的授权模式 `{m}`（仅支持 oauth2 或 adc）"));
+            return Err(SingleAttemptError {
+                message: format!("非法的授权模式 `{m}`（仅支持 oauth2 或 adc）"),
+                fatal: true,
+                cancelled: false,
+            });
         }
         validated_auth = Some(m);
     }
@@ -360,28 +639,52 @@ pub async fn colab_new_with_opts(
     if high_mem && !effective_hm {
         log(&format!(
             "ℹ️ 加速器 {} 采用云端固定内存形态，已自动省略 --high-mem（防止服务端 HTTP 400）",
-            gpu.trim().to_uppercase()
+            normalize_hw_label(gpu)
         ));
     }
+
+    let (req_timeout_str, proc_timeout) = colab_assign_env_for_gpu(gpu);
+    let extra_env = [
+        ("COLAB_CLI_ASSIGN_RETRIES", "0"),
+        ("COLAB_CLI_REQUEST_TIMEOUT", req_timeout_str),
+    ];
 
     let mut cur_hm = effective_hm;
     for attempt in 0..2usize {
         let args = build_colab_new_args(name, gpu, cur_hm, validated_auth.as_deref());
-        let out = cli::run_streaming(
+        let out = cli::run_streaming_with_env(
             &cli::colab_bin(),
             &args,
+            &extra_env,
             None,
-            Duration::from_secs(600),
+            proc_timeout,
             cancel.clone(),
             pid_slot,
             |l| log(l),
         )
-        .await?;
+        .await
+        .map_err(|e| SingleAttemptError {
+            message: format!("{e:#}"),
+            fatal: true,
+            cancelled: false,
+        })?;
         if out.cancelled {
-            return Err(anyhow!("创建实例已取消"));
+            return Err(SingleAttemptError {
+                message: "已放弃抢卡".into(),
+                fatal: true,
+                cancelled: true,
+            });
         }
         if out.timed_out {
-            return Err(anyhow!("创建实例超时 (600s)"));
+            return Err(SingleAttemptError {
+                message: format!(
+                    "请求云端 [{}] 分配响应超时 ({}s)，当前算力池可能拥堵",
+                    normalize_hw_label(gpu),
+                    proc_timeout.as_secs()
+                ),
+                fatal: false,
+                cancelled: false,
+            });
         }
         if out.code == 0 && out.output.contains("Session READY") {
             return Ok(());
@@ -396,9 +699,327 @@ pub async fn colab_new_with_opts(
             cur_hm = false;
             continue;
         }
-        return Err(anyhow!("{}", format_colab_new_failure(gpu, &out.output)));
+        return Err(SingleAttemptError {
+            message: format_colab_new_failure(gpu, &out.output),
+            fatal: is_fatal_colab_new_error(&out.output),
+            cancelled: false,
+        });
     }
-    Err(anyhow!("创建实例失败"))
+    Err(SingleAttemptError {
+        message: "创建实例失败".into(),
+        fatal: false,
+        cancelled: false,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct GrabLoopOptions {
+    pub name: String,
+    pub primary_gpu: String,
+    pub fallback_gpus: Vec<String>,
+    pub high_mem: bool,
+    pub auth_mode: Option<String>,
+    /// "fast" | "standard" | "budget" | "persistent"
+    pub mode: String,
+    pub budget_minutes: Option<u32>,
+    pub retry_seconds: u64,
+    pub cancel: Option<CancellationToken>,
+}
+
+/// 统一抢卡主循环：支持单次探卡 (`fast`)、标准 3 轮 (`standard`)、限时预算蹲守 (`budget`) 与一直抢卡 (`persistent`)，
+/// 支持备选卡型轮询、每次尝试前刷新服务端已有端点快照（防误删孤儿 #77）及毫秒级取消响应。
+pub async fn grab_colab_vm_loop(
+    opts: &GrabLoopOptions,
+    snapshot_guard: Option<(
+        &AppState,
+        &Mutex<std::collections::HashSet<String>>,
+        &AtomicBool,
+    )>,
+    pid_slot: Option<&Mutex<Option<u32>>>,
+    on_status: &(dyn Fn(&GrabStatus) + Send + Sync),
+    log: &(dyn Fn(&str) + Send + Sync),
+) -> Result<String> {
+    let mode = {
+        let m = opts.mode.trim().to_lowercase();
+        if m.is_empty() {
+            "fast".to_string()
+        } else {
+            m
+        }
+    };
+    let primary = normalize_hw_label(&opts.primary_gpu);
+    let mut candidates = vec![primary.clone()];
+    for fb in &opts.fallback_gpus {
+        let norm = normalize_hw_label(fb);
+        if is_valid_accelerator_code(&norm) && !candidates.contains(&norm) {
+            candidates.push(norm);
+        }
+    }
+
+    let max_attempts: Option<u32> = match mode.as_str() {
+        "fast" => Some(candidates.len() as u32),
+        "standard" => Some(3u32.max(candidates.len() as u32)),
+        _ => None,
+    };
+    let budget_minutes = if mode == "budget" {
+        Some(opts.budget_minutes.unwrap_or(60).max(1))
+    } else {
+        None
+    };
+    let retry_secs = opts.retry_seconds.clamp(5, 300);
+    let cancel = opts.cancel.clone().unwrap_or_default();
+    let started_at = chrono::Utc::now().timestamp();
+    let started_instant = std::time::Instant::now();
+    let mut attempt: u32 = 0;
+    let mut last_error: Option<String> = None;
+
+    loop {
+        if cancel.is_cancelled() {
+            on_status(&GrabStatus {
+                active: false,
+                mode: mode.clone(),
+                attempt,
+                max_attempts,
+                budget_minutes,
+                retry_seconds: retry_secs,
+                started_at,
+                next_retry_at: None,
+                target_gpu: primary.clone(),
+                phase: "cancelled".into(),
+                last_error: last_error.clone(),
+            });
+            return Err(anyhow!("已放弃抢卡"));
+        }
+
+        attempt += 1;
+        let target_gpu = candidates[((attempt - 1) as usize) % candidates.len()].clone();
+
+        if let Some((app, ep_set, invalid_flag)) = snapshot_guard {
+            match app.client.list_assignments().await {
+                Ok(existing) => {
+                    *ep_set.l() = existing.into_iter().map(|a| a.endpoint).collect();
+                    invalid_flag.store(false, Ordering::SeqCst);
+                }
+                Err(_) => {
+                    ep_set.l().clear();
+                    invalid_flag.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        on_status(&GrabStatus {
+            active: true,
+            mode: mode.clone(),
+            attempt,
+            max_attempts,
+            budget_minutes,
+            retry_seconds: retry_secs,
+            started_at,
+            next_retry_at: None,
+            target_gpu: target_gpu.clone(),
+            phase: "requesting".into(),
+            last_error: last_error.clone(),
+        });
+
+        match max_attempts {
+            Some(max) if max > 1 => log(&format!(
+                "🎯 第 {attempt}/{max} 次抢卡：正在向 Google Colab 请求 [{target_gpu}] 实例…"
+            )),
+            None if attempt > 1 => log(&format!(
+                "🎯 第 {attempt} 次抢卡（已蹲守 {:.1} 分钟）：正在请求 [{target_gpu}] 实例…",
+                started_instant.elapsed().as_secs_f64() / 60.0
+            )),
+            _ => {}
+        }
+
+        let res = colab_new_single_attempt(
+            &opts.name,
+            &target_gpu,
+            opts.high_mem,
+            opts.auth_mode.as_deref(),
+            Some(cancel.clone()),
+            pid_slot,
+            log,
+        )
+        .await;
+
+        if let Some((_, _, invalid_flag)) = snapshot_guard {
+            if res.is_ok() {
+                invalid_flag.store(true, Ordering::SeqCst);
+            }
+        }
+
+        match res {
+            Ok(()) => {
+                on_status(&GrabStatus {
+                    active: false,
+                    mode: mode.clone(),
+                    attempt,
+                    max_attempts,
+                    budget_minutes,
+                    retry_seconds: retry_secs,
+                    started_at,
+                    next_retry_at: None,
+                    target_gpu: target_gpu.clone(),
+                    phase: "allocated".into(),
+                    last_error: None,
+                });
+                return Ok(target_gpu);
+            }
+            Err(err) => {
+                if err.cancelled || cancel.is_cancelled() {
+                    on_status(&GrabStatus {
+                        active: false,
+                        mode: mode.clone(),
+                        attempt,
+                        max_attempts,
+                        budget_minutes,
+                        retry_seconds: retry_secs,
+                        started_at,
+                        next_retry_at: None,
+                        target_gpu,
+                        phase: "cancelled".into(),
+                        last_error: Some("已放弃抢卡".into()),
+                    });
+                    return Err(anyhow!("已放弃抢卡"));
+                }
+
+                last_error = Some(err.message.clone());
+
+                if err.fatal {
+                    if let Some((_, _, invalid_flag)) = snapshot_guard {
+                        invalid_flag.store(true, Ordering::SeqCst);
+                    }
+                    on_status(&GrabStatus {
+                        active: false,
+                        mode: mode.clone(),
+                        attempt,
+                        max_attempts,
+                        budget_minutes,
+                        retry_seconds: retry_secs,
+                        started_at,
+                        next_retry_at: None,
+                        target_gpu,
+                        phase: "failed".into(),
+                        last_error,
+                    });
+                    return Err(anyhow!("{}", err.message));
+                }
+
+                if let Some(max) = max_attempts {
+                    if attempt >= max {
+                        if let Some((_, _, invalid_flag)) = snapshot_guard {
+                            invalid_flag.store(true, Ordering::SeqCst);
+                        }
+                        on_status(&GrabStatus {
+                            active: false,
+                            mode: mode.clone(),
+                            attempt,
+                            max_attempts,
+                            budget_minutes,
+                            retry_seconds: retry_secs,
+                            started_at,
+                            next_retry_at: None,
+                            target_gpu,
+                            phase: "failed".into(),
+                            last_error,
+                        });
+                        return Err(anyhow!("{}", err.message));
+                    }
+                }
+
+                let mut wait_secs = if mode == "fast" { 0 } else { retry_secs };
+                if let Some(mins) = budget_minutes {
+                    let budget_dur = Duration::from_secs(mins as u64 * 60);
+                    let elapsed = started_instant.elapsed();
+                    if elapsed >= budget_dur {
+                        if let Some((_, _, invalid_flag)) = snapshot_guard {
+                            invalid_flag.store(true, Ordering::SeqCst);
+                        }
+                        let msg = format!(
+                            "在设定的 {mins} 分钟抢卡时间窗口内未能分配到云端实例（共尝试 {attempt} 次）：{}",
+                            err.message
+                        );
+                        on_status(&GrabStatus {
+                            active: false,
+                            mode: mode.clone(),
+                            attempt,
+                            max_attempts,
+                            budget_minutes,
+                            retry_seconds: retry_secs,
+                            started_at,
+                            next_retry_at: None,
+                            target_gpu,
+                            phase: "failed".into(),
+                            last_error: Some(msg.clone()),
+                        });
+                        return Err(anyhow!("{msg}"));
+                    }
+                    let rem_secs = (budget_dur - elapsed).as_secs();
+                    if wait_secs > rem_secs {
+                        wait_secs = rem_secs.max(1);
+                    }
+                }
+
+                let next_gpu = candidates[(attempt as usize) % candidates.len()].clone();
+                if wait_secs > 0 {
+                    let next_at = chrono::Utc::now().timestamp() + wait_secs as i64;
+                    on_status(&GrabStatus {
+                        active: true,
+                        mode: mode.clone(),
+                        attempt,
+                        max_attempts,
+                        budget_minutes,
+                        retry_seconds: retry_secs,
+                        started_at,
+                        next_retry_at: Some(next_at),
+                        target_gpu: next_gpu.clone(),
+                        phase: "waiting_retry".into(),
+                        last_error: last_error.clone(),
+                    });
+                    log(&format!(
+                        "⏳ 第 {attempt} 次未抢到卡（{}），{wait_secs}s 后自动尝试 [{next_gpu}]…",
+                        err.message
+                    ));
+                    if !sleep_cancellable(wait_secs, &cancel).await {
+                        on_status(&GrabStatus {
+                            active: false,
+                            mode: mode.clone(),
+                            attempt,
+                            max_attempts,
+                            budget_minutes,
+                            retry_seconds: retry_secs,
+                            started_at,
+                            next_retry_at: None,
+                            target_gpu: next_gpu,
+                            phase: "cancelled".into(),
+                            last_error: Some("已放弃抢卡".into()),
+                        });
+                        return Err(anyhow!("已放弃抢卡"));
+                    }
+                } else {
+                    log(&format!(
+                        "🔄 [{target_gpu}] 当前无卡，立即尝试备选 [{next_gpu}]…"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// 通过 colab-cli 创建实例（默认单次快速探卡，支持硬件内存形态自适配、400 自动降级重试、取消与 PID 树跟踪）
+pub async fn colab_new_with_opts(
+    name: &str,
+    gpu: &str,
+    high_mem: bool,
+    auth_mode: Option<&str>,
+    cancel: Option<CancellationToken>,
+    pid_slot: Option<&Mutex<Option<u32>>>,
+    log: &(dyn Fn(&str) + Send + Sync),
+) -> Result<()> {
+    colab_new_single_attempt(name, gpu, high_mem, auth_mode, cancel, pid_slot, log)
+        .await
+        .map_err(|e| anyhow!("{}", e.message))
 }
 
 pub async fn colab_new(
@@ -412,20 +1033,310 @@ pub async fn colab_new(
     colab_new_with_opts(name, gpu, high_mem, None, cancel, pid_slot, log).await
 }
 
-async fn done_flag_exists(gdrive_dir: &str) -> bool {
-    match cli::run_simple(
-        &cli::rclone_bin(),
-        &[
-            s(&["lsf", "--retries=5", "--low-level-retries=20", "--"]),
-            vec![format!("{gdrive_dir}/training_done.flag")],
-        ]
-        .concat(),
-        Duration::from_secs(120),
-    )
-    .await
-    {
-        Ok(o) => o.code == 0 && o.stdout.lines().any(|l| l.trim() == "training_done.flag"),
+pub(crate) fn is_done_flag_filename(name: &str) -> bool {
+    let t = name.trim();
+    t.eq_ignore_ascii_case("training_done.flag")
+        || t.eq_ignore_ascii_case("training_completed.flag")
+}
+
+pub(crate) fn is_checkpoint_entry(line: &str) -> bool {
+    let t = line.trim();
+    t == "checkpoint.pt"
+        || t == "checkpoint_prev.pt"
+        || t.trim_end_matches('/') == "hf_checkpoints"
+}
+
+/// 检查网盘接力目录下是否已存在有效断点（用于换棒销毁前核验与应急抢救）
+pub(crate) async fn gdrive_has_checkpoint_with_conf(
+    rclone_bin: &std::path::PathBuf,
+    rclone_conf: &std::path::Path,
+    gdrive_dir: &str,
+) -> bool {
+    let mut args = Vec::new();
+    if rclone_conf.exists() {
+        args.push("--config".into());
+        args.push(rclone_conf.to_string_lossy().to_string());
+    }
+    args.extend(s(&[
+        "lsf",
+        "--retries=3",
+        "--low-level-retries=10",
+        "--",
+    ]));
+    args.push(gdrive_dir.trim_end_matches('/').to_string());
+    match cli::run_simple(rclone_bin, &args, Duration::from_secs(45)).await {
+        Ok(o) => o.code == 0 && o.stdout.lines().any(is_checkpoint_entry),
         Err(_) => false,
+    }
+}
+
+pub(crate) async fn done_flag_exists_with_conf(
+    rclone_bin: &std::path::PathBuf,
+    rclone_conf: &std::path::Path,
+    gdrive_dir: &str,
+) -> bool {
+    let mut args = Vec::new();
+    if rclone_conf.exists() {
+        args.push("--config".into());
+        args.push(rclone_conf.to_string_lossy().to_string());
+    }
+    args.extend(s(&[
+        "lsf",
+        "--files-only",
+        "--retries=5",
+        "--low-level-retries=20",
+        "--",
+    ]));
+    args.push(gdrive_dir.trim_end_matches('/').to_string());
+    match cli::run_simple(rclone_bin, &args, Duration::from_secs(120)).await {
+        Ok(o) => o.code == 0 && o.stdout.lines().any(is_done_flag_filename),
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn find_latest_valid_hf_checkpoint_dir(
+    ws_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let hf_root = ws_dir.join("hf_checkpoints");
+    let entries = std::fs::read_dir(&hf_root).ok()?;
+    let mut best: Option<(u64, std::path::PathBuf)> = None;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let Some(dir_name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(step_str) = dir_name.strip_prefix("checkpoint-") else {
+            continue;
+        };
+        let Ok(step_num) = step_str.parse::<u64>() else {
+            continue;
+        };
+        let state_json = p.join("trainer_state.json");
+        let valid_state = std::fs::read_to_string(&state_json)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| v.is_object())
+            .unwrap_or(false);
+        if valid_state && best.as_ref().map(|(s, _)| step_num >= *s).unwrap_or(true) {
+            best = Some((step_num, p));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// 下载并严格核验最终权重文件（独立维护 `training_completed` 与 `weights_downloaded` 状态，兼容 HF Trainer `hf_checkpoints`）：
+/// 1. 先尝试下载 `{gdrive}/checkpoint.pt`，失败或为空时回退尝试 `{gdrive}/checkpoint_prev.pt`；
+/// 2. 若远端明确无 `checkpoint.pt` 但存在 `hf_checkpoints/`（通过 `rclone lsf` 区分无文件与鉴权/网络错误），自动回退拉取并校验有效 `checkpoint-*/trainer_state.json`；
+/// 3. 必须校验本地目标文件真实存在且字节数 `> 0` 才置 `weights_downloaded = true`、`phase = "completed"`；
+/// 4. 若下载均失败或文件缺失/为空，置 `weights_downloaded = false`、`phase = "download_failed"`、`download_error = Some(...)`。
+pub(crate) async fn download_and_verify_final_weights(
+    h: &RelayHandle,
+    rclone_bin: &std::path::PathBuf,
+    rclone_conf: &std::path::Path,
+    gdrive_dir: &str,
+    ws_dir: &std::path::Path,
+    vm_name: &str,
+) {
+    {
+        let mut st = h.status.l();
+        st.training_completed = true;
+        st.phase = "downloading".into();
+        st.phase_label = "正在从 Google Drive 下载最终训练权重…".into();
+    }
+    let _ = std::fs::create_dir_all(ws_dir);
+    let dst = ws_dir.join(format!("checkpoint_{vm_name}.pt"));
+    let tmp_dst = ws_dir.join(format!(".checkpoint_{vm_name}.pt.downloading"));
+    let _ = std::fs::remove_file(&tmp_dst);
+    h.log(format!("📥 正在下载最终权重到本机：{}", dst.display()));
+
+    let gdrive_clean = gdrive_dir.trim_end_matches('/');
+    let candidates = [
+        format!("{gdrive_clean}/checkpoint.pt"),
+        format!("{gdrive_clean}/checkpoint_prev.pt"),
+    ];
+    let mut errors: Vec<String> = Vec::new();
+    let mut downloaded_non_empty = false;
+
+    for (idx, remote_src) in candidates.iter().enumerate() {
+        let _ = std::fs::remove_file(&tmp_dst);
+        let mut args = Vec::new();
+        if rclone_conf.exists() {
+            args.push("--config".into());
+            args.push(rclone_conf.to_string_lossy().to_string());
+        }
+        args.extend(s(&[
+            "copyto",
+            "--multi-thread-streams=16",
+            "--retries=5",
+            "--low-level-retries=20",
+            "--",
+        ]));
+        args.push(remote_src.clone());
+        args.push(tmp_dst.to_string_lossy().to_string());
+
+        match cli::run_simple(rclone_bin, &args, Duration::from_secs(1800)).await {
+            Ok(o) if o.code == 0 => {
+                let valid = std::fs::metadata(&tmp_dst)
+                    .map(|m| m.is_file() && m.len() > 0)
+                    .unwrap_or(false);
+                if valid {
+                    downloaded_non_empty = true;
+                    break;
+                } else {
+                    errors.push(format!(
+                        "命令 #{} ({remote_src}) 退出码为 0 但本地文件缺失或大小为 0 字节",
+                        idx + 1
+                    ));
+                }
+            }
+            Ok(o) => {
+                let detail = cli::last_meaningful_cli_line(&o.output, "rclone 返回非零状态");
+                errors.push(format!(
+                    "命令 #{} ({remote_src}) 失败 (exit={}): {detail}",
+                    idx + 1,
+                    o.code
+                ));
+            }
+            Err(e) => {
+                errors.push(format!("命令 #{} ({remote_src}) 执行异常: {e}", idx + 1));
+            }
+        }
+    }
+
+    let mut verified_local_path: Option<std::path::PathBuf> = None;
+    if downloaded_non_empty {
+        if std::fs::rename(&tmp_dst, &dst).is_err() {
+            if let Err(e) = std::fs::copy(&tmp_dst, &dst) {
+                errors.push(format!("写入最终权重文件 `{}` 失败: {e}", dst.display()));
+            }
+            let _ = std::fs::remove_file(&tmp_dst);
+        }
+        if std::fs::metadata(&dst)
+            .map(|m| m.is_file() && m.len() > 0)
+            .unwrap_or(false)
+        {
+            verified_local_path = Some(dst.clone());
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp_dst);
+        if std::fs::metadata(&dst).map(|m| m.len() == 0).unwrap_or(false) {
+            let _ = std::fs::remove_file(&dst);
+        }
+
+        // 回退检查是否为 HuggingFace Trainer 目录型断点（仅在 lsf 成功确认无 checkpoint.pt 且存在 hf_checkpoints/ 时回退）
+        let mut lsf_args = Vec::new();
+        if rclone_conf.exists() {
+            lsf_args.push("--config".into());
+            lsf_args.push(rclone_conf.to_string_lossy().to_string());
+        }
+        lsf_args.extend(s(&["lsf", "--retries=3", "--low-level-retries=10", "--"]));
+        lsf_args.push(gdrive_clean.to_string());
+        if let Ok(lsf_out) = cli::run_simple(rclone_bin, &lsf_args, Duration::from_secs(60)).await {
+            if lsf_out.code == 0 {
+                let has_pt = lsf_out.stdout.lines().any(|l| {
+                    let t = l.trim();
+                    t == "checkpoint.pt" || t == "checkpoint_prev.pt"
+                });
+                let has_hf_dir = lsf_out
+                    .stdout
+                    .lines()
+                    .any(|l| l.trim().trim_end_matches('/') == "hf_checkpoints");
+                if !has_pt && has_hf_dir {
+                    let hf_dst = ws_dir.join("hf_checkpoints");
+                    let mut hf_args = Vec::new();
+                    if rclone_conf.exists() {
+                        hf_args.push("--config".into());
+                        hf_args.push(rclone_conf.to_string_lossy().to_string());
+                    }
+                    hf_args.extend(s(&[
+                        "copy",
+                        "--multi-thread-streams=16",
+                        "--retries=5",
+                        "--low-level-retries=20",
+                        "--",
+                    ]));
+                    hf_args.push(format!("{gdrive_clean}/hf_checkpoints"));
+                    hf_args.push(hf_dst.to_string_lossy().to_string());
+                    match cli::run_simple(rclone_bin, &hf_args, Duration::from_secs(1800)).await {
+                        Ok(ho) if ho.code == 0 => {
+                            if let Some(best_hf) = find_latest_valid_hf_checkpoint_dir(ws_dir) {
+                                verified_local_path = Some(best_hf);
+                            } else {
+                                errors.push(
+                                    "hf_checkpoints 同步退出码为 0，但未找到有效的 checkpoint-*/trainer_state.json"
+                                        .into(),
+                                );
+                            }
+                        }
+                        Ok(ho) => {
+                            let detail = cli::last_meaningful_cli_line(
+                                &ho.output,
+                                "rclone copy hf_checkpoints 失败",
+                            );
+                            errors.push(format!(
+                                "回退拉取 hf_checkpoints 失败 (exit={}): {detail}",
+                                ho.code
+                            ));
+                        }
+                        Err(e) => {
+                            errors.push(format!("回退拉取 hf_checkpoints 异常: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(saved_path) = verified_local_path {
+        // 顺带同步远端 results/ 目录（最佳努力，不阻塞主权重回收结果）
+        let results_dst = ws_dir.join("results");
+        let mut res_args = Vec::new();
+        if rclone_conf.exists() {
+            res_args.push("--config".into());
+            res_args.push(rclone_conf.to_string_lossy().to_string());
+        }
+        res_args.extend(s(&["copy", "--retries=3", "--low-level-retries=10", "--"]));
+        res_args.push(format!("{gdrive_clean}/results"));
+        res_args.push(results_dst.to_string_lossy().to_string());
+        let _ = cli::run_simple(rclone_bin, &res_args, Duration::from_secs(300)).await;
+
+        {
+            let mut st = h.status.l();
+            st.training_completed = true;
+            st.weights_downloaded = true;
+            st.download_error = None;
+            st.last_error = None;
+            st.local_weights_path = Some(saved_path.display().to_string());
+            st.phase = "completed".into();
+            st.phase_label = "全部训练轮次已完成，最终权重已回收 (100%)".into();
+        }
+        h.log(format!(
+            "✅ 全部接力训练与权重回收流程执行完毕！已保存至 {}",
+            saved_path.display()
+        ));
+    } else {
+        let err_summary = if errors.is_empty() {
+            format!("未能从 {gdrive_clean} 下载有效非空权重文件")
+        } else {
+            errors.join("；")
+        };
+        {
+            let mut st = h.status.l();
+            st.training_completed = true;
+            st.weights_downloaded = false;
+            st.download_error = Some(err_summary.clone());
+            st.last_error = Some(err_summary.clone());
+            st.local_weights_path = None;
+            st.phase = "download_failed".into();
+            st.phase_label = format!("云端训练已完成，但最终权重下载失败：{err_summary}");
+        }
+        h.log(format!(
+            "❌ 云端训练已完成，但最终权重下载到本地失败（网盘仍保留权重，可点击重试补下载）：{err_summary}"
+        ));
     }
 }
 
@@ -480,8 +1391,14 @@ pub async fn run_relay(app: Arc<AppState>, handle: Arc<RelayHandle>) {
     }
 
     if let Err(e) = result {
-        handle.set_phase("error", format!("接力异常：{e}"));
-        handle.log(format!("❌ 接力训练发生异常：{e}"));
+        let err_str = format!("{e:#}");
+        {
+            let mut st = handle.status.l();
+            st.phase = "error".into();
+            st.phase_label = format!("接力异常：{err_str}");
+            st.last_error = Some(err_str.clone());
+        }
+        handle.log(format!("❌ 接力训练发生异常：{err_str}"));
         // 计费保护：接力异常中止时若实例仍在服务端计费列表中，立即彻底销毁并核验停费，绝不空转计费
         if app.find_assignment_by_name(&name).await.is_some() {
             handle.log("🧹 接力已中止，正在销毁残留实例并核验停止计费…");
@@ -495,32 +1412,331 @@ pub async fn run_relay(app: Arc<AppState>, handle: Arc<RelayHandle>) {
     }
 }
 
+pub(crate) fn detect_legacy_gdrive_artifacts_in_lsf(lsf_stdout: &str) -> Vec<String> {
+    const FILE_TARGETS: &[&str] = &[
+        "checkpoint.pt",
+        "checkpoint_prev.pt",
+        "training_done.flag",
+        "TRAINING_COMPLETED.flag",
+    ];
+    let mut found = Vec::new();
+    for raw in lsf_stdout.lines() {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let clean = item.trim_end_matches('/');
+        if !item.ends_with('/') && FILE_TARGETS.contains(&item) {
+            found.push(item.to_string());
+        } else if clean == "hf_checkpoints" {
+            found.push("hf_checkpoints/".to_string());
+        }
+    }
+    found
+}
+
+async fn rclone_lsf_entries_with_conf(
+    rclone_bin: &std::path::PathBuf,
+    rclone_conf: &std::path::Path,
+    remote_dir: &str,
+) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    if rclone_conf.exists() {
+        args.push("--config".into());
+        args.push(rclone_conf.to_string_lossy().to_string());
+    }
+    args.extend(s(&["lsf", "--retries=5", "--low-level-retries=20", "--"]));
+    args.push(remote_dir.trim_end_matches('/').to_string());
+    let out = cli::run_simple(rclone_bin, &args, Duration::from_secs(90))
+        .await
+        .ok()?;
+    if out.code == 0 {
+        return Some(
+            out.stdout
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect(),
+        );
+    }
+    let low = out.output.to_ascii_lowercase();
+    if low.contains("directory not found")
+        || low.contains("object not found")
+        || low.contains("file not found")
+    {
+        return Some(Vec::new());
+    }
+    None
+}
+
+/// Issue #80：当默认裸路径 `gdrive:colab_relay` 自动升级隔离为 `gdrive:colab_relay/<vm>` 时，
+/// 若新隔离子目录尚无断点/完成标记，但旧版根目录 `gdrive:colab_relay` 下存在历史断点/完成标记：
+/// - 默认在开训前中止并提示确认目录迁移（拒绝静默跳过旧断点从头训练）；
+/// - `Some("migrate")`：自动将旧版顶层断点与结果迁移至新隔离目录后续训；
+/// - `Some("ignore")`：确认忽略旧版断点并在新隔离目录全新开训。
+pub(crate) async fn check_or_migrate_legacy_bare_gdrive_with_conf(
+    rclone_bin: &std::path::PathBuf,
+    rclone_conf: &std::path::Path,
+    isolated_gdrive: &str,
+    legacy_action: Option<&str>,
+    h: &RelayHandle,
+) -> Result<()> {
+    let iso_clean = isolated_gdrive.trim_end_matches('/');
+    if iso_clean == DEFAULT_BARE_GDRIVE_DIR {
+        return Ok(());
+    }
+
+    if let Some(iso_entries) = rclone_lsf_entries_with_conf(rclone_bin, rclone_conf, iso_clean).await {
+        let joined = iso_entries.join("\n");
+        if !detect_legacy_gdrive_artifacts_in_lsf(&joined).is_empty() {
+            return Ok(());
+        }
+    }
+
+    let Some(bare_entries) =
+        rclone_lsf_entries_with_conf(rclone_bin, rclone_conf, DEFAULT_BARE_GDRIVE_DIR).await
+    else {
+        return Ok(());
+    };
+    let bare_joined = bare_entries.join("\n");
+    let legacy_found = detect_legacy_gdrive_artifacts_in_lsf(&bare_joined);
+    if legacy_found.is_empty() {
+        return Ok(());
+    }
+
+    let action = legacy_action.map(str::trim).unwrap_or("");
+    if action.eq_ignore_ascii_case("ignore") {
+        h.log(format!(
+            "ℹ️ 已确认忽略旧版目录 `{DEFAULT_BARE_GDRIVE_DIR}` 中的历史断点（{}），将在新隔离目录 `{iso_clean}` 中全新启动",
+            legacy_found.join(", ")
+        ));
+        return Ok(());
+    }
+
+    if !action.eq_ignore_ascii_case("migrate") {
+        return Err(anyhow!(
+            "检测到旧版默认目录 `{DEFAULT_BARE_GDRIVE_DIR}` 下存在历史断点（{}），而新版会话隔离目录 `{iso_clean}` 尚无断点！为防止跳过旧断点从头训练已中止启动：请在接力面板点击确认「迁移旧断点并续训」或「忽略旧断点全新开始」（或执行 `rclone moveto {DEFAULT_BARE_GDRIVE_DIR}/checkpoint.pt {iso_clean}/checkpoint.pt`）",
+            legacy_found.join(", ")
+        ));
+    }
+
+    let mut mk_args = Vec::new();
+    if rclone_conf.exists() {
+        mk_args.push("--config".into());
+        mk_args.push(rclone_conf.to_string_lossy().to_string());
+    }
+    mk_args.extend(s(&["mkdir", "--retries=5", "--low-level-retries=20", "--"]));
+    mk_args.push(iso_clean.to_string());
+    let mk_out = cli::run_simple(rclone_bin, &mk_args, Duration::from_secs(90)).await?;
+    if mk_out.code != 0 {
+        return Err(anyhow!(
+            "创建迁移目标目录 `{iso_clean}` 失败：{}",
+            cli::last_meaningful_cli_line(&mk_out.output, "rclone mkdir 失败")
+        ));
+    }
+
+    let mut migrate_items = legacy_found.clone();
+    if bare_entries
+        .iter()
+        .any(|e| e == "results" || e == "results/")
+        && !migrate_items.iter().any(|e| e == "results/")
+    {
+        migrate_items.push("results/".to_string());
+    }
+
+    for item in &migrate_items {
+        let clean_item = item.trim_end_matches('/');
+        let src = format!("{DEFAULT_BARE_GDRIVE_DIR}/{clean_item}");
+        let dst = format!("{iso_clean}/{clean_item}");
+        let subcmd = if item.ends_with('/') { "move" } else { "moveto" };
+        let mut mv_args = Vec::new();
+        if rclone_conf.exists() {
+            mv_args.push("--config".into());
+            mv_args.push(rclone_conf.to_string_lossy().to_string());
+        }
+        mv_args.extend(s(&[subcmd, "--retries=5", "--low-level-retries=20", "--"]));
+        mv_args.push(src.clone());
+        mv_args.push(dst.clone());
+        let mv_out = cli::run_simple(rclone_bin, &mv_args, Duration::from_secs(300)).await?;
+        if mv_out.code != 0 {
+            return Err(anyhow!(
+                "迁移旧版断点 `{src}` -> `{dst}` 失败：{}",
+                cli::last_meaningful_cli_line(&mv_out.output, "rclone 迁移失败")
+            ));
+        }
+    }
+
+    h.log(format!(
+        "✅ 已将旧版目录 `{DEFAULT_BARE_GDRIVE_DIR}` 下的历史断点（{}）迁移至 `{iso_clean}`，继续续训",
+        legacy_found.join(", ")
+    ));
+    Ok(())
+}
+
+/// 换棒停机前断点保护：若训练脚本因触发换棒或超时退出，在销毁实例前核验网盘断点；
+/// 若网盘尚无断点或训练因超时被截断，尝试在 90 秒窗口内将云端 `/content` 下的本地断点紧急同步至 Google Drive。
+async fn verify_or_rescue_checkpoint_before_terminate(
+    h: &RelayHandle,
+    colab_bin: &std::path::PathBuf,
+    rclone_bin: &std::path::PathBuf,
+    rclone_conf: &std::path::Path,
+    vm_name: &str,
+    eff_auth: Option<&str>,
+    gdrive: &str,
+    train_out: &cli::RunOutput,
+    cancel: &CancellationToken,
+) {
+    let clean = strip_ansi_codes(&train_out.output);
+    let is_handover = train_out.code == 0 && clean.contains("HANDOVER_REQUESTED");
+    if !is_handover && !train_out.timed_out {
+        return;
+    }
+    let has_remote_ckpt = gdrive_has_checkpoint_with_conf(rclone_bin, rclone_conf, gdrive).await;
+    if has_remote_ckpt && !train_out.timed_out {
+        h.log("✅ 换棒前准备核验通过：网盘已存在最新训练断点，安全进入停机换棒");
+        return;
+    }
+
+    h.set_phase("syncing_checkpoint", "换棒保护：正在停机前抢救同步云端本地断点");
+    h.log("🛡️ 换棒前保护：检测到网盘尚无断点或训练超时截断，正在销毁实例前尝试抢救同步 `/content` 本地断点…");
+    let rescue_py = r#"import os, subprocess
+gd = os.environ.get("GDRIVE_DIR", "").rstrip("/")
+conf = "/content/rclone.conf"
+synced = []
+if gd and os.path.exists(conf):
+    for fn in ("checkpoint.pt", "checkpoint_prev.pt"):
+        for base in ("/content", "."):
+            p = os.path.join(base, fn)
+            if os.path.isfile(p) and os.path.getsize(p) > 0:
+                r = subprocess.run(["rclone", "--config", conf, "copyto", "--retries=3", "--", p, f"{gd}/{fn}"])
+                if r.returncode == 0:
+                    synced.append(fn)
+                    break
+    for base in ("/content", "."):
+        hf = os.path.join(base, "hf_checkpoints")
+        if os.path.isdir(hf) and os.listdir(hf):
+            r = subprocess.run(["rclone", "--config", conf, "copy", "--retries=3", "--", hf, f"{gd}/hf_checkpoints"])
+            if r.returncode == 0:
+                synced.append("hf_checkpoints/")
+                break
+print("EMERGENCY_SYNC_OK:" + ",".join(synced) if synced else "EMERGENCY_SYNC_NONE")
+"#;
+    let raw_args = vec![
+        "exec".into(),
+        "-s".into(),
+        vm_name.to_string(),
+        "--timeout".into(),
+        "90".into(),
+        "--env".into(),
+        format!("GDRIVE_DIR={gdrive}"),
+    ];
+    let exec_args = cli::build_colab_subcommand_args(eff_auth, &raw_args);
+    if let Ok(res_out) = cli::run_streaming(
+        colab_bin,
+        &exec_args,
+        Some(rescue_py.to_string()),
+        Duration::from_secs(110),
+        Some(cancel.clone()),
+        Some(&h.child_pid),
+        |_| {},
+    )
+    .await
+    {
+        if let Some(line) = res_out
+            .output
+            .lines()
+            .find(|l| l.contains("EMERGENCY_SYNC_OK:"))
+        {
+            h.log(format!(
+                "✅ 停机前断点抢救成功（{}），已同步至 {gdrive}",
+                line.trim_start_matches("EMERGENCY_SYNC_OK:").trim()
+            ));
+        }
+    }
+}
+
 async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: CancellationToken) -> Result<()> {
     let name = h.status.l().vm_name.clone();
-    let cfg = h.status.l().config.clone();
+    let mut cfg = h.status.l().config.clone();
+    let raw_was_bare = normalize_gdrive_dir(&cfg.gdrive_dir) == DEFAULT_BARE_GDRIVE_DIR;
+    if raw_was_bare {
+        cfg.gdrive_dir = resolve_isolated_gdrive_dir(&cfg.gdrive_dir, &name);
+        h.status.l().config.gdrive_dir = cfg.gdrive_dir.clone();
+    }
     validate_relay_config(&cfg)?;
-    let gdrive = cfg.gdrive_dir.trim().to_string();
+    let was_auto_isolated = raw_was_bare || h.auto_isolated_gdrive.load(Ordering::SeqCst);
+    let legacy_action = h.legacy_gdrive_action.l().clone();
+    let gdrive = cfg.gdrive_dir.trim().trim_end_matches('/').to_string();
     let max_secs = cfg.max_session_hours * 3600.0;
     let backup_secs = cfg.backup_interval_minutes * 60.0;
+    let (exec_timeout_secs, host_wait_timeout) = compute_relay_timeouts(cfg.max_session_hours);
+    let ws_dir = h
+        .workspace_dir
+        .l()
+        .clone()
+        .or_else(|| cli::lookup_bound_workspace_path(&name))
+        .unwrap_or_else(|| app.workspace.clone());
+    let eff_auth = h
+        .auth_mode
+        .l()
+        .clone()
+        .or_else(|| cli::get_session_auth_mode(&name));
     let conf = cli::rclone_conf_path();
     let rclone = cli::rclone_bin();
     let colab = cli::colab_bin();
 
     h.set_phase("preparing_gdrive", "准备 Google Drive 接力目录");
+    h.log(format!("📂 绑定工作区目录：{}", ws_dir.display()));
     h.log(format!("🔑 使用本机 Rclone 授权文件：{}", conf.display()));
+    if cfg.max_session_hours > 22.5 {
+        h.log(format!(
+            "⚠️ 换棒准备提示：当前单棒上限 {:.1}h 较接近 Colab 24h 强制回收线，推荐设为 ≤22.5h 以预留充足的断点落盘与网盘上传缓冲时间",
+            cfg.max_session_hours
+        ));
+    }
+    {
+        let gm = cfg.grab_mode.trim().to_lowercase();
+        let mode_desc = match gm.as_str() {
+            "persistent" => format!("一直抢卡（每 {}s 重试，直到成功或手动放弃）", cfg.grab_retry_seconds),
+            "fast" => "单次快速探卡（无卡立即报错）".to_string(),
+            "standard" => format!("标准重试 3 轮（间隔 {}s）", cfg.grab_retry_seconds),
+            _ => format!(
+                "限时蹲守 {} 分钟（每 {}s 重试，换棒排队期间旧实例已停机 0 CU 计费）",
+                cfg.grab_timeout_minutes, cfg.grab_retry_seconds
+            ),
+        };
+        let fb_desc = if cfg.fallback_gpus.is_empty() {
+            String::new()
+        } else {
+            format!(" | 备选卡型：[{}]", cfg.fallback_gpus.join(", "))
+        };
+        h.log(format!("🛡️ 接力抢卡策略：{mode_desc}{fb_desc}"));
+    }
     if !conf.exists() {
         return Err(anyhow!("未找到 rclone.conf，请先完成 rclone 授权"));
     }
-    let mkdir_out = cli::run_simple(
-        &rclone,
-        &[
-            s(&["mkdir", "--retries=5", "--low-level-retries=20", "--"]),
-            vec![gdrive.clone()],
-        ]
-        .concat(),
-        Duration::from_secs(120),
-    )
-    .await?;
+    if was_auto_isolated {
+        check_or_migrate_legacy_bare_gdrive_with_conf(
+            &rclone,
+            &conf,
+            &gdrive,
+            legacy_action.as_deref(),
+            &h,
+        )
+        .await?;
+        *h.legacy_gdrive_action.l() = None;
+    }
+    let mkdir_args = vec![
+        "--config".into(),
+        conf.to_string_lossy().to_string(),
+        "mkdir".into(),
+        "--retries=5".into(),
+        "--low-level-retries=20".into(),
+        "--".into(),
+        gdrive.clone(),
+    ];
+    let mkdir_out = cli::run_simple(&rclone, &mkdir_args, Duration::from_secs(120)).await?;
     if mkdir_out.code != 0 {
         return Err(anyhow!(
             "创建网盘目录 {} 失败：{}",
@@ -529,17 +1745,21 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
         ));
     }
     if cfg.reset_done_flag {
-        h.log(format!("🧹 清理网盘旧完成标记 {gdrive}/training_done.flag"));
-        let _ = cli::run_simple(
-            &rclone,
-            &[
-                s(&["deletefile", "--retries=5", "--low-level-retries=20", "--"]),
-                vec![format!("{gdrive}/training_done.flag")],
-            ]
-            .concat(),
-            Duration::from_secs(120),
-        )
-        .await;
+        h.log(format!(
+            "🧹 清理网盘旧完成标记 {gdrive}/training_done.flag 与 TRAINING_COMPLETED.flag"
+        ));
+        for flag_name in ["training_done.flag", "TRAINING_COMPLETED.flag"] {
+            let del_args = vec![
+                "--config".into(),
+                conf.to_string_lossy().to_string(),
+                "deletefile".into(),
+                "--retries=5".into(),
+                "--low-level-retries=20".into(),
+                "--".into(),
+                format!("{gdrive}/{flag_name}"),
+            ];
+            let _ = cli::run_simple(&rclone, &del_args, Duration::from_secs(120)).await;
+        }
     }
 
     let mut round: u32 = 1;
@@ -548,8 +1768,18 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
         if cancel.is_cancelled() {
             return Ok(());
         }
-        if done_flag_exists(&gdrive).await {
-            h.log("🎉 检测到网盘完成标记 training_done.flag，全部接力训练已圆满结束！");
+        if done_flag_exists_with_conf(&rclone, &conf, &gdrive).await {
+            h.status.l().training_completed = true;
+            let local_dst = ws_dir.join(format!("checkpoint_{name}.pt"));
+        let local_ok = std::fs::metadata(&local_dst)
+                .map(|m| m.is_file() && m.len() > 0)
+                .unwrap_or(false)
+                || find_latest_valid_hf_checkpoint_dir(&ws_dir).is_some();
+            if !local_ok {
+                h.log("🎉 检测到网盘已完成标记且本机尚未存在最终权重，立即执行补下载回收！");
+            } else {
+                h.log("🎉 检测到网盘完成标记，全部接力训练已圆满结束，正在核验回收最终权重！");
+            }
             break;
         }
 
@@ -574,29 +1804,96 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             }
         }
         if !reuse {
-            h.set_phase("provisioning", format!("第 {round} 棒：申请云端 {} 实例", cfg.gpu_type));
             if app.find_assignment_by_name(&name).await.is_some() {
+                h.set_phase("destroying", format!("第 {round} 棒前清理残留同名实例"));
                 let r = hard_terminate(&app, &name, None, false).await;
                 h.log(format!("🧹 释放旧实例：{}", if r.verified_unassigned { "核验通过" } else { "未核验" }));
             }
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            if let Ok(existing) = app.client.list_assignments().await {
-                *h.pre_provision_endpoints.l() =
-                    existing.into_iter().map(|a| a.endpoint).collect();
-            }
-            h.log(format!("☁️ 正在向 Google Colab 申请实例 [{name}]…"));
-            let hh = h.clone();
-            colab_new(
-                &name,
-                &cfg.gpu_type,
-                cfg.high_mem,
-                Some(cancel.clone()),
+            h.cloud_unassign_verified.store(false, Ordering::SeqCst);
+            h.set_phase("provisioning", format!("第 {round} 棒：申请云端 {} 实例", cfg.gpu_type));
+            h.log(format!(
+                "☁️ 正在向 Google Colab 申请第 {round} 棒实例 [{name}]{}…",
+                if round > 1 { "（换棒等待期间无运行实例，0 CU 计费）" } else { "" }
+            ));
+            let grab_opts = GrabLoopOptions {
+                name: name.clone(),
+                primary_gpu: cfg.gpu_type.clone(),
+                fallback_gpus: cfg.fallback_gpus.clone(),
+                high_mem: cfg.high_mem,
+                auth_mode: eff_auth.clone(),
+                mode: cfg.grab_mode.clone(),
+                budget_minutes: Some(cfg.grab_timeout_minutes),
+                retry_seconds: cfg.grab_retry_seconds,
+                cancel: Some(cancel.clone()),
+            };
+            let hh_status = h.clone();
+            let hh_log = h.clone();
+            let prov_res = grab_colab_vm_loop(
+                &grab_opts,
+                Some((
+                    &app,
+                    &h.pre_provision_endpoints,
+                    &h.pre_provision_snapshot_invalid,
+                )),
                 Some(&h.child_pid),
-                &move |l: &str| hh.log(l),
+                &move |gs: &GrabStatus| {
+                    let mut st = hh_status.status.l();
+                    st.grab_status = Some(gs.clone());
+                    if gs.active {
+                        let q_note = if round > 1 { " · 排队0计费" } else { "" };
+                        let label = if gs.phase == "waiting_retry" {
+                            format!(
+                                "第 {round} 棒：[{}] 暂无卡，{}s 后第 {} 次重试{}",
+                                gs.target_gpu,
+                                gs.retry_seconds,
+                                gs.attempt + 1,
+                                q_note
+                            )
+                        } else if let Some(max) = gs.max_attempts {
+                            if max > 1 {
+                                format!(
+                                    "第 {round} 棒：第 {}/{} 次抢卡 [{}]{}",
+                                    gs.attempt, max, gs.target_gpu, q_note
+                                )
+                            } else {
+                                format!("第 {round} 棒：申请云端 [{}] 实例{}", gs.target_gpu, q_note)
+                            }
+                        } else {
+                            format!(
+                                "第 {round} 棒：第 {} 次蹲守抢卡 [{}]{}",
+                                gs.attempt, gs.target_gpu, q_note
+                            )
+                        };
+                        st.phase = "provisioning".into();
+                        st.phase_label = label;
+                    }
+                },
+                &move |l: &str| hh_log.log(l),
             )
-            .await?;
+            .await;
+            match prov_res {
+                Ok(ref allocated_gpu) => {
+                    h.pre_provision_snapshot_invalid.store(true, Ordering::SeqCst);
+                    h.status.l().grab_status = None;
+                    if !allocated_gpu.eq_ignore_ascii_case(&cfg.gpu_type) {
+                        h.log(format!(
+                            "🔄 主选 [{}] 暂无库存，本棒已通过备选卡型成功分配 [{}] 实例！",
+                            cfg.gpu_type, allocated_gpu
+                        ));
+                    }
+                    h.set_phase("connecting", format!("第 {round} 棒：连接已分配 [{allocated_gpu}] 实例"));
+                }
+                Err(_) => {
+                    if !cancel.is_cancelled() {
+                        h.pre_provision_snapshot_invalid.store(true, Ordering::SeqCst);
+                        h.set_phase("alloc_failed", format!("第 {round} 棒：实例抢卡失败"));
+                    }
+                }
+            }
+            prov_res?;
         }
         if cancel.is_cancelled() {
             return Ok(());
@@ -606,16 +1903,35 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             .find_assignment_by_name(&name)
             .await
             .ok_or_else(|| anyhow!("服务端未找到实例 [{name}]"))?;
+        h.cloud_unassign_verified.store(false, Ordering::SeqCst);
         h.log(format!("✅ 实例就绪，Endpoint：{}", a.endpoint));
 
-        // 2. 上传 rclone.conf 与 train.py
+        // 2. 上传 rclone.conf、工作区标记与绑定工作区的 train.py
         h.set_phase("uploading_auth", format!("第 {round} 棒：上传 rclone.conf 与 train.py"));
         let conf_bytes = std::fs::read(&conf)?;
         app.client.contents_upload(&a, "content/rclone.conf", &conf_bytes).await?;
-        let train_path = app.workspace.join("train.py");
-        let train_bytes = std::fs::read(&train_path)?;
+        let train_path = ws_dir.join("train.py");
+        let train_bytes = std::fs::read(&train_path).map_err(|e| {
+            anyhow!(
+                "无法从绑定工作区读取训练脚本 `{}`：{e}",
+                train_path.display()
+            )
+        })?;
         app.client.contents_upload(&a, "content/train.py", &train_bytes).await?;
-        h.log("📤 rclone.conf 与 train.py 已上传至 /content");
+        let ws_meta_json = serde_json::json!({
+            "name": ws_dir.file_name().and_then(|s| s.to_str()).unwrap_or(&name),
+            "path": ws_dir.display().to_string(),
+        });
+        if let Ok(ws_bytes) = serde_json::to_vec(&ws_meta_json) {
+            let _ = app
+                .client
+                .contents_upload(&a, "content/.colab_workspace.json", &ws_bytes)
+                .await;
+        }
+        h.log(format!(
+            "📤 rclone.conf 与 {} 已上传至 /content",
+            train_path.display()
+        ));
 
         // 遥测探针
         match crate::deploy_probe_inner(&app, &name).await {
@@ -631,9 +1947,13 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
         h.log("🔧 正在云端安装 rclone…");
         let install_code = "import shutil, subprocess\nif not shutil.which('rclone'):\n    subprocess.run(['bash','-c','apt-get update -qq && apt-get install -y -qq rclone'], check=True)\nprint('RCLONE_READY:', shutil.which('rclone'))\n";
         let hh = h.clone();
+        let rclone_exec_args = cli::build_colab_subcommand_args(
+            eff_auth.as_deref(),
+            &s(&["exec", "-s", &name, "--timeout", "600"]),
+        );
         let out = cli::run_streaming(
             &colab,
-            &s(&["exec", "-s", &name, "--timeout", "600"]),
+            &rclone_exec_args,
             Some(install_code.to_string()),
             Duration::from_secs(700),
             Some(cancel.clone()),
@@ -648,16 +1968,26 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             return Err(anyhow!("云端 rclone 安装失败"));
         }
 
-        let req_path = app.workspace.join("requirements.txt");
+        let req_path = ws_dir.join("requirements.txt");
         let has_reqs = std::fs::read_to_string(&req_path)
             .map(|t| t.lines().any(|l| !l.trim().is_empty() && !l.trim().starts_with('#')))
             .unwrap_or(false);
         if has_reqs {
-            h.log("📦 正在安装 requirements.txt 依赖…");
+            h.log(format!(
+                "📦 正在安装 {} 依赖…",
+                req_path.display()
+            ));
             let hh = h.clone();
+            let raw_install_args = [
+                s(&["install", "-s", &name, "-r"]),
+                vec![req_path.to_string_lossy().to_string()],
+            ]
+            .concat();
+            let install_args =
+                cli::build_colab_subcommand_args(eff_auth.as_deref(), &raw_install_args);
             let out = cli::run_streaming(
                 &colab,
-                &[s(&["install", "-s", &name, "-r"]), vec![req_path.to_string_lossy().to_string()]].concat(),
+                &install_args,
                 None,
                 Duration::from_secs(1800),
                 Some(cancel.clone()),
@@ -671,19 +2001,21 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             validate_colab_install_output(&out)?;
         }
 
-        // 4. 执行训练（--timeout 86400，流式日志）
+        // 4. 执行训练（流式日志，超时严格对齐 max_session_hours + 缓冲）
         h.set_phase("training", format!("第 {round} 棒：云端训练 · 定时热备中"));
         h.log(format!(
-            "⏳ 开始训练：单棒上限 {:.2}h，每 {:.0} 分钟同步至 {gdrive}",
-            cfg.max_session_hours, cfg.backup_interval_minutes
+            "⏳ 开始训练：单棒上限 {:.2}h（exec 超时 {}s），每 {:.0} 分钟同步至 {gdrive}",
+            cfg.max_session_hours, exec_timeout_secs, cfg.backup_interval_minutes
         ));
         let exec_started = std::time::Instant::now();
-        let args = vec![
+        let raw_train_args = vec![
             "exec".into(),
             "-s".into(),
             name.clone(),
             "--timeout".into(),
-            "86400".into(),
+            exec_timeout_secs.to_string(),
+            "--env".into(),
+            format!("COLAB_WORKSPACE={}", ws_dir.display()),
             "--env".into(),
             format!("GDRIVE_DIR={gdrive}"),
             "--env".into(),
@@ -699,12 +2031,13 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             "-f".into(),
             train_path.to_string_lossy().to_string(),
         ];
+        let args = cli::build_colab_subcommand_args(eff_auth.as_deref(), &raw_train_args);
         let hh = h.clone();
         let out = cli::run_streaming(
             &colab,
             &args,
             None,
-            Duration::from_secs(90_000),
+            host_wait_timeout,
             Some(cancel.clone()),
             Some(&h.child_pid),
             move |l| {
@@ -719,6 +2052,23 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             return Ok(());
         }
 
+        // 4.5 换棒销毁前核验与应急抢救：确保在停机释放前最新训练断点已落入网盘
+        verify_or_rescue_checkpoint_before_terminate(
+            &h,
+            &colab,
+            &rclone,
+            &conf,
+            &name,
+            eff_auth.as_deref(),
+            &gdrive,
+            &out,
+            &cancel,
+        )
+        .await;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
         // 5. 本棒结束，无论成功或失败均先彻底销毁实例停止计费
         h.set_phase("destroying", format!("第 {round} 棒结束：销毁实例并核验停费"));
         h.log("🧹 本棒结束，正在 unassign 并核验服务端计费列表…");
@@ -730,14 +2080,15 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
             return Err(anyhow!("实例销毁未通过核验，为防止空转计费已中止接力"));
         }
 
-        let remote_done = done_flag_exists(&gdrive).await;
+        let remote_done = done_flag_exists_with_conf(&rclone, &conf, &gdrive).await;
         let round_completed = classify_training_round(&out, remote_done)?;
         if round_completed {
+            h.status.l().training_completed = true;
             h.log("🎉 检测到网盘完成标记，全部接力训练已圆满结束！");
             break;
         }
 
-        // 快速失败/异常换棒熔断器：若单棒配置 > 0.1h 但连续 3 棒均在 60 秒内请求换棒，说明计时配置异常，立即熔断
+        // 快速失败/异常换棒熔断器：若单棒配置 >= 0.1h 但连续 3 棒均在 60 秒内请求换棒，说明计时配置异常，立即熔断
         if cfg.max_session_hours >= 0.1 && exec_elapsed < Duration::from_secs(60) {
             consecutive_short_rounds += 1;
             if consecutive_short_rounds >= 3 {
@@ -757,39 +2108,11 @@ async fn relay_inner(app: Arc<AppState>, h: Arc<RelayHandle>, cancel: Cancellati
         }
     }
 
-    {
-        h.set_phase("completed", "全部训练轮次已完成 (100%)");
-        // 确保不残留计费实例
-        if app.find_assignment_by_name(&name).await.is_some() {
-            let _ = hard_terminate(&app, &name, None, false).await;
-        }
-        let dst = app.workspace.join(format!("checkpoint_{name}.pt"));
-        h.log(format!("📥 正在下载最终权重到本机：{}", dst.display()));
-        match cli::run_simple(
-            &rclone,
-            &[
-                s(&["copyto", "--multi-thread-streams=16", "--retries=5", "--low-level-retries=20", "--"]),
-                vec![format!("{gdrive}/checkpoint.pt"), dst.to_string_lossy().to_string()],
-            ]
-            .concat(),
-            Duration::from_secs(1800),
-        )
-        .await
-        {
-            Ok(o) if o.code == 0 && dst.exists() => {
-                h.log("✅ 全部接力训练与权重回收流程执行完毕！");
-            }
-            Ok(o) => {
-                h.log(format!(
-                    "⚠️ 最终权重下载返回非零状态（网盘中仍保留最新权重）：{}",
-                    o.output.lines().last().unwrap_or("")
-                ));
-            }
-            Err(e) => {
-                h.log(format!("⚠️ 最终权重下载失败（网盘中仍保留最新权重）：{e}"));
-            }
-        }
+    // 确保不残留计费实例
+    if app.find_assignment_by_name(&name).await.is_some() {
+        let _ = hard_terminate(&app, &name, None, false).await;
     }
+    download_and_verify_final_weights(&h, &rclone, &conf, &gdrive, &ws_dir, &name).await;
     Ok(())
 }
 
@@ -817,6 +2140,7 @@ mod tests {
             backup_interval_minutes: 15.0,
             total_epochs: 100,
             reset_done_flag: false,
+            ..Default::default()
         };
         assert!(validate_relay_config(&valid).is_ok());
 
@@ -1035,5 +2359,349 @@ assert caught, "parser should reject trailing --auth after subcommand 'new'"
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn test_issue_44_52_54_gdrive_isolation_cpu_preserved_and_23_5h_session_cap() {
+        // #44: bare default gdrive:colab_relay auto-isolates by sanitized VM name
+        assert_eq!(
+            resolve_isolated_gdrive_dir("gdrive:colab_relay", "resnet-a"),
+            "gdrive:colab_relay/resnet-a"
+        );
+        assert_eq!(
+            resolve_isolated_gdrive_dir("  gdrive:colab_relay/  ", "vm_02"),
+            "gdrive:colab_relay/vm_02"
+        );
+        assert_eq!(
+            resolve_isolated_gdrive_dir("gdrive:colab_relay/custom_shared", "resnet-a"),
+            "gdrive:colab_relay/custom_shared"
+        );
+
+        // #52: CPU gpu_type is valid and preserved
+        let cpu_cfg = RelayConfig {
+            gpu_type: "CPU".into(),
+            high_mem: false,
+            gdrive_dir: "gdrive:colab_relay/cpu-job".into(),
+            max_session_hours: 23.5,
+            backup_interval_minutes: 15.0,
+            total_epochs: 20,
+            reset_done_flag: false,
+            ..Default::default()
+        };
+        assert!(validate_relay_config(&cpu_cfg).is_ok());
+
+        // #54: strict 0.1..=23.5h bounds (reject >23.5 such as 24h, 30h, 48h and <=0)
+        for bad_h in [0.0, -1.0, 0.05, 23.51, 24.0, 30.0, 48.0] {
+            let mut c = cpu_cfg.clone();
+            c.max_session_hours = bad_h;
+            assert!(
+                validate_relay_config(&c).is_err(),
+                "max_session_hours={bad_h} must be rejected"
+            );
+        }
+        for ok_h in [0.1, 1.0, 12.0, 22.5, 23.5] {
+            let mut c = cpu_cfg.clone();
+            c.max_session_hours = ok_h;
+            assert!(
+                validate_relay_config(&c).is_ok(),
+                "max_session_hours={ok_h} must be accepted"
+            );
+        }
+
+        let (exec_to_max, local_wait_max) = compute_relay_timeouts(23.5);
+        assert_eq!(exec_to_max, 86_400);
+        assert!(local_wait_max >= Duration::from_secs(87_000));
+        assert!(local_wait_max <= Duration::from_secs(90_000));
+    }
+
+    #[tokio::test]
+    async fn test_issue_53_final_weights_download_verification_and_rerun_recovery() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let py = cli::colab_python_bin();
+        if !py.exists() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("pilot_relay_dl_{}", uuid::Uuid::new_v4()));
+        let cfg_dir = tmp.join("colab-cli");
+        let remote_drive = tmp.join("mock_gdrive");
+        let ws_dir = tmp.join("custom_ws");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&remote_drive).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let rclone_conf = cfg_dir.join("rclone.conf");
+        std::fs::write(&rclone_conf, "[gdrive]\ntype = drive\n").unwrap();
+
+        // Create a cross-platform mock rclone script backed by Python reading MOCK_RCLONE_ROOT & MOCK_RCLONE_MODE
+        let rclone_py = tmp.join("mock_rclone.py");
+        std::fs::write(
+            &rclone_py,
+            r#"import os, shutil, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if "--config" in args:
+    i = args.index("--config")
+    args = args[:i] + args[i+2:]
+clean = [a for a in args if not a.startswith("-") and a != "--"]
+cmd = clean[0] if clean else ""
+root = Path(os.environ["MOCK_RCLONE_ROOT"])
+mode = os.environ.get("MOCK_RCLONE_MODE", "normal")
+
+def map_remote(spec: str) -> Path:
+    _, rel = spec.split(":", 1)
+    return root / rel.strip("/")
+
+if mode == "fail_all" and cmd in ("copyto", "copy"):
+    sys.stderr.write("ERROR : simulated rclone network failure\n")
+    sys.exit(1)
+
+if cmd == "mkdir":
+    map_remote(clean[1]).mkdir(parents=True, exist_ok=True)
+    sys.exit(0)
+elif cmd == "lsf":
+    p = map_remote(clean[1])
+    if not p.exists():
+        sys.exit(0)
+    for child in sorted(p.iterdir()):
+        sys.stdout.write(child.name + ("/\n" if child.is_dir() else "\n"))
+    sys.exit(0)
+elif cmd == "copyto":
+    src = map_remote(clean[1])
+    dst = Path(clean[2])
+    if mode == "zero_byte":
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"")
+        sys.exit(0)
+    if not src.is_file():
+        sys.stderr.write(f"directory not found: {src.name}\n")
+        sys.exit(3)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+    sys.exit(0)
+elif cmd == "copy":
+    src = map_remote(clean[1])
+    dst = Path(clean[2])
+    if not src.exists():
+        sys.exit(0)
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+    sys.exit(0)
+sys.exit(0)
+"#,
+        )
+        .unwrap();
+
+        #[cfg(windows)]
+        let mock_rclone = {
+            let cmd_path = tmp.join("mock_rclone.cmd");
+            std::fs::write(
+                &cmd_path,
+                format!("@echo off\r\n\"{}\" \"{}\" %*\r\n", py.display(), rclone_py.display()),
+            )
+            .unwrap();
+            cmd_path
+        };
+        #[cfg(not(windows))]
+        let mock_rclone = {
+            use std::os::unix::fs::PermissionsExt;
+            let sh_path = tmp.join("mock_rclone.sh");
+            std::fs::write(
+                &sh_path,
+                format!("#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n", py.display(), rclone_py.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            sh_path
+        };
+
+        std::env::set_var("MOCK_RCLONE_ROOT", &remote_drive);
+        *cli::TEST_CONFIG_DIR.l() = Some(cfg_dir.clone());
+        *cli::TEST_RCLONE_BIN.l() = Some(mock_rclone.clone());
+        *cli::TEST_RCLONE_CONF.l() = Some(rclone_conf.clone());
+        *cli::TEST_COLAB_BIN.l() = Some(tmp.join("nonexistent_colab_must_not_be_called"));
+
+        let job_remote = remote_drive.join("colab_relay").join("dl-vm");
+        std::fs::create_dir_all(&job_remote).unwrap();
+        std::fs::write(job_remote.join("TRAINING_COMPLETED.flag"), "done\n").unwrap();
+        assert!(
+            done_flag_exists_with_conf(&mock_rclone, &rclone_conf, "gdrive:colab_relay/dl-vm").await,
+            "must detect uppercase TRAINING_COMPLETED.flag"
+        );
+
+        // 1. Both download commands fail -> phase MUST be download_failed, weights_downloaded=false
+        std::env::set_var("MOCK_RCLONE_MODE", "fail_all");
+        let h1 = Arc::new(RelayHandle::new("dl-vm"));
+        download_and_verify_final_weights(
+            &h1,
+            &mock_rclone,
+            &rclone_conf,
+            "gdrive:colab_relay/dl-vm",
+            &ws_dir,
+            "dl-vm",
+        )
+        .await;
+        let s1 = h1.snapshot();
+        assert!(s1.training_completed);
+        assert!(!s1.weights_downloaded);
+        assert_eq!(s1.phase, "download_failed");
+        assert!(s1.download_error.is_some());
+        assert!(s1.local_weights_path.is_none());
+
+        // 2. rclone exits 0 but writes 0-byte file -> still download_failed!
+        std::env::set_var("MOCK_RCLONE_MODE", "zero_byte");
+        download_and_verify_final_weights(
+            &h1,
+            &mock_rclone,
+            &rclone_conf,
+            "gdrive:colab_relay/dl-vm",
+            &ws_dir,
+            "dl-vm",
+        )
+        .await;
+        let s2 = h1.snapshot();
+        assert!(!s2.weights_downloaded);
+        assert_eq!(s2.phase, "download_failed");
+
+        // 3. Re-running relay_inner (!reset_done_flag) when remote has TRAINING_COMPLETED.flag and local file is missing:
+        //    must perform recovery download into bound ws_dir without allocating a VM, then verify >0 bytes -> completed!
+        std::env::set_var("MOCK_RCLONE_MODE", "normal");
+        std::fs::write(job_remote.join("checkpoint.pt"), b"PYTORCH_WEIGHTS_PAYLOAD").unwrap();
+
+        let tok_file = tmp.join("token.json");
+        std::fs::write(
+            &tok_file,
+            r#"{"token":"valid-token","expiry":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let client = crate::colab::ColabClient::new_for_test("http://127.0.0.1:9".into(), tok_file);
+        let default_ws = tmp.join("default_ws_unused");
+        std::fs::create_dir_all(&default_ws).unwrap();
+        let app = AppState::new_with(client, default_ws.clone());
+
+        let h_rerun = Arc::new(RelayHandle::new("dl-vm"));
+        *h_rerun.workspace_dir.l() = Some(ws_dir.clone());
+        h_rerun.status.l().config = RelayConfig {
+            gpu_type: "CPU".into(),
+            high_mem: false,
+            gdrive_dir: "gdrive:colab_relay/dl-vm".into(),
+            max_session_hours: 12.0,
+            backup_interval_minutes: 15.0,
+            total_epochs: 10,
+            reset_done_flag: false,
+            ..Default::default()
+        };
+        relay_inner(app, h_rerun.clone(), CancellationToken::new())
+            .await
+            .expect("rerun recovery download should succeed without touching colab new");
+
+        let s3 = h_rerun.snapshot();
+        assert!(s3.training_completed);
+        assert!(s3.weights_downloaded);
+        assert_eq!(s3.phase, "completed");
+        assert!(s3.download_error.is_none());
+        let expected_ckpt = ws_dir.join("checkpoint_dl-vm.pt");
+        assert_eq!(
+            std::fs::read(&expected_ckpt).unwrap(),
+            b"PYTORCH_WEIGHTS_PAYLOAD"
+        );
+        assert!(!default_ws.join("checkpoint_dl-vm.pt").exists());
+
+        // 4. HuggingFace Trainer fallback: remote has hf_checkpoints/checkpoint-20/trainer_state.json and no checkpoint.pt
+        let hf_remote = remote_drive
+            .join("colab_relay")
+            .join("hf-vm")
+            .join("hf_checkpoints")
+            .join("checkpoint-20");
+        std::fs::create_dir_all(&hf_remote).unwrap();
+        std::fs::write(
+            remote_drive.join("colab_relay").join("hf-vm").join("TRAINING_COMPLETED.flag"),
+            "done\n",
+        )
+        .unwrap();
+        std::fs::write(hf_remote.join("trainer_state.json"), r#"{"global_step":20}"#).unwrap();
+        let hf_ws = tmp.join("hf_ws");
+        std::fs::create_dir_all(&hf_ws).unwrap();
+        let h_hf = Arc::new(RelayHandle::new("hf-vm"));
+        download_and_verify_final_weights(
+            &h_hf,
+            &mock_rclone,
+            &rclone_conf,
+            "gdrive:colab_relay/hf-vm",
+            &hf_ws,
+            "hf-vm",
+        )
+        .await;
+        let s_hf = h_hf.snapshot();
+        assert!(s_hf.weights_downloaded);
+        assert_eq!(s_hf.phase, "completed");
+        assert!(s_hf
+            .local_weights_path
+            .as_deref()
+            .unwrap_or("")
+            .contains("checkpoint-20"));
+
+        std::env::remove_var("MOCK_RCLONE_ROOT");
+        std::env::remove_var("MOCK_RCLONE_MODE");
+        *cli::TEST_CONFIG_DIR.l() = None;
+        *cli::TEST_RCLONE_BIN.l() = None;
+        *cli::TEST_RCLONE_CONF.l() = None;
+        *cli::TEST_COLAB_BIN.l() = None;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_issue_80_legacy_bare_gdrive_checkpoint_requires_confirmation_and_migrates_with_real_rclone() {
+        let _guard = cli::TEST_ENV_LOCK.lock().await;
+        let real_rclone = cli::rclone_bin();
+        if !real_rclone.exists() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("pilot_issue80_{}", uuid::Uuid::new_v4()));
+        let drive_root = tmp.join("drive_storage");
+        let legacy_dir = drive_root.join("colab_relay");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_ckpt = legacy_dir.join("checkpoint.pt");
+        std::fs::write(&legacy_ckpt, b"EPOCH_7_WEIGHTS").unwrap();
+
+        let conf = tmp.join("rclone.conf");
+        let drive_norm = drive_root.to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            &conf,
+            format!("[gdrive]\ntype = alias\nremote = {drive_norm}\n"),
+        )
+        .unwrap();
+
+        let h = RelayHandle::new("legacy-run");
+
+        // 1) Unconfirmed auto-isolated path MUST abort before starting training and explain migration
+        let err = check_or_migrate_legacy_bare_gdrive_with_conf(
+            &real_rclone,
+            &conf,
+            "gdrive:colab_relay/legacy-run",
+            None,
+            &h,
+        )
+        .await
+        .expect_err("unconfirmed legacy root checkpoint must block silent fresh start");
+        let err_str = err.to_string();
+        assert!(err_str.contains("gdrive:colab_relay"));
+        assert!(err_str.contains("gdrive:colab_relay/legacy-run"));
+        assert!(legacy_ckpt.exists(), "legacy checkpoint must remain untouched");
+
+        // 2) Confirmed `migrate` moves checkpoint.pt into `gdrive:colab_relay/legacy-run/checkpoint.pt`
+        check_or_migrate_legacy_bare_gdrive_with_conf(
+            &real_rclone,
+            &conf,
+            "gdrive:colab_relay/legacy-run",
+            Some("migrate"),
+            &h,
+        )
+        .await
+        .expect("confirmed migration with real rclone must succeed");
+        let migrated_ckpt = legacy_dir.join("legacy-run").join("checkpoint.pt");
+        assert_eq!(std::fs::read(&migrated_ckpt).unwrap(), b"EPOCH_7_WEIGHTS");
+        assert!(!legacy_ckpt.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -8,24 +8,63 @@ import {
   Cpu,
   FolderGit2,
   HardDrive,
+  HeartPulse,
+  History,
   KeyRound,
   Loader2,
   Power,
+  PowerOff,
   Repeat2,
   Server,
   ShieldCheck,
   Sparkles,
   Terminal,
   Wrench,
+  Zap,
 } from "lucide-react";
 import { errText } from "../api";
-import { isSingleShapeAccelerator, resolveEffectiveHighMem } from "../chatUtils";
+import {
+  DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
+  DEFAULT_RELAY_GRAB_RETRY_SECONDS,
+  DEFAULT_VM_GRAB_RETRY_SECONDS,
+  KEEP_ALIVE_PRESET_INTERVALS,
+  MAX_GRAB_RETRY_SECONDS,
+  MAX_KEEP_ALIVE_INTERVAL_SECONDS,
+  MAX_RELAY_SESSION_HOURS,
+  MIN_GRAB_RETRY_SECONDS,
+  MIN_KEEP_ALIVE_INTERVAL_SECONDS,
+  MIN_RELAY_SESSION_HOURS,
+  RECOMMENDED_MAX_RELAY_SESSION_HOURS,
+  checkCreateVmAuthGuard,
+  describeGrabStatus,
+  findConflictingRelayVm,
+  isDefaultBareGdriveDir,
+  isLlmEngineCompatibleWithAccelerator,
+  isNvidiaCudaAccelerator,
+  isSingleShapeAccelerator,
+  isValidGrabRetrySeconds,
+  isValidKeepAliveInterval,
+  isValidRelayGrabTimeoutMinutes,
+  isValidRelaySessionHours,
+  normalizeKeepAliveConfig,
+  parseFallbackGpuInput,
+  requiresGdriveConfig,
+  resolveEffectiveHighMem,
+  resolveEffectiveRelayGdriveDir,
+  sanitizeRelayVmSegment,
+} from "../chatUtils";
 import { ColabIcon, Modal } from "./ui";
 import {
+  DEFAULT_GRAB_CONFIG,
+  DEFAULT_KEEP_ALIVE,
   DEFAULT_RELAY,
   type CreateVmLlmConfig,
   type CreateVmRequest,
+  type EnvStatus,
+  type GrabConfig,
+  type KeepAliveConfig,
   type RelayConfig,
+  type VmView,
 } from "../types";
 
 export const DEFAULT_LLM_MODEL = "Qwen/Qwen2.5-7B-Instruct-GGUF";
@@ -39,7 +78,13 @@ export interface CreateVmPreset {
   llm_slot?: "blue" | "green" | "standalone";
   llm_model?: string;
   llm_engine?: string;
+  llm_config?: CreateVmLlmConfig | null;
+  relay_config?: RelayConfig | null;
+  keep_alive?: KeepAliveConfig | null;
+  grab_config?: GrabConfig | null;
   workspace_path?: string;
+  /** 历史记录无持久化配置时提示用户确认工作模式与参数 (#74) */
+  unverified_history_profile?: boolean;
   /** 若指定已有运行中实例名，则切换为“在该实例上直接部署大模型”模式（调用 deploy_llm_on_vm） */
   target_existing_vm?: string;
 }
@@ -55,12 +100,12 @@ export const ACCELERATORS = [
   { v: "CPU", tag: "CPU · 标准", d: "标准多核 CPU · 脚本与轻量任务", variant: "CPU", singleShape: false },
 ];
 
-const LLM_ENGINES = [
-  { v: "llama.cpp", label: "llama.cpp (CUDA GGUF)", desc: "极速拉取 GGUF 量化权重，原生 CUDA 推理" },
-  { v: "vllm", label: "vLLM (PagedAttention)", desc: "高并发吞吐 OpenAI 兼容服务端" },
-  { v: "ollama", label: "Ollama", desc: "一键拉取 Ollama 模型仓库并暴露接口" },
-  { v: "transformers", label: "HF Transformers", desc: "原生 PyTorch bfloat16 流式生成服务" },
-  { v: "builtin", label: "Builtin 轻量边车", desc: "秒级启动云端边车用于链路冒烟与调试" },
+export const LLM_ENGINES = [
+  { v: "llama.cpp", label: "llama.cpp (CUDA GGUF)", desc: "极速拉取 GGUF 量化权重，原生 CUDA 推理", requiresCuda: true },
+  { v: "vllm", label: "vLLM (PagedAttention)", desc: "高并发吞吐 OpenAI 兼容服务端", requiresCuda: true },
+  { v: "ollama", label: "Ollama", desc: "一键拉取 Ollama 模型仓库并暴露接口", requiresCuda: false },
+  { v: "transformers", label: "HF Transformers (CUDA)", desc: "原生 PyTorch CUDA bfloat16 流式生成服务", requiresCuda: true },
+  { v: "builtin", label: "Builtin 轻量边车", desc: "秒级启动云端边车用于链路冒烟与调试", requiresCuda: false },
 ];
 
 export const MODEL_PRESETS = [
@@ -74,9 +119,12 @@ export const MODEL_PRESETS = [
 export function CreateVmDialog(props: {
   open: boolean;
   defaultWorkspace?: string;
+  env?: EnvStatus | null;
+  vms?: VmView[];
   preset?: CreateVmPreset | null;
   onClose: () => void;
   onCreate: (req: CreateVmRequest) => Promise<void>;
+  onCancelCreate?: (name: string) => Promise<void>;
   onDeployLlmOnVm?: (name: string, config: CreateVmLlmConfig) => Promise<void>;
 }) {
   const [name, setName] = useState("");
@@ -86,6 +134,7 @@ export function CreateVmDialog(props: {
   const [workspacePath, setWorkspacePath] = useState(props.defaultWorkspace ?? "");
   const [description, setDescription] = useState("");
   const [bootMode, setBootMode] = useState<"general" | "llm" | "relay">("general");
+  const [historyUnverifiedNotice, setHistoryUnverifiedNotice] = useState(false);
 
   // LLM 部署配置
   const [llmEngine, setLlmEngine] = useState(DEFAULT_LLM_ENGINE);
@@ -96,10 +145,19 @@ export function CreateVmDialog(props: {
 
   // 24h+ 接力训练配置
   const [relayCfg, setRelayCfg] = useState<RelayConfig>({ ...DEFAULT_RELAY });
+  const [relayFallbacksRaw, setRelayFallbacksRaw] = useState("");
+  const [confirmReuseRelayGdrive, setConfirmReuseRelayGdrive] = useState(false);
 
-  // Colab 高级运行时环境配置
+  // 开机抢卡策略（支持快速探卡 / 标准重试 / 一直抢卡）
+  const [grabCfg, setGrabCfg] = useState<GrabConfig>({ ...DEFAULT_GRAB_CONFIG });
+  const [grabFallbacksRaw, setGrabFallbacksRaw] = useState("");
+
+  // 新建实例默认每 90 秒检查运行时连接并在 Kernel 空闲时发送脉冲。
+  const [keepAliveCfg, setKeepAliveCfg] = useState<KeepAliveConfig>({ ...DEFAULT_KEEP_ALIVE });
+
+  // Colab 高级运行时环境配置（#67：通用模式下 syncRclone 默认 false）
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [syncRclone, setSyncRclone] = useState(true);
+  const [syncRclone, setSyncRclone] = useState(false);
   const [mountGdrive, setMountGdrive] = useState(false);
   const [installReqTxt, setInstallReqTxt] = useState(false);
   const [pipPackages, setPipPackages] = useState("");
@@ -107,14 +165,30 @@ export function CreateVmDialog(props: {
   const [startupScript, setStartupScript] = useState("");
 
   const [busy, setBusy] = useState(false);
+  const [activeCreatingName, setActiveCreatingName] = useState<string | null>(null);
+  const [cancellingCreate, setCancellingCreate] = useState(false);
+  const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000));
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [copiedError, setCopiedError] = useState(false);
   const prevOpenRef = useRef(false);
+  const openRef = useRef(props.open);
+  openRef.current = props.open;
+  const cancelledByUserRef = useRef(false);
+  const userToggledSyncRcloneRef = useRef(false);
 
   const targetExistingVm = props.preset?.target_existing_vm?.trim() || null;
   const isDeployExisting = Boolean(targetExistingVm);
 
-  // 每次弹窗打开（含 preset === null）时完整重置全部表单状态，避免残留上次填写的会话名/模式/报错
+  useEffect(() => {
+    if (!busy || !activeCreatingName) return;
+    setNowSec(Math.floor(Date.now() / 1000));
+    const timer = window.setInterval(() => {
+      setNowSec(Math.floor(Date.now() / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [busy, activeCreatingName]);
+
+  // 每次弹窗打开（含 preset === null）时完整重置全部表单状态
   useEffect(() => {
     const justOpened = props.open && !prevOpenRef.current;
     prevOpenRef.current = props.open;
@@ -122,25 +196,50 @@ export function CreateVmDialog(props: {
 
     const p = props.preset ?? null;
     const initAcc = (p?.accelerator ?? "T4").toUpperCase();
-    const initSingle = isSingleShapeAccelerator(initAcc);
+    const validAcc = ACCELERATORS.some((a) => a.v === initAcc) ? initAcc : "T4";
+    const initSingle = isSingleShapeAccelerator(validAcc);
     const existingTarget = p?.target_existing_vm?.trim() || "";
+    const initBootMode: "general" | "llm" | "relay" = existingTarget
+      ? "llm"
+      : (p?.boot_mode ?? "general");
 
     setBusy(false);
+    setActiveCreatingName(null);
+    setCancellingCreate(false);
+    cancelledByUserRef.current = false;
     setSubmitError(null);
     setCopiedError(false);
+    userToggledSyncRcloneRef.current = false;
 
     setName(p?.name ?? "");
-    setAcc(ACCELERATORS.some((a) => a.v === initAcc) ? initAcc : "T4");
+    setAcc(validAcc);
     setHighMem(initSingle ? false : (p?.high_mem ?? true));
     setAuthMode("oauth2");
     setWorkspacePath(p?.workspace_path ?? props.defaultWorkspace ?? "");
     setDescription("");
-    setBootMode(existingTarget ? "llm" : (p?.boot_mode ?? "general"));
+    setBootMode(initBootMode);
+    setHistoryUnverifiedNotice(Boolean(p?.unverified_history_profile));
 
-    setLlmEngine(p?.llm_engine ?? DEFAULT_LLM_ENGINE);
-    setLlmModel(p?.llm_model ?? DEFAULT_LLM_MODEL);
+    const savedLlm = p?.llm_config ?? null;
+    const initGdriveModel = savedLlm?.gdrive_model_path ?? "";
+    const rawSavedSlot = (savedLlm?.slot ?? "").toLowerCase();
+    const resolvedSavedSlot: "blue" | "green" | "standalone" | undefined =
+      rawSavedSlot === "blue" || rawSavedSlot === "green" || rawSavedSlot === "standalone"
+        ? rawSavedSlot
+        : undefined;
+
+    const defaultEngineForAcc = isNvidiaCudaAccelerator(validAcc)
+      ? DEFAULT_LLM_ENGINE
+      : "ollama";
+    setLlmEngine(savedLlm?.engine ?? p?.llm_engine ?? defaultEngineForAcc);
+    setLlmModel(
+      savedLlm?.model_name ??
+        p?.llm_model ??
+        (isNvidiaCudaAccelerator(validAcc) ? DEFAULT_LLM_MODEL : "qwen2.5:7b"),
+    );
     setLlmSlot(
       p?.llm_slot ??
+        resolvedSavedSlot ??
         (existingTarget
           ? existingTarget.endsWith("-blue")
             ? "blue"
@@ -149,12 +248,31 @@ export function CreateVmDialog(props: {
               : "standalone"
           : "blue"),
     );
-    setGdriveModelPath("");
-    setCustomApiKey("");
+    setGdriveModelPath(initGdriveModel);
+    setCustomApiKey(savedLlm?.custom_api_key ?? "");
 
-    setRelayCfg({ ...DEFAULT_RELAY });
+    const initRelay = p?.relay_config
+      ? { ...DEFAULT_RELAY, ...p.relay_config }
+      : { ...DEFAULT_RELAY, gpu_type: validAcc };
+    setRelayCfg(initRelay);
+    setRelayFallbacksRaw((initRelay.fallback_gpus ?? []).join(", "));
+    setConfirmReuseRelayGdrive(false);
+
+    const initGrab = p?.grab_config
+      ? { ...DEFAULT_GRAB_CONFIG, ...p.grab_config }
+      : { ...DEFAULT_GRAB_CONFIG };
+    setGrabCfg(initGrab);
+    setGrabFallbacksRaw((initGrab.fallback_gpus ?? []).join(", "));
+
+    setKeepAliveCfg(
+      p?.keep_alive
+        ? normalizeKeepAliveConfig({ ...DEFAULT_KEEP_ALIVE, ...p.keep_alive })
+        : { ...DEFAULT_KEEP_ALIVE },
+    );
+
     setShowAdvanced(false);
-    setSyncRclone(true);
+    // #67：通用算力模式下默认不要求/不同步 rclone.conf；仅接力或显式填写 Google Drive 权重路径时默认开启
+    setSyncRclone(initBootMode === "relay" || Boolean(initGdriveModel.trim()));
     setMountGdrive(false);
     setInstallReqTxt(false);
     setPipPackages("");
@@ -162,10 +280,110 @@ export function CreateVmDialog(props: {
     setStartupScript("");
   }, [props.open, props.preset, props.defaultWorkspace]);
 
+  const handleSelectBootMode = (nextMode: "general" | "llm" | "relay") => {
+    setBootMode(nextMode);
+    if (!userToggledSyncRcloneRef.current) {
+      if (nextMode === "relay") setSyncRclone(true);
+      else if (nextMode === "general") setSyncRclone(false);
+      else setSyncRclone(Boolean(gdriveModelPath.trim()));
+    }
+  };
+
   const selectedAcc = ACCELERATORS.find((a) => a.v === acc) ?? ACCELERATORS[0];
-  const effectiveHighMem = selectedAcc.singleShape ? false : resolveEffectiveHighMem(selectedAcc.v, highMem);
+  const effectiveHighMem = selectedAcc.singleShape
+    ? false
+    : resolveEffectiveHighMem(selectedAcc.v, highMem);
   const nameOk = isDeployExisting || name === "" || /^[A-Za-z0-9_-]{1,40}$/.test(name.trim());
-  const llmOk = (!isDeployExisting && bootMode !== "llm") || llmModel.trim().length > 0;
+  const isLlmFlow = isDeployExisting || bootMode === "llm";
+  const llmModelOk = !isLlmFlow || llmEngine === "builtin" || llmModel.trim().length > 0;
+
+  // #68：CUDA 推理预设与非 NVIDIA 硬件（CPU / TPU）兼容性检查
+  const llmHwCompatible = !isLlmFlow || isLlmEngineCompatibleWithAccelerator(llmEngine, acc);
+  const selectedEngineMeta = LLM_ENGINES.find((e) => e.v === llmEngine);
+
+  // #43：ADC / OAuth 凭证监控与停费核验守卫
+  const authGuard = !isDeployExisting
+    ? checkCreateVmAuthGuard(authMode, props.env)
+    : { blocked: false, level: "none" as const, message: null };
+
+  // #54：接力单棒时长上限校验（0.1 ~ 23.5h）
+  const isRelayFlow = !isDeployExisting && bootMode === "relay";
+  const relayHoursOk = !isRelayFlow || isValidRelaySessionHours(relayCfg.max_session_hours);
+  const relayGdriveFormatOk =
+    !isRelayFlow ||
+    (/^[A-Za-z0-9_-]{2,}:[^\\\s]+$/.test(relayCfg.gdrive_dir.trim()) &&
+      !relayCfg.gdrive_dir.trim().startsWith("-") &&
+      !relayCfg.gdrive_dir.includes(".."));
+
+  // #44：默认云盘目录隔离展示与运行中目录冲突拦截
+  const effectiveRelayGdrive = isRelayFlow
+    ? resolveEffectiveRelayGdriveDir(relayCfg.gdrive_dir, name.trim() || null)
+    : "";
+  const relayConflictVm = isRelayFlow
+    ? findConflictingRelayVm(relayCfg.gdrive_dir, name.trim() || null, props.vms ?? [])
+    : undefined;
+  const relayConflictBlocked = Boolean(relayConflictVm && !confirmReuseRelayGdrive);
+
+  // #67：当所选配置依赖 Google Drive / rclone.conf 且本机缺失授权时，在底部上方醒目提示（即使高级配置折叠）
+  const needsGdrive = requiresGdriveConfig({
+    isDeployExisting,
+    bootMode,
+    syncRclone,
+    mountGdrive,
+    gdriveModelPath,
+  });
+  const missingGdriveEnv = Boolean(
+    needsGdrive && props.env && (!props.env.rclone_ok || !props.env.rclone_conf_ok),
+  );
+
+  const keepAliveIntervalOk =
+    isDeployExisting ||
+    !keepAliveCfg.enabled ||
+    isValidKeepAliveInterval(keepAliveCfg.interval_seconds);
+
+  const parsedVmFallbacks = parseFallbackGpuInput(grabFallbacksRaw, acc);
+  const parsedRelayFallbacks = parseFallbackGpuInput(relayFallbacksRaw, acc);
+
+  const vmGrabRetryOk =
+    isDeployExisting ||
+    isRelayFlow ||
+    grabCfg.mode === "fast" ||
+    isValidGrabRetrySeconds(grabCfg.retry_seconds);
+  const vmGrabFallbacksOk =
+    isDeployExisting || isRelayFlow || parsedVmFallbacks.invalid.length === 0;
+
+  const relayGrabMode = relayCfg.grab_mode ?? "budget";
+  const relayGrabBudgetOk =
+    !isRelayFlow ||
+    relayGrabMode !== "budget" ||
+    isValidRelayGrabTimeoutMinutes(relayCfg.grab_timeout_minutes ?? 60);
+  const relayGrabRetryOk =
+    !isRelayFlow ||
+    relayGrabMode === "fast" ||
+    isValidGrabRetrySeconds(relayCfg.grab_retry_seconds ?? DEFAULT_RELAY_GRAB_RETRY_SECONDS);
+  const relayGrabFallbacksOk = !isRelayFlow || parsedRelayFallbacks.invalid.length === 0;
+
+  const liveCreatingVm =
+    busy && activeCreatingName
+      ? (props.vms ?? []).find((v) => v.name === activeCreatingName)
+      : undefined;
+  const liveGrabSummary = describeGrabStatus(liveCreatingVm?.grab_status, nowSec);
+
+  const canSubmit =
+    !busy &&
+    nameOk &&
+    llmModelOk &&
+    llmHwCompatible &&
+    !authGuard.blocked &&
+    relayHoursOk &&
+    relayGdriveFormatOk &&
+    !relayConflictBlocked &&
+    keepAliveIntervalOk &&
+    vmGrabRetryOk &&
+    vmGrabFallbacksOk &&
+    relayGrabBudgetOk &&
+    relayGrabRetryOk &&
+    relayGrabFallbacksOk;
 
   const copyError = async () => {
     if (!submitError) return;
@@ -178,10 +396,72 @@ export function CreateVmDialog(props: {
     }
   };
 
+  const handleCancelGrab = async () => {
+    if (!activeCreatingName || !props.onCancelCreate || cancellingCreate) return;
+    setCancellingCreate(true);
+    cancelledByUserRef.current = true;
+    try {
+      await props.onCancelCreate(activeCreatingName);
+      setSubmitError(null);
+    } catch (e) {
+      setSubmitError(errText(e));
+    } finally {
+      setCancellingCreate(false);
+    }
+  };
+
   const submit = async () => {
-    if (!nameOk || !llmOk || busy) return;
+    if (busy) return;
+    if (authGuard.blocked && authGuard.message) {
+      setSubmitError(authGuard.message);
+      return;
+    }
+    if (!llmHwCompatible) {
+      setSubmitError(
+        `推理引擎「${selectedEngineMeta?.label ?? llmEngine}」依赖 NVIDIA CUDA，无法在 ${acc} 上运行。请切换为 NVIDIA GPU 或改用兼容引擎（如 Ollama）。`,
+      );
+      return;
+    }
+    if (!relayHoursOk) {
+      setSubmitError(
+        `接力单棒时长必须在 ${MIN_RELAY_SESSION_HOURS} ~ ${MAX_RELAY_SESSION_HOURS} 小时之间（受限于 Colab 单次最长运行周期）。`,
+      );
+      return;
+    }
+    if (relayConflictBlocked && relayConflictVm) {
+      setSubmitError(
+        `云盘目录 ${effectiveRelayGdrive} 正被运行中的接力任务 [${relayConflictVm.name}] 占用，请更换目录或勾选显式确认续训。`,
+      );
+      return;
+    }
+    if (!keepAliveIntervalOk) {
+      setSubmitError(
+        `连接检查间隔必须在 ${MIN_KEEP_ALIVE_INTERVAL_SECONDS} ~ ${MAX_KEEP_ALIVE_INTERVAL_SECONDS} 秒之间。`,
+      );
+      return;
+    }
+    if (!vmGrabRetryOk || !relayGrabRetryOk) {
+      setSubmitError(
+        `抢卡重试间隔必须在 ${MIN_GRAB_RETRY_SECONDS} ~ ${MAX_GRAB_RETRY_SECONDS} 秒之间。`,
+      );
+      return;
+    }
+    if (!relayGrabBudgetOk) {
+      setSubmitError("接力抢卡等待上限必须在 1 ~ 1440 分钟（24 小时）之间。");
+      return;
+    }
+    if (!vmGrabFallbacksOk || !relayGrabFallbacksOk) {
+      const badList = isRelayFlow ? parsedRelayFallbacks.invalid : parsedVmFallbacks.invalid;
+      setSubmitError(
+        `不支持的备选硬件型号：${badList.join(", ")}（可选值：T4, L4, G4, A100, H100, V5E1, V6E1, CPU）。`,
+      );
+      return;
+    }
+    if (!nameOk || !llmModelOk || !relayGdriveFormatOk) return;
+
     setSubmitError(null);
     setCopiedError(false);
+    cancelledByUserRef.current = false;
     setBusy(true);
     try {
       if (isDeployExisting && targetExistingVm) {
@@ -195,12 +475,16 @@ export function CreateVmDialog(props: {
           gdrive_model_path: gdriveModelPath.trim() || null,
           custom_api_key: customApiKey.trim() || null,
         });
-        props.onClose();
+        if (openRef.current) props.onClose();
         return;
       }
 
+      const concreteName =
+        name.trim() || `vm-${Math.random().toString(36).slice(2, 8).padEnd(6, "0")}`;
+      setActiveCreatingName(concreteName);
+
       const req: CreateVmRequest = {
-        name: name.trim() || null,
+        name: concreteName,
         accelerator: acc,
         high_mem: effectiveHighMem,
         auth_mode: authMode,
@@ -212,8 +496,17 @@ export function CreateVmDialog(props: {
           bootMode === "relay"
             ? {
                 ...relayCfg,
-                gpu_type: acc === "CPU" ? "T4" : acc,
+                // #52：严格保留用户选择的硬件规格（包括 "CPU"），绝不静默篡改为 "T4"
+                gpu_type: acc,
                 high_mem: effectiveHighMem,
+                grab_mode: relayGrabMode,
+                grab_timeout_minutes: Number.isFinite(relayCfg.grab_timeout_minutes)
+                  ? Math.round(relayCfg.grab_timeout_minutes ?? 60)
+                  : 60,
+                grab_retry_seconds: Number.isFinite(relayCfg.grab_retry_seconds)
+                  ? Math.round(relayCfg.grab_retry_seconds ?? DEFAULT_RELAY_GRAB_RETRY_SECONDS)
+                  : DEFAULT_RELAY_GRAB_RETRY_SECONDS,
+                fallback_gpus: parsedRelayFallbacks.gpus,
               }
             : null,
         llm_config:
@@ -234,14 +527,31 @@ export function CreateVmDialog(props: {
           startup_script: startupScript.trim() || null,
           env_vars: envVars.trim() || null,
         },
+        keep_alive: normalizeKeepAliveConfig(keepAliveCfg),
+        grab_config: {
+          mode: grabCfg.mode,
+          retry_seconds: Number.isFinite(grabCfg.retry_seconds)
+            ? Math.round(grabCfg.retry_seconds)
+            : DEFAULT_VM_GRAB_RETRY_SECONDS,
+          fallback_gpus: parsedVmFallbacks.gpus,
+        },
       };
       await props.onCreate(req);
-      setName("");
-      props.onClose();
+      if (openRef.current) {
+        setName("");
+        props.onClose();
+      }
     } catch (e) {
-      setSubmitError(errText(e));
+      const msg = errText(e);
+      if (cancelledByUserRef.current || msg.includes("放弃抢卡")) {
+        if (openRef.current) setSubmitError(null);
+      } else if (openRef.current) {
+        setSubmitError(msg);
+      }
     } finally {
       setBusy(false);
+      setActiveCreatingName(null);
+      setCancellingCreate(false);
     }
   };
 
@@ -260,7 +570,7 @@ export function CreateVmDialog(props: {
       }
       sub={
         isDeployExisting
-          ? "复用当前已运行的云端算力实例拉取模型权重并启动推理引擎，自动生成专属 OpenAI API 与 Key"
+          ? `复用当前已运行的云端算力实例 (${acc}) 拉取模型权重并启动推理引擎，自动生成专属 OpenAI API 与 Key`
           : "自由选择 GPU / TPU / CPU 与全量 Colab 运行时配置 · 自动为每台实例提供免密 SSH，并为大模型实例生成专属 OpenAI API 与 Key"
       }
       footer={
@@ -277,7 +587,7 @@ export function CreateVmDialog(props: {
             ) : (
               <>
                 <Terminal size={13} />
-                <span>开机后自动分配 SSH 端口与免密密钥</span>
+                <span>分配成功后即刻关闭弹窗并在后台注入监控与 SSH</span>
                 {bootMode === "llm" && (
                   <>
                     <span>·</span>
@@ -288,21 +598,57 @@ export function CreateVmDialog(props: {
               </>
             )}
           </div>
-          <button type="button" className="btn" onClick={props.onClose} disabled={busy}>
-            取消
-          </button>
+          {busy && !isDeployExisting ? (
+            <>
+              <button
+                type="button"
+                className="btn"
+                onClick={props.onClose}
+                title="关闭此弹窗，继续在仪表盘实例卡片上后台抢卡（卡片上同样可随时放弃抢卡）"
+              >
+                转入后台抢卡
+              </button>
+              {props.onCancelCreate && activeCreatingName && (
+                <button
+                  type="button"
+                  className="btn btn-danger"
+                  onClick={handleCancelGrab}
+                  disabled={cancellingCreate}
+                  title="立即中止当前抢卡进程并核验释放残留实例"
+                >
+                  {cancellingCreate ? (
+                    <>
+                      <Loader2 size={14} className="spin" />
+                      <span>正在停止抢卡…</span>
+                    </>
+                  ) : (
+                    <>
+                      <PowerOff size={14} />
+                      <span>放弃抢卡</span>
+                    </>
+                  )}
+                </button>
+              )}
+            </>
+          ) : (
+            <button type="button" className="btn" onClick={props.onClose} disabled={busy}>
+              取消
+            </button>
+          )}
           <button
             type="button"
             className="btn btn-primary"
             onClick={submit}
-            disabled={busy || !nameOk || !llmOk}
+            disabled={!canSubmit}
           >
             {busy ? (
               <>
                 <Loader2 size={15} className="spin" />
                 {isDeployExisting
                   ? "正在提交云端大模型部署任务…"
-                  : "正在云端分配并初始化（约 15–60 秒）…"}
+                  : liveGrabSummary?.countdownSec !== null && liveGrabSummary?.countdownSec !== undefined
+                    ? `${liveGrabSummary.countdownSec}s 后自动重试抢卡…`
+                    : `正在抢卡分配 (${activeCreatingName ?? acc})…`}
               </>
             ) : isDeployExisting ? (
               <>
@@ -316,13 +662,43 @@ export function CreateVmDialog(props: {
                   ? `开机并部署大模型 (${acc})`
                   : bootMode === "relay"
                     ? `开机并启动接力训练 (${acc})`
-                    : `立即开机 (${acc})`}
+                    : grabCfg.mode === "persistent"
+                      ? `开始一直抢卡 (${acc})`
+                      : `立即开机 (${acc})`}
               </>
             )}
           </button>
         </>
       }
     >
+      {/* 实时抢卡状态面板：在弹窗等待期间直观展示抢卡轮次、倒计时与一键放弃/转后台按钮 */}
+      {busy && !isDeployExisting && (
+        <div className="banner banner-info" role="status" style={{ margin: 0, alignItems: "center" }}>
+          <Loader2 size={16} className="spin" style={{ flexShrink: 0 }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700 }}>
+              {liveGrabSummary
+                ? liveGrabSummary.headline
+                : `正在向 Google Colab 请求分配 [${acc}] 实例 (${activeCreatingName ?? ""})…`}
+            </div>
+            <div style={{ fontSize: 12, marginTop: 2, opacity: 0.9 }}>
+              {liveGrabSummary
+                ? liveGrabSummary.subline
+                : "单次请求无库存时约 25 秒内立即反馈；获得实例后将自动关闭弹窗并在后台完成初始化。"}
+            </div>
+          </div>
+        </div>
+      )}
+      {/* #74：无持久化工作模式档案的历史会话提示 */}
+      {historyUnverifiedNotice && !isDeployExisting && (
+        <div className="banner banner-warn" role="status" style={{ margin: 0 }}>
+          <History size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+          <div>
+            <b>该历史记录仅复用了会话名称与硬件规格，请确认所需的工作模式与参数</b>
+          </div>
+        </div>
+      )}
+
       {submitError && (
         <div className="banner banner-danger modal-inline-error" role="alert">
           <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
@@ -355,7 +731,7 @@ export function CreateVmDialog(props: {
               <button
                 type="button"
                 className={`boot-mode-tab ${bootMode === "general" ? "sel" : ""}`}
-                onClick={() => setBootMode("general")}
+                onClick={() => handleSelectBootMode("general")}
               >
                 <div className="boot-mode-tab-head">
                   <Terminal size={15} />
@@ -369,7 +745,7 @@ export function CreateVmDialog(props: {
               <button
                 type="button"
                 className={`boot-mode-tab ${bootMode === "llm" ? "sel" : ""}`}
-                onClick={() => setBootMode("llm")}
+                onClick={() => handleSelectBootMode("llm")}
               >
                 <div className="boot-mode-tab-head">
                   <Sparkles size={15} />
@@ -383,7 +759,7 @@ export function CreateVmDialog(props: {
               <button
                 type="button"
                 className={`boot-mode-tab ${bootMode === "relay" ? "sel" : ""}`}
-                onClick={() => setBootMode("relay")}
+                onClick={() => handleSelectBootMode("relay")}
               >
                 <div className="boot-mode-tab-head">
                   <Repeat2 size={15} />
@@ -491,7 +867,7 @@ export function CreateVmDialog(props: {
                   style={{ flex: 1 }}
                   className={authMode === "oauth2" ? "sel" : ""}
                   onClick={() => setAuthMode("oauth2")}
-                  title="使用 Google OAuth2 账号令牌"
+                  title="使用 Google OAuth2 账号令牌（通过 colab auth 授权）"
                 >
                   OAuth2 账号
                 </button>
@@ -500,18 +876,32 @@ export function CreateVmDialog(props: {
                   style={{ flex: 1 }}
                   className={authMode === "adc" ? "sel" : ""}
                   onClick={() => setAuthMode("adc")}
-                  title="使用 Google Cloud Application Default Credentials"
+                  title="使用 Google Cloud Application Default Credentials（监控与停费核验仍需 colab auth）"
                 >
                   ADC 凭证
                 </button>
               </div>
             </div>
           </div>
+
+          {/* #43 & #75：ADC / 未登录 Colab OAuth 限制与引导警告 */}
+          {authGuard.message && (
+            <div
+              className={`banner ${authGuard.blocked ? "banner-danger" : "banner-warn"}`}
+              role="alert"
+              style={{ margin: 0 }}
+            >
+              <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+              <div style={{ flex: 1 }}>
+                <div>{authGuard.message}</div>
+              </div>
+            </div>
+          )}
         </>
       )}
 
       {/* 4. 模式专属配置区：大模型 API/Key 配置 或 24h+ 接力训练配置 */}
-      {(isDeployExisting || bootMode === "llm") && (
+      {isLlmFlow && (
         <div className="cfg-panel cfg-panel-llm">
           <div className="cfg-panel-head">
             <span className="cfg-panel-title">
@@ -521,15 +911,57 @@ export function CreateVmDialog(props: {
             <span className="cfg-panel-badge">OpenAI 兼容 `/v1/chat/completions`</span>
           </div>
 
+          {/* #68：CUDA 推理预设与 CPU/TPU 不兼容拦截提示 */}
+          {!llmHwCompatible && (
+            <div className="banner banner-danger" role="alert" style={{ margin: 0, alignItems: "center" }}>
+              <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 700 }}>
+                  硬件不兼容：推理引擎「{selectedEngineMeta?.label ?? llmEngine}」依赖 NVIDIA CUDA
+                </div>
+                <div style={{ fontSize: 12, marginTop: 2 }}>
+                  当前所选硬件为 <b>{acc}</b>（非 NVIDIA GPU），无法运行 CUDA 推理预设。请切换为 NVIDIA GPU（如 T4 / L4 / A100）或改用兼容引擎（如 Ollama）。
+                </div>
+              </div>
+              <div style={{ display: "inline-flex", gap: 6, flexWrap: "wrap" }}>
+                {!isDeployExisting && (
+                  <button type="button" className="btn btn-sm" onClick={() => setAcc("T4")}>
+                    切换硬件至 T4
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => {
+                    setLlmEngine("ollama");
+                    if (llmModel.toLowerCase().includes("gguf")) {
+                      setLlmModel("qwen2.5:7b");
+                    }
+                  }}
+                >
+                  切换至 Ollama
+                </button>
+              </div>
+            </div>
+          )}
+
           <div className="form-grid-2">
             <div className="field">
               <label>推理引擎 (Engine)</label>
-              <select value={llmEngine} onChange={(e) => setLlmEngine(e.target.value)}>
-                {LLM_ENGINES.map((eng) => (
-                  <option key={eng.v} value={eng.v}>
-                    {eng.label} — {eng.desc}
-                  </option>
-                ))}
+              <select
+                value={llmEngine}
+                onChange={(e) => setLlmEngine(e.target.value)}
+                style={!llmHwCompatible ? { borderColor: "var(--danger)" } : undefined}
+              >
+                {LLM_ENGINES.map((eng) => {
+                  const compatible = isLlmEngineCompatibleWithAccelerator(eng.v, acc);
+                  return (
+                    <option key={eng.v} value={eng.v} disabled={!compatible}>
+                      {eng.label}
+                      {!compatible ? `（需 NVIDIA GPU，不支持 ${acc}）` : ` — ${eng.desc}`}
+                    </option>
+                  );
+                })}
               </select>
             </div>
 
@@ -568,19 +1000,29 @@ export function CreateVmDialog(props: {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
               <label>模型 ID（HuggingFace 仓库 / GGUF 路径 / Ollama 模型名）</label>
               <div className="preset-pills">
-                {MODEL_PRESETS.map((p) => (
-                  <button
-                    type="button"
-                    key={p.label}
-                    className={`preset-pill ${llmModel === p.value ? "active" : ""}`}
-                    onClick={() => {
-                      setLlmModel(p.value);
-                      setLlmEngine(p.engine);
-                    }}
-                  >
-                    {p.label}
-                  </button>
-                ))}
+                {MODEL_PRESETS.map((p) => {
+                  const presetOk = isLlmEngineCompatibleWithAccelerator(p.engine, acc);
+                  return (
+                    <button
+                      type="button"
+                      key={p.label}
+                      disabled={!presetOk}
+                      className={`preset-pill ${llmModel === p.value ? "active" : ""}`}
+                      title={
+                        presetOk
+                          ? `选用预设模型 ${p.value} (${p.engine})`
+                          : `该预设使用 ${p.engine}（需 NVIDIA CUDA GPU），不支持当前硬件 ${acc}`
+                      }
+                      onClick={() => {
+                        if (!presetOk) return;
+                        setLlmModel(p.value);
+                        setLlmEngine(p.engine);
+                      }}
+                    >
+                      {p.label}
+                    </button>
+                  );
+                })}
               </div>
             </div>
             <input
@@ -605,21 +1047,27 @@ export function CreateVmDialog(props: {
               <input
                 value={gdriveModelPath}
                 placeholder="例如 gdrive:models/qwen2.5-7b-gguf（留空直接从云端拉取）"
-                onChange={(e) => setGdriveModelPath(e.target.value)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setGdriveModelPath(v);
+                  if (!userToggledSyncRcloneRef.current) {
+                    setSyncRclone(Boolean(v.trim()));
+                  }
+                }}
               />
             </div>
           </div>
         </div>
       )}
 
-      {!isDeployExisting && bootMode === "relay" && (
+      {isRelayFlow && (
         <div className="cfg-panel cfg-panel-relay">
           <div className="cfg-panel-head">
             <span className="cfg-panel-title">
               <Repeat2 size={14} />
               24h+ 跨实例自动接力训练配置
             </span>
-            <span className="cfg-panel-badge">自动断点热备与换棒</span>
+            <span className="cfg-panel-badge">换棒硬件: {acc} · 自动断点热备</span>
           </div>
 
           <div className="form-grid-4">
@@ -635,16 +1083,19 @@ export function CreateVmDialog(props: {
               />
             </div>
             <div className="field">
-              <label>单棒上限时长 (小时)</label>
+              <label>单棒上限时长 (0.1~23.5h)</label>
               <input
                 type="number"
                 step={0.5}
-                min={0.5}
-                max={24}
-                value={relayCfg.max_session_hours}
-                onChange={(e) =>
-                  setRelayCfg({ ...relayCfg, max_session_hours: Number(e.target.value) || 22.5 })
-                }
+                min={MIN_RELAY_SESSION_HOURS}
+                max={MAX_RELAY_SESSION_HOURS}
+                value={Number.isFinite(relayCfg.max_session_hours) ? relayCfg.max_session_hours : ""}
+                style={!relayHoursOk ? { borderColor: "var(--danger)" } : undefined}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  const v = raw === "" ? Number.NaN : Number(raw);
+                  setRelayCfg({ ...relayCfg, max_session_hours: v });
+                }}
               />
             </div>
             <div className="field">
@@ -662,10 +1113,194 @@ export function CreateVmDialog(props: {
               <label>Google Drive 断点目录</label>
               <input
                 value={relayCfg.gdrive_dir}
-                onChange={(e) => setRelayCfg({ ...relayCfg, gdrive_dir: e.target.value })}
+                style={!relayGdriveFormatOk ? { borderColor: "var(--danger)" } : undefined}
+                onChange={(e) => {
+                  setRelayCfg({ ...relayCfg, gdrive_dir: e.target.value });
+                  setConfirmReuseRelayGdrive(false);
+                }}
               />
             </div>
           </div>
+
+          {!relayHoursOk && (
+            <div className="field-err">
+              受限于 Colab 单次最长运行周期，单棒上限时长必须在 {MIN_RELAY_SESSION_HOURS} ~ {MAX_RELAY_SESSION_HOURS} 小时之间。
+            </div>
+          )}
+
+          {relayHoursOk && relayCfg.max_session_hours > RECOMMENDED_MAX_RELAY_SESSION_HOURS && (
+            <div className="vm-alert-box vm-alert-warn" role="status" style={{ alignItems: "center" }}>
+              <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+              <div className="vm-alert-content">
+                <div className="vm-alert-title">
+                  建议预留 ≥1.5h 换棒安全缓冲窗口（当前距 24h 强制断连仅剩 {(24 - relayCfg.max_session_hours).toFixed(1)}h）
+                </div>
+                <div className="vm-alert-desc">
+                  预留充足缓冲可确保大模型权重完整落盘并上传至 Google Drive，防止在最后一刻被硬性回收。
+                </div>
+              </div>
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() =>
+                  setRelayCfg({ ...relayCfg, max_session_hours: RECOMMENDED_MAX_RELAY_SESSION_HOURS })
+                }
+              >
+                设为推荐 22.5h
+              </button>
+            </div>
+          )}
+
+          {/* 接力换棒抢卡时间与准备策略 */}
+          <div className="grab-policy-subbox">
+            <div className="field" style={{ marginBottom: 6 }}>
+              <label style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                <span>换棒抢卡策略与时间预算（换棒排队期间上一棒已停机释放，0 CU 计费）</span>
+                <span className="dim" style={{ fontWeight: 500 }}>
+                  停机前自动核验并抢救同步网盘断点
+                </span>
+              </label>
+              <div className="seg" style={{ marginTop: 4 }}>
+                <button
+                  type="button"
+                  className={relayGrabMode === "budget" ? "sel" : ""}
+                  onClick={() => setRelayCfg({ ...relayCfg, grab_mode: "budget" })}
+                >
+                  ⏱️ 限时蹲守（默认 {relayCfg.grab_timeout_minutes ?? 60}m）
+                </button>
+                <button
+                  type="button"
+                  className={relayGrabMode === "persistent" ? "sel" : ""}
+                  onClick={() => setRelayCfg({ ...relayCfg, grab_mode: "persistent" })}
+                >
+                  🎯 一直抢卡（直到有卡）
+                </button>
+                <button
+                  type="button"
+                  className={relayGrabMode === "fast" ? "sel" : ""}
+                  onClick={() => setRelayCfg({ ...relayCfg, grab_mode: "fast" })}
+                >
+                  ⚡ 单次探卡（无卡立停）
+                </button>
+              </div>
+            </div>
+
+            <div className="form-grid-3">
+              {relayGrabMode === "budget" && (
+                <div className="field">
+                  <label>每棒抢卡等待上限 (分钟)</label>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                    <input
+                      type="number"
+                      min={1}
+                      max={1440}
+                      value={
+                        Number.isFinite(relayCfg.grab_timeout_minutes)
+                          ? relayCfg.grab_timeout_minutes
+                          : ""
+                      }
+                      style={
+                        !relayGrabBudgetOk
+                          ? { borderColor: "var(--danger)", width: 82 }
+                          : { width: 82 }
+                      }
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        setRelayCfg({
+                          ...relayCfg,
+                          grab_timeout_minutes: raw === "" ? Number.NaN : Number(raw),
+                        });
+                      }}
+                    />
+                    <div className="preset-pills">
+                      {[30, 60, 180, 360].map((m) => (
+                        <button
+                          type="button"
+                          key={m}
+                          className={`preset-pill ${(relayCfg.grab_timeout_minutes ?? 60) === m ? "active" : ""}`}
+                          onClick={() => setRelayCfg({ ...relayCfg, grab_timeout_minutes: m })}
+                        >
+                          {m >= 60 ? `${m / 60}h` : `${m}m`}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {relayGrabMode !== "fast" && (
+                <div className="field">
+                  <label>抢卡重试间隔 ({MIN_GRAB_RETRY_SECONDS}~{MAX_GRAB_RETRY_SECONDS}s)</label>
+                  <input
+                    type="number"
+                    min={MIN_GRAB_RETRY_SECONDS}
+                    max={MAX_GRAB_RETRY_SECONDS}
+                    value={
+                      Number.isFinite(relayCfg.grab_retry_seconds)
+                        ? relayCfg.grab_retry_seconds
+                        : ""
+                    }
+                    style={!relayGrabRetryOk ? { borderColor: "var(--danger)" } : undefined}
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      setRelayCfg({
+                        ...relayCfg,
+                        grab_retry_seconds: raw === "" ? Number.NaN : Number(raw),
+                      });
+                    }}
+                  />
+                </div>
+              )}
+
+              <div className="field" style={{ gridColumn: relayGrabMode === "fast" ? "1 / -1" : undefined }}>
+                <label>换棒备选卡型（可选，逗号分隔如 G4, L4；留空严格只抢 {acc}）</label>
+                <input
+                  value={relayFallbacksRaw}
+                  placeholder={`留空严格只抢 [${acc}]；如填 G4, L4 则在主卡售罄时轮询备选卡`}
+                  style={!relayGrabFallbacksOk ? { borderColor: "var(--danger)" } : undefined}
+                  onChange={(e) => setRelayFallbacksRaw(e.target.value)}
+                />
+              </div>
+            </div>
+
+            {!relayGrabFallbacksOk && (
+              <div className="field-err">
+                存在不支持的备选硬件：{parsedRelayFallbacks.invalid.join(", ")}
+              </div>
+            )}
+          </div>
+
+          {isDefaultBareGdriveDir(relayCfg.gdrive_dir) && (
+            <div className="field-hint">
+              默认目录将自动按实例子目录隔离为：
+              <code>
+                gdrive:colab_relay/{name.trim() ? sanitizeRelayVmSegment(name) : "<实例名>"}
+              </code>
+              （防止多个默认接力任务共用 checkpoint 与完成标记）
+            </div>
+          )}
+
+          {relayConflictVm && (
+            <div className="vm-alert-box vm-alert-warn" role="alert">
+              <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 2 }} />
+              <div className="vm-alert-content">
+                <div className="vm-alert-title">
+                  云盘目录 <code>{effectiveRelayGdrive}</code> 正被运行中的接力实例 [{relayConflictVm.name}] 占用
+                </div>
+                <div className="vm-alert-desc">
+                  多任务共用同一目录会互相覆盖断点与完成标记，建议修改为独立目录。
+                </div>
+                <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginTop: 5, cursor: "pointer" }}>
+                  <input
+                    type="checkbox"
+                    checked={confirmReuseRelayGdrive}
+                    onChange={(e) => setConfirmReuseRelayGdrive(e.target.checked)}
+                  />
+                  <span>我已知晓风险，显式确认复用该云盘目录续训</span>
+                </label>
+              </div>
+            </div>
+          )}
 
           <label style={{ display: "inline-flex", alignItems: "center", gap: 7, fontSize: 12, cursor: "pointer" }}>
             <input
@@ -674,8 +1309,206 @@ export function CreateVmDialog(props: {
               onChange={(e) => setRelayCfg({ ...relayCfg, reset_done_flag: e.target.checked })}
               style={{ accentColor: "var(--primary)" }}
             />
-            <span>启动前清除云盘上的 `training_done.flag`（从头或继续训练）</span>
+            <span>启动前清除云盘上的完成标记（从头训练）</span>
           </label>
+        </div>
+      )}
+
+      {!isDeployExisting && !isRelayFlow && (
+        /* 4.2 开机抢卡策略（支持快速探卡 / 标准重试 / 一直抢卡 + 随时放弃抢卡） */
+        <div className="cfg-panel cfg-panel-grab">
+          <div className="cfg-panel-head">
+            <span className="cfg-panel-title">
+              <Zap size={14} color="var(--primary)" />
+              开机抢卡策略（无卡快速反馈 / 一直抢卡蹲守 / 随时可放弃）
+            </span>
+            <span className="cfg-panel-badge">
+              {grabCfg.mode === "persistent"
+                ? "一直抢卡直到成功"
+                : grabCfg.mode === "standard"
+                  ? "标准重试 3 轮"
+                  : "快速探卡·没卡立报"}
+            </span>
+          </div>
+
+          <div className="seg">
+            <button
+              type="button"
+              className={grabCfg.mode === "fast" ? "sel" : ""}
+              onClick={() => setGrabCfg((prev) => ({ ...prev, mode: "fast" }))}
+            >
+              ⚡ 快速探卡（没卡约 25s 立报）
+            </button>
+            <button
+              type="button"
+              className={grabCfg.mode === "standard" ? "sel" : ""}
+              onClick={() => setGrabCfg((prev) => ({ ...prev, mode: "standard" }))}
+            >
+              🔁 标准重试（自动尝试 3 轮）
+            </button>
+            <button
+              type="button"
+              className={grabCfg.mode === "persistent" ? "sel" : ""}
+              onClick={() => setGrabCfg((prev) => ({ ...prev, mode: "persistent" }))}
+            >
+              🎯 一直抢卡（持续蹲守直到有卡）
+            </button>
+          </div>
+
+          <div className="form-grid-2" style={{ marginTop: 4 }}>
+            {grabCfg.mode !== "fast" && (
+              <div className="field">
+                <label>抢卡重试间隔 ({MIN_GRAB_RETRY_SECONDS}~{MAX_GRAB_RETRY_SECONDS}s)</label>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                  <input
+                    type="number"
+                    min={MIN_GRAB_RETRY_SECONDS}
+                    max={MAX_GRAB_RETRY_SECONDS}
+                    value={Number.isFinite(grabCfg.retry_seconds) ? grabCfg.retry_seconds : ""}
+                    style={!vmGrabRetryOk ? { borderColor: "var(--danger)", width: 84 } : { width: 84 }}
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      setGrabCfg((prev) => ({
+                        ...prev,
+                        retry_seconds: raw === "" ? Number.NaN : Number(raw),
+                      }));
+                    }}
+                  />
+                  <div className="preset-pills">
+                    {[10, 15, 30, 60].map((sec) => (
+                      <button
+                        type="button"
+                        key={sec}
+                        className={`preset-pill ${grabCfg.retry_seconds === sec ? "active" : ""}`}
+                        onClick={() => setGrabCfg((prev) => ({ ...prev, retry_seconds: sec }))}
+                      >
+                        {sec}s
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div className="field" style={{ gridColumn: grabCfg.mode === "fast" ? "1 / -1" : undefined }}>
+              <label>备选卡型（可选，逗号分隔如 G4, L4；留空严格只抢 {acc}）</label>
+              <input
+                value={grabFallbacksRaw}
+                placeholder={`留空严格只抢 [${acc}]；如填 G4, L4 则在 [${acc}] 售罄时自动轮询`}
+                style={!vmGrabFallbacksOk ? { borderColor: "var(--danger)" } : undefined}
+                onChange={(e) => setGrabFallbacksRaw(e.target.value)}
+              />
+            </div>
+          </div>
+
+          {!vmGrabFallbacksOk && (
+            <div className="field-err">
+              存在不支持的备选硬件：{parsedVmFallbacks.invalid.join(", ")}
+            </div>
+          )}
+
+          <div className="field-hint">
+            {grabCfg.mode === "persistent"
+              ? `将每 ${Number.isFinite(grabCfg.retry_seconds) ? Math.round(grabCfg.retry_seconds) : DEFAULT_VM_GRAB_RETRY_SECONDS}s 循环请求 [${acc}]，期间可点击「转入后台抢卡」收起弹窗，或在弹窗/卡片上随时点击「放弃抢卡」立即停止。`
+              : grabCfg.mode === "standard"
+                ? `若遇到库存紧张或拥堵，将自动重试最多 3 轮（间隔 ${Number.isFinite(grabCfg.retry_seconds) ? Math.round(grabCfg.retry_seconds) : DEFAULT_VM_GRAB_RETRY_SECONDS}s），期间随时可点击「放弃抢卡」。`
+                : `已移除内部 3 分 15 秒静默退避重试：有卡时即刻分配并秒关弹窗；无卡 (503) 时约 25 秒内立即报错，方便快速切换卡型。`}
+          </div>
+        </div>
+      )}
+
+      {!isDeployExisting && (
+        /* 4.5 实例保活策略（只要创建实例，统一配置保活策略） */
+        <div className={`cfg-panel cfg-panel-keepalive ${keepAliveCfg.enabled ? "is-on" : "is-off"}`}>
+          <div className="cfg-panel-head">
+            <span className="cfg-panel-title">
+              <HeartPulse size={14} color={keepAliveCfg.enabled ? "var(--success)" : "var(--muted)"} />
+              实例保活策略
+            </span>
+            <label className="ka-inline-switch">
+              <input
+                type="checkbox"
+                checked={keepAliveCfg.enabled}
+                onChange={(e) =>
+                  setKeepAliveCfg((prev) =>
+                    normalizeKeepAliveConfig({ ...prev, enabled: e.target.checked }),
+                  )
+                }
+                style={{ accentColor: "var(--success)" }}
+              />
+              <span>{keepAliveCfg.enabled ? "开机后自动检查运行时连接" : "暂不开启（手动控制）"}</span>
+            </label>
+          </div>
+
+          <div className="ka-create-row">
+            <div className="field" style={{ minWidth: 165 }}>
+              <label>连接检查间隔 ({MIN_KEEP_ALIVE_INTERVAL_SECONDS}~{MAX_KEEP_ALIVE_INTERVAL_SECONDS}s)</label>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <input
+                  type="number"
+                  min={MIN_KEEP_ALIVE_INTERVAL_SECONDS}
+                  max={MAX_KEEP_ALIVE_INTERVAL_SECONDS}
+                  step={10}
+                  disabled={!keepAliveCfg.enabled}
+                  value={Number.isFinite(keepAliveCfg.interval_seconds) ? keepAliveCfg.interval_seconds : ""}
+                  style={!keepAliveIntervalOk ? { borderColor: "var(--danger)", width: 88 } : { width: 88 }}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    const v = raw === "" ? Number.NaN : Number(raw);
+                    setKeepAliveCfg((prev) => ({ ...prev, interval_seconds: v }));
+                  }}
+                />
+                <div className="preset-pills">
+                  {KEEP_ALIVE_PRESET_INTERVALS.map((sec) => (
+                    <button
+                      type="button"
+                      key={sec}
+                      disabled={!keepAliveCfg.enabled}
+                      className={`preset-pill ${keepAliveCfg.interval_seconds === sec ? "active" : ""}`}
+                      onClick={() =>
+                        setKeepAliveCfg((prev) => ({ ...prev, interval_seconds: sec }))
+                      }
+                    >
+                      {sec}s
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <label
+              className="ka-kernel-opt"
+              style={{ opacity: keepAliveCfg.enabled ? 1 : 0.55 }}
+            >
+              <input
+                type="checkbox"
+                disabled={!keepAliveCfg.enabled}
+                checked={keepAliveCfg.kernel_ping}
+                onChange={(e) =>
+                  setKeepAliveCfg((prev) => ({ ...prev, kernel_ping: e.target.checked }))
+                }
+                style={{ accentColor: "var(--primary)" }}
+              />
+              <div>
+                <div className="t">启用轻量 Jupyter Kernel 脉冲心跳（<code>pass</code>）</div>
+                <div className="d">
+                  仅在 Kernel 空闲时发送脉冲，任务运行时自动跳过。
+                </div>
+              </div>
+            </label>
+          </div>
+
+          {!keepAliveIntervalOk && (
+            <div className="field-err">
+              连接检查间隔必须在 {MIN_KEEP_ALIVE_INTERVAL_SECONDS} ~ {MAX_KEEP_ALIVE_INTERVAL_SECONDS} 秒之间。
+            </div>
+          )}
+
+          <div className="field-hint" style={{ marginTop: 2 }}>
+            {keepAliveCfg.enabled
+              ? `开机后每 ${Number.isFinite(keepAliveCfg.interval_seconds) ? Math.round(keepAliveCfg.interval_seconds) : DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS} 秒检查运行时连接${keepAliveCfg.kernel_ping ? "，并在 Kernel 空闲时发送脉冲" : ""}。`
+              : "可在实例卡片上开启运行时连接检查。"}
+          </div>
         </div>
       )}
 
@@ -737,14 +1570,17 @@ export function CreateVmDialog(props: {
                   <input
                     type="checkbox"
                     checked={syncRclone}
-                    onChange={(e) => setSyncRclone(e.target.checked)}
+                    onChange={(e) => {
+                      userToggledSyncRcloneRef.current = true;
+                      setSyncRclone(e.target.checked);
+                    }}
                     style={{ accentColor: "var(--primary)" }}
                   />
                   <div>
                     <div className="t">
                       <HardDrive size={13} /> 自动同步本机 `rclone.conf` 到云端 `/content/rclone.conf`
                     </div>
-                    <div className="d">使云端实例无需重新授权即可高速读写 Google Drive</div>
+                    <div className="d">使云端实例无需重新授权即可高速读写 Google Drive（通用模式下默认关闭）</div>
                   </div>
                 </label>
 
@@ -785,11 +1621,13 @@ export function CreateVmDialog(props: {
                   />
                 </div>
 
+                {/* #69：多行环境变量输入框，与每行一个 KEY=VALUE 提示及后端按行解析严格对齐 */}
                 <div className="field">
                   <label>注入环境变量（每行一个 `KEY=VALUE`）</label>
-                  <input
+                  <textarea
+                    rows={3}
                     value={envVars}
-                    placeholder="例如 HF_TOKEN=hf_xxx  WANDB_API_KEY=xxx"
+                    placeholder={"例如：\nHF_TOKEN=hf_xxx\nWANDB_API_KEY=xxx"}
                     onChange={(e) => setEnvVars(e.target.value)}
                   />
                 </div>
@@ -805,6 +1643,34 @@ export function CreateVmDialog(props: {
                 />
               </div>
             </div>
+          )}
+        </div>
+      )}
+
+      {/* #67：无论高级配置是否折叠，只要当前配置依赖 Google Drive 而本机缺少 rclone.conf，即在提交按钮上方醒目提示 */}
+      {missingGdriveEnv && (
+        <div className="banner banner-warn" role="alert" style={{ margin: 0, alignItems: "center" }}>
+          <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700 }}>当前配置依赖 Google Drive（rclone.conf）授权</div>
+            <div style={{ fontSize: 12, marginTop: 2 }}>
+              {!props.env?.rclone_ok
+                ? `未检测到 rclone 可执行文件（${props.env?.rclone_bin ?? "rclone"}）。`
+                : `未检测到本机 rclone 授权配置文件（${props.env?.rclone_conf ?? "rclone.conf"}）。请先在终端运行 rclone config 完成 Google Drive 授权，或关闭网盘同步选项。`}
+            </div>
+          </div>
+          {!isDeployExisting && bootMode !== "relay" && (syncRclone || mountGdrive) && (
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => {
+                userToggledSyncRcloneRef.current = true;
+                setSyncRclone(false);
+                setMountGdrive(false);
+              }}
+            >
+              关闭网盘同步选项
+            </button>
           )}
         </div>
       )}

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -16,6 +16,7 @@ import {
   FolderGit2,
   Gauge,
   GitCompare,
+  HeartPulse,
   KeyRound,
   Link2,
   Loader2,
@@ -27,8 +28,11 @@ import {
   ShieldCheck,
   Sparkles,
   Terminal,
+  Trash2,
 } from "lucide-react";
 import type {
+  KeepAliveConfig,
+  KeepAliveStatus,
   LlmApiAccessInfo,
   LlmTelemetry,
   ProcInfo,
@@ -37,8 +41,21 @@ import type {
   VmSshInfo,
   VmView,
 } from "../types";
-import { fmtDuration, num, numOrNull, pct, shortEndpoint, str } from "../format";
-import { isLlmVm, isLlmVmReady } from "../chatUtils";
+import { fmtDuration, fmtSnapshotTime, formatRealtimeTps, num, numOrNull, pct, shortEndpoint, str } from "../format";
+import {
+  DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS,
+  KEEP_ALIVE_PRESET_INTERVALS,
+  MAX_KEEP_ALIVE_INTERVAL_SECONDS,
+  MIN_KEEP_ALIVE_INTERVAL_SECONDS,
+  describeGrabStatus,
+  isLlmVm,
+  isLlmVmReady,
+  isValidKeepAliveInterval,
+  parseKeepAliveIntervalInput,
+  resolveKeepAliveBadge,
+  resolveRelayCompletionView,
+  resolveVmStatusPillSpec,
+} from "../chatUtils";
 import { RelayPanel } from "./RelayPanel";
 import { KV } from "./ui";
 
@@ -102,82 +119,12 @@ function MiniMeter({ name, value, display }: { name: string; value: number; disp
   );
 }
 
-function statusPill(vm: VmView, activeProc: ProcInfo | null) {
-  const t = vm.telemetry;
-  const llm = t?.llm;
-  const tr = t?.training;
-
-  if (vm.busy === "creating") {
-    return (
-      <span className="pill pill-amber">
-        <span className="dot pulse" />
-        开机分配中…
-      </span>
-    );
-  }
-  if (vm.busy === "deploying_llm") {
-    return (
-      <span className="pill pill-amber">
-        <span className="dot pulse" />
-        部署大模型中…
-      </span>
-    );
-  }
-  if (vm.deploy_error) {
-    return (
-      <span className="pill pill-red" title={vm.deploy_error}>
-        <span className="dot" />
-        部署失败
-      </span>
-    );
-  }
-  if (vm.busy === "probing") {
-    return (
-      <span className="pill pill-blue">
-        <span className="dot pulse" />
-        连接中
-      </span>
-    );
-  }
-  if (llm && (llm.online || llm.backend_healthy)) {
-    const tps = num(llm.instant_tps) || num(llm.last_request_tps);
-    const cls = llm.role === "warming" ? "pill-amber" : llm.role === "draining" ? "pill-gray" : "pill-green";
-    return (
-      <span className={`pill ${cls}`}>
-        <span className="dot pulse" />
-        LLM · {tps.toFixed(1)} tok/s
-      </span>
-    );
-  }
-  if (tr && tr.status) {
-    const isDone = tr.status === "completed";
-    return (
-      <span className={`pill ${isDone ? "pill-green" : "pill-blue"}`}>
-        <span className={`dot ${isDone ? "" : "pulse"}`} />
-        {isDone ? "训练完成" : `训练中 · Epoch ${tr.current_epoch ?? 0}/${tr.total_epochs ?? "?"}`}
-      </span>
-    );
-  }
-  if (vm.running_task || activeProc) {
-    return (
-      <span className="pill pill-blue">
-        <span className="dot pulse" />
-        运行中
-      </span>
-    );
-  }
-  if (vm.on_server) {
-    return (
-      <span className="pill pill-green">
-        <span className="dot" />
-        空闲
-      </span>
-    );
-  }
+function statusPill(vm: VmView, activeProc: ProcInfo | null, serverStateUnknown = false) {
+  const spec = resolveVmStatusPillSpec(vm, Boolean(activeProc), serverStateUnknown);
   return (
-    <span className="pill pill-gray">
-      <span className="dot" />
-      离线
+    <span className={`pill ${spec.cls}`} title={spec.title}>
+      <span className={`dot ${spec.pulse ? "pulse" : ""}`} />
+      {spec.text}
     </span>
   );
 }
@@ -566,18 +513,25 @@ function LlmSupervisionBox({
   const slot = str(llm.slot, "blue").toLowerCase() || "blue";
   const role = str(llm.role, "active").toLowerCase() || "active";
   const modelName = str(llm.model_name) || llmApi?.model_name || "LLM";
-  const instantTps = num(llm.instant_tps);
-  const lastTps = num(llm.last_request_tps);
-  const displayTps = instantTps > 0 ? instantTps : lastTps;
+  // #65：严格区分实时输出速率与上次请求速率，空闲时保持 0.0 tok/s，绝不把 last_request_tps 冒充为实时速率
+  const tpsView = formatRealtimeTps({
+    instantTps: llm.instant_tps,
+    lastRequestTps: llm.last_request_tps,
+    peakTps: llm.peak_tps,
+    activeStreams: llm.active_streams,
+  });
   const avgTps = num(llm.avg_tps_60s);
   const peakTps = num(llm.peak_tps);
   const ttft = numOrNull(llm.ttft_ms) ?? numOrNull(llm.avg_ttft_ms);
-  const activeStreams = num(llm.active_streams);
+  const activeStreams = tpsView.activeStreams;
   const rawHistory = Array.isArray(llm.tps_history) ? llm.tps_history.map((v) => num(v)) : [];
   const history = rawHistory.length > 0 ? rawHistory : [0, 0, 0, 0, 0, 0, 0, 0];
   const maxHist = Math.max(50, ...history, peakTps);
   const chatReady =
     Boolean(llm.online || llm.backend_healthy) &&
+    role !== "warming" &&
+    llm.online !== false &&
+    llm.backend_healthy !== false &&
     vmBusy !== "deploying_llm" &&
     vmBusy !== "creating";
 
@@ -620,14 +574,15 @@ function LlmSupervisionBox({
             <Gauge size={13} /> 实时速率
           </div>
           <div className="tps-value">
-            {displayTps.toFixed(1)} <small>tok/s</small>
+            {tpsView.realtimeTps.toFixed(1)}{" "}
+            <small>tok/s{tpsView.isIdle ? " (空闲)" : ""}</small>
           </div>
           <div className="tps-sub">
             {activeStreams > 0
               ? `${activeStreams} 个流式请求进行中`
-              : lastTps > 0
-                ? `峰值 ${peakTps.toFixed(1)} tok/s`
-                : "等待请求"}
+              : tpsView.lastRequestText
+                ? `${tpsView.lastRequestText}${peakTps > 0 ? ` · 峰值 ${peakTps.toFixed(1)} tok/s` : ""}`
+                : "空闲 · 等待请求"}
           </div>
         </div>
 
@@ -684,8 +639,294 @@ function LlmSupervisionBox({
   );
 }
 
+function KeepAliveBar({
+  vmName,
+  keepAlive,
+  disabled,
+  onSetKeepAlive,
+  onPingKeepAlive,
+}: {
+  vmName: string;
+  keepAlive?: KeepAliveStatus | null;
+  disabled: boolean;
+  onSetKeepAlive?: (name: string, cfg: KeepAliveConfig) => Promise<void>;
+  onPingKeepAlive?: (name: string) => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const [pinging, setPinging] = useState(false);
+  const badge = resolveKeepAliveBadge(keepAlive);
+  const enabled = Boolean(keepAlive?.enabled);
+  const interval = keepAlive?.interval_seconds ?? DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS;
+  const kernelPing = keepAlive?.kernel_ping ?? true;
+  const actionLabel = kernelPing ? "保活" : "连接检查";
+
+  const [intervalDraft, setIntervalDraft] = useState(() => String(interval));
+  const [intervalFocused, setIntervalFocused] = useState(false);
+  const skipBlurCommitRef = useRef(false);
+
+  useEffect(() => {
+    if (!enabled || busy || disabled) {
+      setIntervalFocused(false);
+    }
+  }, [enabled, busy, disabled]);
+
+  useEffect(() => {
+    if (!intervalFocused && !busy) {
+      setIntervalDraft(String(interval));
+    }
+  }, [interval, intervalFocused, busy]);
+
+  const parsedDraft = parseKeepAliveIntervalInput(intervalDraft);
+  const draftValid = parsedDraft !== null;
+  const draftDirty = parsedDraft !== null && parsedDraft !== interval;
+  const effectiveInterval =
+    parsedDraft ??
+    (isValidKeepAliveInterval(interval) ? Math.round(interval) : DEFAULT_KEEP_ALIVE_INTERVAL_SECONDS);
+
+  const applyCfg = async (next: KeepAliveConfig) => {
+    if (!onSetKeepAlive || busyRef.current || busy || disabled) return;
+    setIntervalFocused(false);
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      await onSetKeepAlive(vmName, next);
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  };
+
+  const commitDraft = () => {
+    if (!enabled || busyRef.current || busy || disabled) return;
+    if (parsedDraft !== null && parsedDraft !== interval) {
+      void applyCfg({
+        enabled,
+        interval_seconds: parsedDraft,
+        kernel_ping: kernelPing,
+      });
+    }
+  };
+
+  const handlePing = async () => {
+    if (!onPingKeepAlive || pinging || disabled) return;
+    setPinging(true);
+    try {
+      await onPingKeepAlive(vmName);
+    } finally {
+      setPinging(false);
+    }
+  };
+
+  const pingBtnLabel = pinging
+    ? "检查中…"
+    : enabled
+      ? kernelPing
+        ? "立即保活"
+        : "立即检查"
+      : kernelPing
+        ? "单次保活"
+        : "单次检查";
+
+  const pingBtnTitle = enabled
+    ? kernelPing
+      ? "立即检查运行时连接并在 Kernel 空闲时发送脉冲"
+      : "立即检查运行时连接"
+    : kernelPing
+      ? "仅执行单次运行时连接检查与空闲 Kernel 脉冲（不会开启周期自动保活）"
+      : "仅执行单次运行时连接检查（不会开启周期自动保活）";
+
+  return (
+    <div className={`ka-bar ka-bar-${badge.tone}`}>
+      <div className="ka-bar-row">
+        <div className="ka-bar-left">
+          <span className={`ka-pill ka-pill-${badge.tone}`}>
+            <HeartPulse size={12} />
+            <span>{badge.label}</span>
+          </span>
+          <span className="ka-bar-detail" title={badge.detail}>
+            {badge.detail}
+            {keepAlive?.last_ok_at ? ` · 上次 ${fmtSnapshotTime(keepAlive.last_ok_at)}` : ""}
+          </span>
+        </div>
+
+        <div className="ka-bar-controls">
+          {onSetKeepAlive && (
+            <>
+              <div className="ka-interval-group">
+                <input
+                  type="number"
+                  className={`ka-interval-input${enabled && !draftValid ? " is-invalid" : ""}`}
+                  aria-label="连接检查间隔"
+                  aria-invalid={enabled && !draftValid ? true : undefined}
+                  min={MIN_KEEP_ALIVE_INTERVAL_SECONDS}
+                  max={MAX_KEEP_ALIVE_INTERVAL_SECONDS}
+                  step={1}
+                  value={intervalDraft}
+                  disabled={busy || disabled || !enabled}
+                  onFocus={() => {
+                    skipBlurCommitRef.current = false;
+                    setIntervalFocused(true);
+                  }}
+                  onChange={(e) => setIntervalDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      commitDraft();
+                      e.currentTarget.blur();
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      skipBlurCommitRef.current = true;
+                      setIntervalDraft(String(interval));
+                      setIntervalFocused(false);
+                      e.currentTarget.blur();
+                    }
+                  }}
+                  onBlur={() => {
+                    setIntervalFocused(false);
+                    if (skipBlurCommitRef.current) {
+                      skipBlurCommitRef.current = false;
+                      return;
+                    }
+                    if (draftValid && draftDirty) {
+                      commitDraft();
+                    }
+                  }}
+                  title={`输入 ${MIN_KEEP_ALIVE_INTERVAL_SECONDS}~${MAX_KEEP_ALIVE_INTERVAL_SECONDS} 秒的连接检查间隔`}
+                />
+                <span className="ka-interval-unit">s</span>
+                {enabled && draftDirty && (
+                  <button
+                    type="button"
+                    className="btn btn-sm ka-apply-btn"
+                    disabled={!draftValid || busy || disabled}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => commitDraft()}
+                    title="应用自定义连接检查间隔"
+                  >
+                    应用
+                  </button>
+                )}
+                <div className="ka-preset-pills" role="group" aria-label="快捷间隔预设">
+                  {KEEP_ALIVE_PRESET_INTERVALS.map((sec) => (
+                    <button
+                      type="button"
+                      key={sec}
+                      className={`ka-preset-pill ${interval === sec ? "active" : ""}`}
+                      disabled={busy || disabled || !enabled}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => {
+                        setIntervalDraft(String(sec));
+                        if (sec !== interval) {
+                          void applyCfg({
+                            enabled,
+                            interval_seconds: sec,
+                            kernel_ping: kernelPing,
+                          });
+                        }
+                      }}
+                      title={`设为每 ${sec} 秒`}
+                    >
+                      {sec}s
+                    </button>
+                  ))}
+                </div>
+                {enabled && !draftValid && (
+                  <span className="ka-interval-err" role="status">
+                    间隔须为 {MIN_KEEP_ALIVE_INTERVAL_SECONDS}~{MAX_KEEP_ALIVE_INTERVAL_SECONDS}s
+                  </span>
+                )}
+              </div>
+
+              <label
+                className="ka-mini-check"
+                title="仅在 Jupyter Kernel 空闲时发送脉冲，任务运行时自动跳过"
+              >
+                <input
+                  type="checkbox"
+                  checked={kernelPing}
+                  disabled={busy || disabled || !enabled}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onChange={(e) =>
+                    applyCfg({
+                      enabled,
+                      interval_seconds: effectiveInterval,
+                      kernel_ping: e.target.checked,
+                    })
+                  }
+                />
+                <span>Kernel脉冲</span>
+              </label>
+            </>
+          )}
+
+          {onPingKeepAlive && (
+            <button
+              type="button"
+              className="btn btn-sm ka-btn"
+              disabled={pinging || busy || disabled}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={handlePing}
+              title={pingBtnTitle}
+            >
+              {pinging ? <Loader2 size={12} className="spin" /> : <HeartPulse size={12} />}
+              <span>{pingBtnLabel}</span>
+            </button>
+          )}
+
+          {onSetKeepAlive && (
+            <button
+              type="button"
+              className={`btn btn-sm ka-btn ${enabled ? "" : "btn-primary"}`}
+              disabled={busy || pinging || disabled}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() =>
+                applyCfg({
+                  enabled: !enabled,
+                  interval_seconds: effectiveInterval,
+                  kernel_ping: kernelPing,
+                })
+              }
+              title={`${enabled ? "关闭" : "开启"}该实例的自动${actionLabel}`}
+            >
+              <span>{busy ? "更新中…" : `${enabled ? "关闭" : "开启"}${actionLabel}`}</span>
+            </button>
+          )}
+        </div>
+      </div>
+
+      {badge.persistenceError && (
+        <div className="ka-persistence-alert" role="alert">
+          <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
+          <span className="ka-persistence-msg">{badge.persistenceError}</span>
+          {onSetKeepAlive && (
+            <button
+              type="button"
+              className="btn btn-sm ka-btn"
+              disabled={busy || pinging || disabled}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() =>
+                applyCfg({
+                  enabled,
+                  interval_seconds: effectiveInterval,
+                  kernel_ping: kernelPing,
+                })
+              }
+            >
+              <RefreshCw size={11} />
+              <span>{busy ? "重试中…" : "重试保存策略"}</span>
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function VmCard({
   vm,
+  allVms,
+  serverStateUnknown = false,
   onOpenLlmChat,
   onShutdown,
   onOpenSshTerminal,
@@ -694,22 +935,61 @@ export function VmCard({
   onDeployLlm,
   onStartRelay,
   onRequestStopRelay,
+  onDismissRelay,
   onOpenScriptDialog,
+  onSetKeepAlive,
+  onPingKeepAlive,
+  onCancelCreate,
 }: {
   vm: VmView;
+  allVms?: VmView[];
+  serverStateUnknown?: boolean;
   onOpenLlmChat?: (name: string) => void;
   onShutdown?: (vm: VmView) => void;
   onOpenSshTerminal?: (name: string) => void;
   onRotateLlmKey?: (vmName: string, customKey?: string | null) => Promise<void>;
   onRetryProbe?: (name: string) => Promise<void>;
   onDeployLlm?: (vm: VmView) => void;
-  onStartRelay?: (name: string, config: RelayConfig) => Promise<void>;
+  onStartRelay?: (
+    name: string,
+    config: RelayConfig,
+    workspacePath?: string | null,
+    legacyGdriveAction?: "migrate" | "ignore" | null,
+  ) => Promise<void>;
   onRequestStopRelay?: (vm: VmView) => void;
-  onOpenScriptDialog?: () => void;
+  onDismissRelay?: (name: string) => Promise<void>;
+  onOpenScriptDialog?: (vm: VmView) => void;
+  onSetKeepAlive?: (name: string, config: KeepAliveConfig) => Promise<void>;
+  onPingKeepAlive?: (name: string) => Promise<void>;
+  onCancelCreate?: (name: string) => Promise<void>;
 }) {
   const [probingLocal, setProbingLocal] = useState(false);
   const [relayPending, setRelayPending] = useState(false);
-  const [relayExpanded, setRelayExpanded] = useState(false);
+  const [dismissingRelay, setDismissingRelay] = useState(false);
+  const [cancellingGrab, setCancellingGrab] = useState(false);
+  const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000));
+  // #76 & #73：当接力运行中或为离线接力记录时初始展开一次，但允许用户随时手动点击折叠/展开
+  const [relayExpanded, setRelayExpanded] = useState<boolean>(
+    () => Boolean(vm.relay?.running) || (!vm.on_server && Boolean(vm.relay)),
+  );
+  const prevRelayRunningRef = useRef<boolean>(Boolean(vm.relay?.running));
+  const prevOfflineRelayRef = useRef<boolean>(!vm.on_server && Boolean(vm.relay));
+
+  useEffect(() => {
+    const nowRunning = Boolean(vm.relay?.running);
+    if (nowRunning && !prevRelayRunningRef.current) {
+      setRelayExpanded(true);
+    }
+    prevRelayRunningRef.current = nowRunning;
+  }, [vm.relay?.running]);
+
+  useEffect(() => {
+    const nowOffline = !vm.on_server && Boolean(vm.relay);
+    if (nowOffline && !prevOfflineRelayRef.current) {
+      setRelayExpanded(true);
+    }
+    prevOfflineRelayRef.current = nowOffline;
+  }, [vm.on_server, vm.relay]);
 
   const t = vm.telemetry;
   const tr = t?.training ?? null;
@@ -722,6 +1002,37 @@ export function VmCard({
   const isCreating = vm.busy === "creating";
   const isDeployingLlm = vm.busy === "deploying_llm";
   const isProbing = probingLocal || vm.busy === "probing";
+  const isOfflineRelayRecord = !vm.on_server && vm.relay !== null;
+  const isBillingUnknown = Boolean(vm.server_state_unknown || serverStateUnknown);
+  const offlineRelayView = isOfflineRelayRecord
+    ? resolveRelayCompletionView(vm.relay, isBillingUnknown)
+    : null;
+  const activeGrab = vm.grab_status ?? vm.relay?.grab_status ?? null;
+  const isGrabbing =
+    !vm.on_server &&
+    (isCreating ||
+      Boolean(activeGrab?.active) ||
+      Boolean(vm.relay?.running && vm.relay?.phase === "provisioning"));
+  const grabSummary = describeGrabStatus(activeGrab, nowSec);
+
+  useEffect(() => {
+    if (!activeGrab?.active) return;
+    setNowSec(Math.floor(Date.now() / 1000));
+    const timer = window.setInterval(() => {
+      setNowSec(Math.floor(Date.now() / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [activeGrab?.active]);
+
+  const handleCancelGrabClick = async () => {
+    if (!onCancelCreate || cancellingGrab) return;
+    setCancellingGrab(true);
+    try {
+      await onCancelCreate(vm.name);
+    } finally {
+      setCancellingGrab(false);
+    }
+  };
 
   const gpu = t?.gpu;
   const rawProcs = t?.threads?.processes;
@@ -738,7 +1049,8 @@ export function VmCard({
     : [];
   const busy = !!(vm.running_task || activeProc || llm?.online || vm.relay?.running);
 
-  const showRelayDrawer = Boolean(vm.relay?.running) || relayExpanded;
+  // #76：直接使用 relayExpanded，确保点击折叠箭头可真正切换展开与收起状态
+  const showRelayDrawer = relayExpanded;
   const canUseWorkloadTools = vm.on_server && !isDeleting && !isCreating;
 
   const handleRetryProbeClick = async () => {
@@ -751,18 +1063,34 @@ export function VmCard({
     }
   };
 
-  const handleStartRelayClick = async (cfg: RelayConfig) => {
+  const handleStartRelayClick = async (
+    cfg: RelayConfig,
+    legacyGdriveAction?: "migrate" | "ignore" | null,
+  ) => {
     if (!onStartRelay || relayPending) return;
     setRelayPending(true);
     try {
-      await onStartRelay(vm.name, cfg);
+      // #42 & #80：始终携带当前实例绑定的工作区路径与可选旧目录迁移确认动作
+      await onStartRelay(vm.name, cfg, vm.workspace?.path ?? null, legacyGdriveAction ?? null);
     } finally {
       setRelayPending(false);
     }
   };
 
+  const handleDismissRelayClick = async () => {
+    if (!onDismissRelay || dismissingRelay) return;
+    setDismissingRelay(true);
+    try {
+      await onDismissRelay(vm.name);
+    } finally {
+      setDismissingRelay(false);
+    }
+  };
+
   return (
-    <section className={`vm-card ${busy ? "relay-on" : ""} ${isDeleting ? "deleting" : ""}`}>
+    <section
+      className={`vm-card ${busy ? "relay-on" : ""} ${isOfflineRelayRecord ? "offline-relay-card" : ""} ${isDeleting ? "deleting" : ""}`}
+    >
       {/* 头部：会话名 · 硬件 · 状态 · 工作区与运行时长 · 部署/对话/关机按钮 */}
       <div className="vm-head">
         <span className="vm-name">{vm.name}</span>
@@ -770,22 +1098,38 @@ export function VmCard({
           {vm.accelerator}
           {vm.high_ram ? " · High-RAM" : ""}
         </span>
+        {isOfflineRelayRecord && (
+          <span
+            className={`chip ${isBillingUnknown ? "chip-red" : ""}`.trim()}
+            title={
+              isBillingUnknown
+                ? "服务端实例列表查询失败，暂无法确认云端实例是否已停费释放"
+                : "云端实例已释放下线，保留最近一次接力任务结果与日志"
+            }
+          >
+            {isBillingUnknown ? "云端计费状态未知 · 接力记录" : "云端实例已下线 · 接力记录"}
+          </span>
+        )}
         {vm.orphan && (
           <span className="chip chip-red" title="浏览器或外部会话创建的云端实例（已自动接管监控与远程终端）">
             外部会话
           </span>
         )}
-        {statusPill(vm, activeProc)}
+        {statusPill(vm, activeProc, isBillingUnknown)}
         <span className="vm-meta">
           <span title={vm.workspace.path ?? ""}>
             <FolderGit2 size={12} />
             {vm.workspace.name}
           </span>
-          <span>
-            <Clock size={12} />
-            {fmtDuration(t?.uptime_seconds)}
-          </span>
-          {stale && <span className="warn">遥测延迟 {vm.telemetry_age?.toFixed(0)}s</span>}
+          {vm.on_server && (
+            <span>
+              <Clock size={12} />
+              {fmtDuration(t?.uptime_seconds)}
+            </span>
+          )}
+          {vm.on_server && stale && (
+            <span className="warn">遥测延迟 {vm.telemetry_age?.toFixed(0)}s</span>
+          )}
         </span>
 
         {canUseWorkloadTools && !llmReady && onDeployLlm && (
@@ -828,7 +1172,29 @@ export function VmCard({
           </button>
         )}
 
-        {onShutdown && (
+        {isGrabbing && onCancelCreate && (
+          <button
+            type="button"
+            className="btn btn-danger-ghost btn-sm"
+            onClick={handleCancelGrabClick}
+            disabled={cancellingGrab || isDeleting}
+            title={`立即放弃抢卡并清理残留分配 (${vm.name})`}
+          >
+            {cancellingGrab ? (
+              <>
+                <Loader2 size={13} className="spin" />
+                <span>停止抢卡中…</span>
+              </>
+            ) : (
+              <>
+                <PowerOff size={13} />
+                <span>放弃抢卡</span>
+              </>
+            )}
+          </button>
+        )}
+
+        {vm.on_server && onShutdown && (
           <button
             type="button"
             className="btn btn-danger-ghost btn-sm"
@@ -849,16 +1215,40 @@ export function VmCard({
             )}
           </button>
         )}
+
+        {isOfflineRelayRecord && !vm.relay?.running && onDismissRelay && (
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={handleDismissRelayClick}
+            disabled={dismissingRelay}
+            title="清除此已结束/已释放的离线接力任务记录"
+          >
+            {dismissingRelay ? <Loader2 size={13} className="spin" /> : <Trash2 size={13} />}
+            <span>清除记录</span>
+          </button>
+        )}
       </div>
 
-      {/* 每台虚拟机均提供免密 SSH 连接栏 */}
-      <SshAccessBar
-        vmName={vm.name}
-        ssh={vm.ssh}
-        orphan={vm.orphan}
-        onServer={vm.on_server}
-        onOpenSshTerminal={onOpenSshTerminal}
-      />
+      {/* 每台在线虚拟机均提供免密 SSH 连接栏与实例保活策略状态栏 */}
+      {vm.on_server && (
+        <SshAccessBar
+          vmName={vm.name}
+          ssh={vm.ssh}
+          orphan={vm.orphan}
+          onServer={vm.on_server}
+          onOpenSshTerminal={onOpenSshTerminal}
+        />
+      )}
+      {vm.on_server && (
+        <KeepAliveBar
+          vmName={vm.name}
+          keepAlive={vm.keep_alive}
+          disabled={isDeleting || isCreating}
+          onSetKeepAlive={onSetKeepAlive}
+          onPingKeepAlive={onPingKeepAlive}
+        />
+      )}
 
       <div className="vm-main">
         {/* 部署异常横幅（可见、可复制、可一键重新部署） */}
@@ -994,17 +1384,90 @@ export function VmCard({
               )}
             </div>
           </div>
+        ) : isOfflineRelayRecord ? (
+          <div
+            className={`vm-alert-box ${
+              offlineRelayView?.isError || offlineRelayView?.isDownloadFailed
+                ? "vm-alert-danger"
+                : "vm-alert-warn"
+            }`}
+            role="status"
+          >
+            <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+            <div className="vm-alert-content">
+              <div className="vm-alert-title">
+                {vm.relay?.running
+                  ? isBillingUnknown
+                    ? `接力处理中 · 云端计费状态未知（${vm.relay.phase_label || "正在推进流程"}）`
+                    : `接力换棒处理中（${vm.relay.phase_label || "正在分配下一棒实例"}）`
+                  : isBillingUnknown
+                    ? `本地接力记录 · 云端计费状态未知（${offlineRelayView?.stateLabel ?? "已停止"}）`
+                    : `已结束/已释放接力任务记录 · ${offlineRelayView?.stateLabel ?? "实例已下线"}`}
+              </div>
+              <div className="vm-alert-desc">
+                {vm.relay?.running
+                  ? isBillingUnknown
+                    ? "当前服务端计费列表查询失败，暂无法确认云端实例状态，本机监工正在推进流程。"
+                    : "上一棒云端实例已释放，本机监工正在推进下一棒流程。"
+                  : isBillingUnknown
+                    ? `服务端计费列表查询失败，当前云端实例计费状态未知（待服务端查询恢复并确认释放后，再显示已停费）。${offlineRelayView?.sub ?? ""}`
+                    : `云端 Colab 实例已下线释放（不再产生计费）。${offlineRelayView?.sub ?? ""}`}
+              </div>
+            </div>
+            {!vm.relay?.running && onDismissRelay && (
+              <div className="vm-alert-actions">
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={handleDismissRelayClick}
+                  disabled={dismissingRelay}
+                >
+                  <Trash2 size={12} />
+                  <span>清除记录</span>
+                </button>
+              </div>
+            )}
+          </div>
+        ) : isCreating || activeGrab?.active ? (
+          <div className="vm-alert-box vm-alert-warn" role="status" style={{ alignItems: "center" }}>
+            <Loader2 size={15} className="spin" style={{ flexShrink: 0 }} />
+            <div className="vm-alert-content">
+              <div className="vm-alert-title">
+                {grabSummary
+                  ? grabSummary.headline
+                  : `正在 Google Colab 云端请求分配 [${vm.accelerator}] 算力实例…`}
+              </div>
+              <div className="vm-alert-desc">
+                {grabSummary
+                  ? grabSummary.subline
+                  : "分配成功后将自动注入遥测探针与免密 SSH；您可随时点击右侧「放弃抢卡」终止请求。"}
+              </div>
+            </div>
+            {onCancelCreate && (
+              <div className="vm-alert-actions">
+                <button
+                  type="button"
+                  className="btn btn-danger-ghost btn-sm"
+                  onClick={handleCancelGrabClick}
+                  disabled={cancellingGrab}
+                >
+                  {cancellingGrab ? <Loader2 size={12} className="spin" /> : <PowerOff size={12} />}
+                  <span>{cancellingGrab ? "停止中…" : "放弃抢卡"}</span>
+                </button>
+              </div>
+            )}
+          </div>
         ) : (
           <div className="probe-line">
             <Loader2 size={14} className="spin" />
             <span>
-              {isCreating
-                ? "正在 Google Colab 云端分配算力实例并配置免密 SSH…"
-                : isDeployingLlm
-                  ? "正在云端拉取大模型权重并启动推理服务（首次预热约需 1–5 分钟）…"
+              {isDeployingLlm
+                ? "正在云端拉取大模型权重并启动推理服务（首次预热约需 1–5 分钟）…"
+                : vm.busy === "initializing_env"
+                  ? "正在后台同步环境配置与安装预装依赖…"
                   : "正在连接遥测…"}
             </span>
-            {!isCreating && onRetryProbe && vm.on_server && (
+            {onRetryProbe && vm.on_server && (
               <button
                 type="button"
                 className="copy-chip-btn"
@@ -1039,12 +1502,17 @@ export function VmCard({
               <button
                 type="button"
                 className="vm-tools-toggle"
+                aria-expanded={showRelayDrawer}
                 onClick={() => setRelayExpanded((v) => !v)}
               >
                 <Repeat2 size={13} color="var(--primary)" />
                 <span>接力训练 / 脚本配置</span>
                 {vm.relay?.running ? (
                   <span className="chip chip-blue">运行中 · 第 {vm.relay.round || 1} 棒</span>
+                ) : isOfflineRelayRecord ? (
+                  <span className="chip">
+                    {offlineRelayView?.stateLabel ?? "已结束接力记录"}
+                  </span>
                 ) : (
                   <span className="dim" style={{ fontWeight: 400, fontSize: 11.5 }}>
                     配置 `train.py` / `requirements.txt` 或开启 24h+ Google Drive 跨实例自动换棒训练
@@ -1061,8 +1529,8 @@ export function VmCard({
                 <button
                   type="button"
                   className="copy-chip-btn"
-                  onClick={onOpenScriptDialog}
-                  title="打开编辑器配置本地工作区 train.py 与 requirements.txt"
+                  onClick={() => onOpenScriptDialog(vm)}
+                  title={`打开编辑器配置工作区 (${vm.workspace.path ?? vm.workspace.name}) 的 train.py 与 requirements.txt`}
                 >
                   <FileCode2 size={12} />
                   <span>编辑训练脚本</span>
@@ -1074,15 +1542,17 @@ export function VmCard({
               <div className="vm-tools-body">
                 <RelayPanel
                   vm={vm}
+                  allVms={allVms}
+                  serverStateUnknown={isBillingUnknown}
                   pending={relayPending}
                   onStart={handleStartRelayClick}
                   onStopRequest={() => onRequestStopRelay?.(vm)}
                 />
                 {vm.relay?.logs && vm.relay.logs.length > 0 && (
-                  <details className="relay-logs-details">
+                  <details className="relay-logs-details" open={isOfflineRelayRecord || undefined}>
                     <summary>接力监工日志 ({vm.relay.logs.length})</summary>
-                    <pre className="llm-snippet-pre mono" style={{ maxHeight: 160, overflowY: "auto" }}>
-                      {vm.relay.logs.slice(-40).join("\n")}
+                    <pre className="llm-snippet-pre mono" style={{ maxHeight: 220, overflowY: "auto" }}>
+                      {vm.relay.logs.slice(-200).join("\n")}
                     </pre>
                   </details>
                 )}

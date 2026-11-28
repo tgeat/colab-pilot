@@ -7,15 +7,17 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 import urllib.error
 import urllib.request
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest import mock
@@ -37,6 +39,7 @@ def load_module(name: str, rel_path: str):
 
 adapter_mod = load_module("colab_relay_adapter", ".agents/skills/colab-dl-relay/scripts/colab_relay_adapter.py")
 runner_mod = load_module("dl_relay_runner", ".agents/skills/colab-dl-relay/scripts/dl_relay_runner.py")
+smoke_mod = load_module("smoke_test_dl", ".agents/skills/colab-dl-relay/scripts/smoke_test_dl.py")
 train_mod = load_module("pilot_train_script", "train.py")
 gateway_mod = load_module("llm_local_gateway", ".agents/skills/colab-llm-bluegreen/scripts/llm_local_gateway.py")
 sidecar_mod = load_module("llm_metrics_sidecar", ".agents/skills/colab-llm-bluegreen/scripts/llm_metrics_sidecar.py")
@@ -1221,6 +1224,2621 @@ print(f"PARSED_OK valid={len(payload['valid'])} invalid={len(payload['invalid'])
             f"v0.8.0 Click dry-parse contract failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}",
         )
         self.assertIn("PARSED_OK", proc.stdout)
+
+    def test_issue_88_gateway_per_instance_keepalive_policy_and_runtime_check(self):
+        with tempfile.TemporaryDirectory() as td:
+            st_file = os.path.join(td, "llm_bluegreen_state.json")
+            sess_file = os.path.join(td, "sessions.json")
+            keys_file = os.path.join(td, "llm_api_keys.json")
+            prof_file = os.path.join(td, "pilot_session_profiles.json")
+
+            recorded_gets = {"ordinary": [], "blue": [], "green": [], "standalone": []}
+            standalone_expected_tok = {"tok": "fresh-standalone-tok"}
+
+            def make_kernel_srv(bucket: str, kernels_payload, expected_tok_fn):
+                class KernelHandler(BaseHTTPRequestHandler):
+                    def log_message(self, fmt, *args):
+                        pass
+
+                    def do_GET(self):
+                        parsed_u = urllib.request.urlsplit(self.path)
+                        qs = dict(urllib.parse.parse_qsl(parsed_u.query)) if hasattr(urllib, "parse") else {}
+                        hdr_tok = self.headers.get("X-Colab-Runtime-Proxy-Token")
+                        agent = self.headers.get("X-Colab-Client-Agent")
+                        recorded_gets[bucket].append(
+                            {
+                                "path": parsed_u.path,
+                                "query_token": qs.get("colab-runtime-proxy-token"),
+                                "header_token": hdr_tok,
+                                "agent": agent,
+                            }
+                        )
+                        exp_tok = expected_tok_fn()
+                        if hdr_tok != exp_tok or qs.get("colab-runtime-proxy-token") != exp_tok:
+                            self.send_response(401)
+                            self.end_headers()
+                            return
+                        body = (")]}'\n" + json.dumps(kernels_payload)).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+
+                srv = HTTPServer(("127.0.0.1", 0), KernelHandler)
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                return srv
+
+            import urllib.parse
+
+            srv_ord = make_kernel_srv("ordinary", [{"id": "kid-ord", "execution_state": "idle"}], lambda: "tok-ord")
+            srv_blue = make_kernel_srv("blue", [{"id": "kid-blue", "execution_state": "idle"}], lambda: "tok-blue")
+            srv_green = make_kernel_srv("green", [{"id": "kid-green", "execution_state": "idle"}], lambda: "tok-green")
+            srv_std = make_kernel_srv(
+                "standalone",
+                [{"id": "kid-std", "execution_state": "idle"}],
+                lambda: standalone_expected_tok["tok"],
+            )
+
+            Path(st_file).write_text(
+                json.dumps(
+                    {
+                        "session_prefix": "llm",
+                        "active_slot": "blue",
+                        "blue_session": "llm-blue",
+                        "green_session": "llm-green",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(keys_file).write_text(
+                json.dumps(
+                    {
+                        "vms": {
+                            "standalone-g4": {
+                                "vm_name": "standalone-g4",
+                                "slot": "standalone",
+                                "local_port": 18083,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(sess_file).write_text(
+                json.dumps(
+                    {
+                        "ordinary-vm": {
+                            "endpoint": "m-s-ord",
+                            "url": f"http://127.0.0.1:{srv_ord.server_port}",
+                            "token": "tok-ord",
+                            "kernel_id": "kid-ord",
+                        },
+                        "llm-blue": {
+                            "endpoint": "m-s-blue",
+                            "url": f"http://127.0.0.1:{srv_blue.server_port}",
+                            "token": "tok-blue",
+                            "kernel_id": "kid-blue",
+                        },
+                        "llm-green": {
+                            "endpoint": "m-s-green",
+                            "url": f"http://127.0.0.1:{srv_green.server_port}",
+                            "token": "tok-green",
+                            "kernel_id": "kid-green",
+                        },
+                        "standalone-g4": {
+                            "endpoint": "m-s-std",
+                            "url": f"http://127.0.0.1:{srv_std.server_port}",
+                            "token": "stale-standalone-tok",
+                            "kernel_id": "kid-std",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(prof_file).write_text(
+                json.dumps(
+                    {
+                        "ordinary-vm": {"keep_alive": {"enabled": True, "interval_seconds": 30, "kernel_ping": True}},
+                        "llm-blue": {"keep_alive": {"enabled": False, "interval_seconds": 30, "kernel_ping": True}},
+                        "llm-green": {"keep_alive": {"enabled": True, "interval_seconds": 120, "kernel_ping": False}},
+                        "standalone-g4": {"keep_alive": {"enabled": True, "interval_seconds": 30, "kernel_ping": True}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            pass_calls = []
+            list_assign_calls = {"n": 0}
+
+            class FakeClient:
+                colab_domain = "https://colab.research.google.com"
+
+                class session:
+                    @staticmethod
+                    def request(*args, **kwargs):
+                        raise AssertionError(f"Legacy /tun/m/keep-alive must never be called: {args} {kwargs}")
+
+                @staticmethod
+                def list_assignments():
+                    list_assign_calls["n"] += 1
+                    std_tok = "stale-standalone-tok" if list_assign_calls["n"] <= 1 else "fresh-standalone-tok"
+                    return [
+                        types.SimpleNamespace(
+                            endpoint="m-s-green",
+                            runtime_proxy_info=types.SimpleNamespace(
+                                url=f"http://127.0.0.1:{srv_green.server_port}",
+                                token="tok-green",
+                            ),
+                        ),
+                        types.SimpleNamespace(
+                            endpoint="m-s-std",
+                            runtime_proxy_info=types.SimpleNamespace(
+                                url=f"http://127.0.0.1:{srv_std.server_port}",
+                                token=std_tok,
+                            ),
+                        ),
+                    ]
+
+            fake_common = types.ModuleType("colab_cli.common")
+            fake_common.state = types.SimpleNamespace(client=FakeClient())
+
+            class FakeColabRuntime:
+                def __init__(self, url, token, kernel_id=None, session_id=None):
+                    self.url = url
+                    self.token = token
+                    self.kernel_id = kernel_id
+
+                def execute_code(self, code, output_hook=None, timeout=300):
+                    pass_calls.append((self.url, self.token, self.kernel_id, code))
+
+                def stop(self):
+                    pass
+
+            fake_colab = types.ModuleType("colab_cli")
+            fake_rt = types.ModuleType("colab_cli.runtime")
+            fake_rt.ColabRuntime = FakeColabRuntime
+
+            with (
+                mock.patch.object(gateway_mod, "state_path", return_value=st_file),
+                mock.patch.object(gateway_mod, "sessions_path", return_value=sess_file),
+                mock.patch.dict(
+                    sys.modules,
+                    {"colab_cli": fake_colab, "colab_cli.common": fake_common, "colab_cli.runtime": fake_rt},
+                ),
+            ):
+                try:
+                    gateway_mod._LAST_KEEPALIVE_AT.clear()
+                    gateway_mod._LAST_TOKEN_REFRESH_AT = 0.0
+                    gateway_mod._LAST_ON_DEMAND_REFRESH = 0.0
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+
+                    # On-demand token refresh must NEVER call /api/kernels or ColabRuntime
+                    gateway_mod.maybe_refresh_tokens_now(min_interval=0.0)
+                    self.assertEqual(sum(len(v) for v in recorded_gets.values()), 0)
+                    self.assertEqual(len(pass_calls), 0)
+
+                    # Reset call counter so t=1000 sees stale token first -> 401 -> refresh -> 200 retry
+                    list_assign_calls["n"] = 0
+                    gateway_mod._LAST_ON_DEMAND_REFRESH = 0.0
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True, respect_interval=True, now=1000.0)
+                    self.assertEqual(len(recorded_gets["ordinary"]), 0)
+                    self.assertEqual(len(recorded_gets["blue"]), 0)
+                    self.assertEqual(len(recorded_gets["green"]), 1)
+                    # standalone: 1st attempt 401 + retry 200 = 2 GETs, 1 pass
+                    self.assertEqual(len(recorded_gets["standalone"]), 2)
+                    self.assertEqual(len(pass_calls), 1)
+                    self.assertEqual(pass_calls[0][2], "kid-std")
+                    self.assertEqual(pass_calls[0][1], "fresh-standalone-tok")
+
+                    # t=1020: neither 30s nor 120s elapsed
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True, respect_interval=True, now=1020.0)
+                    self.assertEqual(len(recorded_gets["green"]), 1)
+                    self.assertEqual(len(recorded_gets["standalone"]), 2)
+                    self.assertEqual(len(pass_calls), 1)
+
+                    # t=1035: standalone (30s) due, green (120s) not due
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True, respect_interval=True, now=1035.0)
+                    self.assertEqual(len(recorded_gets["green"]), 1)
+                    self.assertEqual(len(recorded_gets["standalone"]), 3)
+                    self.assertEqual(len(pass_calls), 2)
+
+                    # t=1125: both green (120s) and standalone (30s) due; green has kernel_ping=False
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True, respect_interval=True, now=1125.0)
+                    self.assertEqual(len(recorded_gets["green"]), 2)
+                    self.assertEqual(len(recorded_gets["standalone"]), 4)
+                    self.assertEqual(len(pass_calls), 3)
+                    self.assertEqual(len(recorded_gets["ordinary"]), 0)
+                    self.assertEqual(len(recorded_gets["blue"]), 0)
+
+                    for rec in recorded_gets["green"] + recorded_gets["standalone"]:
+                        self.assertEqual(rec["path"], "/api/kernels")
+                        self.assertEqual(rec["header_token"], rec["query_token"])
+                        self.assertEqual(rec["agent"], "colab-cli")
+                finally:
+                    gateway_mod._LAST_KEEPALIVE_AT.clear()
+                    gateway_mod._LAST_TOKEN_REFRESH_AT = 0.0
+                    gateway_mod._LAST_ON_DEMAND_REFRESH = 0.0
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+                    srv_ord.shutdown()
+                    srv_ord.server_close()
+                    srv_blue.shutdown()
+                    srv_blue.server_close()
+                    srv_green.shutdown()
+                    srv_green.server_close()
+                    srv_std.shutdown()
+                    srv_std.server_close()
+
+    def test_issue_93_gateway_never_spawns_kernel_on_empty_or_retired_kernel_list(self):
+        with tempfile.TemporaryDirectory() as td:
+            st_file = os.path.join(td, "llm_bluegreen_state.json")
+            sess_file = os.path.join(td, "sessions.json")
+            prof_file = os.path.join(td, "pilot_session_profiles.json")
+
+            kernels_state = {"items": []}
+
+            class KernelHandler(BaseHTTPRequestHandler):
+                def log_message(self, fmt, *args):
+                    pass
+
+                def do_GET(self):
+                    body = json.dumps(kernels_state["items"]).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            srv = HTTPServer(("127.0.0.1", 0), KernelHandler)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+            Path(st_file).write_text(
+                json.dumps({"session_prefix": "llm", "active_slot": "blue", "blue_session": "llm-blue"}),
+                encoding="utf-8",
+            )
+            Path(prof_file).write_text(
+                json.dumps({"llm-blue": {"keep_alive": {"enabled": True, "interval_seconds": 30, "kernel_ping": True}}}),
+                encoding="utf-8",
+            )
+
+            rt_calls = []
+
+            class FakeColabRuntime:
+                def __init__(self, url, token, kernel_id=None, session_id=None):
+                    rt_calls.append({"url": url, "token": token, "kernel_id": kernel_id, "session_id": session_id})
+
+                def execute_code(self, code, output_hook=None, timeout=300):
+                    pass
+
+                def stop(self):
+                    pass
+
+            fake_colab = types.ModuleType("colab_cli")
+            fake_common = types.ModuleType("colab_cli.common")
+            fake_common.state = types.SimpleNamespace(
+                client=types.SimpleNamespace(list_assignments=lambda: [])
+            )
+            fake_rt = types.ModuleType("colab_cli.runtime")
+            fake_rt.ColabRuntime = FakeColabRuntime
+
+            with (
+                mock.patch.object(gateway_mod, "state_path", return_value=st_file),
+                mock.patch.object(gateway_mod, "sessions_path", return_value=sess_file),
+                mock.patch.dict(
+                    sys.modules,
+                    {"colab_cli": fake_colab, "colab_cli.common": fake_common, "colab_cli.runtime": fake_rt},
+                ),
+            ):
+                try:
+                    gateway_mod._LAST_KEEPALIVE_AT.clear()
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+
+                    # 1. Empty /api/kernels with retired kernel_id -> 0 ColabRuntime calls across 2 rounds
+                    Path(sess_file).write_text(
+                        json.dumps(
+                            {
+                                "llm-blue": {
+                                    "endpoint": "m-s-b93",
+                                    "url": f"http://127.0.0.1:{srv.server_port}",
+                                    "token": "tok-b93",
+                                    "kernel_id": "retired-kid",
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(rt_calls, [])
+
+                    # 2. Empty /api/kernels with kernel_id=None -> 0 ColabRuntime calls
+                    Path(sess_file).write_text(
+                        json.dumps(
+                            {
+                                "llm-blue": {
+                                    "endpoint": "m-s-b93",
+                                    "url": f"http://127.0.0.1:{srv.server_port}",
+                                    "token": "tok-b93",
+                                    "kernel_id": None,
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(rt_calls, [])
+
+                    # 3. Live kernel present while sessions.json has retired kernel_id -> uses live-kid
+                    Path(sess_file).write_text(
+                        json.dumps(
+                            {
+                                "llm-blue": {
+                                    "endpoint": "m-s-b93",
+                                    "url": f"http://127.0.0.1:{srv.server_port}",
+                                    "token": "tok-b93",
+                                    "kernel_id": "retired-kid",
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    kernels_state["items"] = [{"id": "live-kid", "execution_state": "idle"}]
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(len(rt_calls), 1)
+                    self.assertEqual(rt_calls[0]["kernel_id"], "live-kid")
+
+                    # 4. Cached kernel_id present in multi-kernel live list -> prefers preferred-kid
+                    Path(sess_file).write_text(
+                        json.dumps(
+                            {
+                                "llm-blue": {
+                                    "endpoint": "m-s-b93",
+                                    "url": f"http://127.0.0.1:{srv.server_port}",
+                                    "token": "tok-b93",
+                                    "kernel_id": "preferred-kid",
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    kernels_state["items"] = [
+                        {"id": "other-kid", "execution_state": "idle"},
+                        {"id": "preferred-kid", "execution_state": "idle"},
+                    ]
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(len(rt_calls), 2)
+                    self.assertEqual(rt_calls[1]["kernel_id"], "preferred-kid")
+                finally:
+                    gateway_mod._LAST_KEEPALIVE_AT.clear()
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+                    srv.shutdown()
+                    srv.server_close()
+
+    def test_issue_95_gateway_per_session_busy_does_not_block_other_idle_slot(self):
+        with tempfile.TemporaryDirectory() as td:
+            st_file = os.path.join(td, "llm_bluegreen_state.json")
+            sess_file = os.path.join(td, "sessions.json")
+            prof_file = os.path.join(td, "pilot_session_profiles.json")
+
+            blue_kernels = {"items": [{"id": "kid-blue", "execution_state": "idle"}], "gets": 0}
+            green_kernels = {"items": [{"id": "kid-green", "execution_state": "idle"}], "gets": 0}
+
+            def make_srv(state_ref):
+                class Handler(BaseHTTPRequestHandler):
+                    def log_message(self, fmt, *args):
+                        pass
+
+                    def do_GET(self):
+                        state_ref["gets"] += 1
+                        body = json.dumps(state_ref["items"]).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+
+                srv = HTTPServer(("127.0.0.1", 0), Handler)
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                return srv
+
+            srv_blue = make_srv(blue_kernels)
+            srv_green = make_srv(green_kernels)
+
+            Path(st_file).write_text(
+                json.dumps(
+                    {
+                        "session_prefix": "llm",
+                        "active_slot": "blue",
+                        "blue_session": "llm-blue",
+                        "green_session": "llm-green",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(sess_file).write_text(
+                json.dumps(
+                    {
+                        "llm-blue": {
+                            "endpoint": "m-s-b95",
+                            "url": f"http://127.0.0.1:{srv_blue.server_port}",
+                            "token": "tok-b95",
+                            "kernel_id": "kid-blue",
+                        },
+                        "llm-green": {
+                            "endpoint": "m-s-g95",
+                            "url": f"http://127.0.0.1:{srv_green.server_port}",
+                            "token": "tok-g95",
+                            "kernel_id": "kid-green",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(prof_file).write_text(
+                json.dumps(
+                    {
+                        "llm-blue": {"keep_alive": {"enabled": True, "interval_seconds": 30, "kernel_ping": True}},
+                        "llm-green": {"keep_alive": {"enabled": True, "interval_seconds": 30, "kernel_ping": True}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            stream_started = threading.Event()
+            release_stream = threading.Event()
+            pass_kernels = []
+
+            class FakeColabRuntime:
+                def __init__(self, url, token, kernel_id=None, session_id=None):
+                    self.url = url
+                    self.kernel_id = kernel_id
+
+                def execute_code(self, code, output_hook=None, timeout=300):
+                    if code == "pass":
+                        pass_kernels.append(self.kernel_id)
+                        return
+                    stream_started.set()
+                    release_stream.wait(timeout=5.0)
+                    meta = gateway_mod.META_PREFIX + json.dumps({"status": 200, "ctype": "text/event-stream"}) + "\n"
+                    chunk = 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+                    output_hook({"output_type": "stream", "text": meta + chunk})
+
+                def stop(self):
+                    pass
+
+            fake_colab = types.ModuleType("colab_cli")
+            fake_common = types.ModuleType("colab_cli.common")
+            fake_common.state = types.SimpleNamespace(
+                client=types.SimpleNamespace(list_assignments=lambda: [])
+            )
+            fake_rt = types.ModuleType("colab_cli.runtime")
+            fake_rt.ColabRuntime = FakeColabRuntime
+
+            with (
+                mock.patch.object(gateway_mod, "state_path", return_value=st_file),
+                mock.patch.object(gateway_mod, "sessions_path", return_value=sess_file),
+                mock.patch.dict(
+                    sys.modules,
+                    {"colab_cli": fake_colab, "colab_cli.common": fake_common, "colab_cli.runtime": fake_rt},
+                ),
+            ):
+                gw_srv = gateway_mod.ThreadedHTTPServer(("127.0.0.1", 0), gateway_mod.make_gateway_handler("blue"))
+                threading.Thread(target=gw_srv.serve_forever, daemon=True).start()
+                stream_result = {}
+
+                def _do_chat():
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{gw_srv.server_port}/v1/chat/completions",
+                        data=json.dumps({"stream": True, "messages": [{"role": "user", "content": "hi"}]}).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        stream_result["body"] = resp.read().decode("utf-8")
+
+                chat_thread = threading.Thread(target=_do_chat, daemon=True)
+                try:
+                    gateway_mod._LAST_KEEPALIVE_AT.clear()
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+
+                    chat_thread.start()
+                    self.assertTrue(stream_started.wait(timeout=5.0))
+                    counts = gateway_mod.get_active_gateway_counts()
+                    self.assertEqual(counts["by_session"], {"llm-blue": 1})
+                    self.assertEqual(counts["total"], 1)
+
+                    # While llm-blue has an active SSE stream, idle llm-green still receives pass!
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(blue_kernels["gets"], 1)
+                    self.assertEqual(green_kernels["gets"], 1)
+                    self.assertEqual(pass_kernels, ["kid-green"])
+                finally:
+                    release_stream.set()
+                    chat_thread.join(timeout=5.0)
+                    gw_srv.shutdown()
+                    gw_srv.server_close()
+
+                self.assertIn("data: [DONE]", stream_result.get("body", ""))
+                self.assertEqual(gateway_mod.get_active_gateway_counts()["by_session"], {})
+
+                # Also verify live /api/kernels execution_state=="busy"/"starting" skips only that slot
+                try:
+                    pass_kernels.clear()
+                    blue_kernels["items"] = [{"id": "kid-blue", "execution_state": "busy"}]
+                    green_kernels["items"] = [{"id": "kid-green", "execution_state": "idle"}]
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(pass_kernels, ["kid-green"])
+
+                    pass_kernels.clear()
+                    blue_kernels["items"] = [{"id": "kid-blue", "execution_state": "starting"}]
+                    gateway_mod.refresh_tokens_and_keepalive(send_kernel_ping=True)
+                    self.assertEqual(pass_kernels, ["kid-green"])
+                finally:
+                    gateway_mod._LAST_KEEPALIVE_AT.clear()
+                    gateway_mod._TOKEN_OVERRIDES.clear()
+                    srv_blue.shutdown()
+                    srv_blue.server_close()
+                    srv_green.shutdown()
+                    srv_green.server_close()
+
+
+class IssueRegressionTests(unittest.TestCase):
+    def test_issue_44_default_gdrive_isolation_active_lock_and_train_temp_prefix(self):
+        # 1) Bare default gdrive:colab_relay automatically isolates by session-prefix / session
+        gd_a, iso_a = runner_mod.resolve_effective_gdrive_dir("gdrive:colab_relay", "task-alpha")
+        gd_b, iso_b = runner_mod.resolve_effective_gdrive_dir("gdrive:colab_relay/", "worker-1", session_prefix="exp/beta 01")
+        gd_explicit, iso_exp = runner_mod.resolve_effective_gdrive_dir("gdrive:colab_relay/custom_dir/", "task-alpha")
+        self.assertTrue(iso_a)
+        self.assertEqual(gd_a, "gdrive:colab_relay/task-alpha")
+        self.assertTrue(iso_b)
+        self.assertEqual(gd_b, "gdrive:colab_relay/exp-beta-01")
+        self.assertFalse(iso_exp)
+        self.assertEqual(gd_explicit, "gdrive:colab_relay/custom_dir")
+
+        with tempfile.TemporaryDirectory() as td:
+            locks_file = os.path.join(td, "dl_relay_locks.json")
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(ws_dir, exist_ok=True)
+            Path(ws_dir, "train.py").write_text("print('ok')\n", encoding="utf-8")
+
+            with mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file):
+                ok1, _ = runner_mod.acquire_gdrive_dir_lock("gdrive:colab_relay/shared", "sess-a", ws_dir)
+                self.assertTrue(ok1)
+                # Second session targeting the same explicit directory without --allow-shared-gdrive-dir is blocked
+                ok2, err2 = runner_mod.acquire_gdrive_dir_lock("gdrive:colab_relay/shared", "sess-b", ws_dir)
+                self.assertFalse(ok2)
+                self.assertIn("sess-a", err2)
+                self.assertIn("--allow-shared-gdrive-dir", err2)
+
+                rc_conflict = runner_mod.main(
+                    ["--session", "sess-b", "--workspace", ws_dir, "--gdrive-dir", "gdrive:colab_relay/shared"]
+                )
+                self.assertEqual(rc_conflict, 1)
+
+                # Explicit --allow-shared-gdrive-dir permits reuse
+                ok3, _ = runner_mod.acquire_gdrive_dir_lock(
+                    "gdrive:colab_relay/shared", "sess-b", ws_dir, allow_shared=True
+                )
+                self.assertTrue(ok3)
+                runner_mod.release_gdrive_dir_lock("gdrive:colab_relay/shared", "sess-b")
+
+            # 2) train.py honors RELAY_GDRIVE_DIR and adds session+pid prefix to hot-backup temp upload names
+            ckpt_file = os.path.join(td, "checkpoint.pt")
+            Path(ckpt_file).write_bytes(b"pt-weights")
+            pushed_cmds_a = []
+            pushed_cmds_b = []
+
+            def make_fake_subproc(recorder):
+                def _fake(cmd, *args, **kwargs):
+                    recorder.append(list(cmd))
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+                return _fake
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "SMOKE_TEST": "0",
+                        "RELAY_GDRIVE_DIR": "gdrive:colab_relay/sess-a",
+                        "RELAY_SESSION": "sess-a",
+                        "CHECKPOINT_PATH": ckpt_file,
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(train_mod.subprocess, "run", side_effect=make_fake_subproc(pushed_cmds_a)),
+            ):
+                train_mod.rclone_push(ckpt_file)
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "SMOKE_TEST": "0",
+                        "RELAY_GDRIVE_DIR": "gdrive:colab_relay/sess-b",
+                        "RELAY_SESSION": "sess-b",
+                        "CHECKPOINT_PATH": ckpt_file,
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(train_mod.subprocess, "run", side_effect=make_fake_subproc(pushed_cmds_b)),
+            ):
+                train_mod.rclone_push(ckpt_file)
+
+            tmp_dest_a = pushed_cmds_a[0][-1]
+            tmp_dest_b = pushed_cmds_b[0][-1]
+            self.assertTrue(tmp_dest_a.startswith("gdrive:colab_relay/sess-a/.sess-a."))
+            self.assertTrue(tmp_dest_a.endswith(".checkpoint.pt.uploading"))
+            self.assertTrue(tmp_dest_b.startswith("gdrive:colab_relay/sess-b/.sess-b."))
+            self.assertNotEqual(tmp_dest_a, tmp_dest_b)
+
+    def test_issue_45_first_alloc_retry_keeps_relay_round_1_and_train_empty_remote_diagnostic(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(ws_dir, exist_ok=True)
+            Path(ws_dir, "train.py").write_text("print('train')\n", encoding="utf-8")
+            rclone_conf = os.path.join(td, "rclone.conf")
+            Path(rclone_conf).write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+            locks_file = os.path.join(td, "locks.json")
+
+            new_attempts = {"n": 0}
+            captured_boot_scripts = []
+
+            def fake_run_cmd(cmd, timeout=300, stdin_text=None):
+                prog = os.path.basename(cmd[0]).lower()
+                if "rclone" in prog:
+                    if "copyto" in cmd:
+                        Path(cmd[-1]).write_bytes(b"final-weights-ok")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                sub = cmd[1]
+                if sub == "new":
+                    new_attempts["n"] += 1
+                    if new_attempts["n"] == 1:
+                        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="503 Service Unavailable")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Session READY", stderr="")
+                if sub == "status":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No active session")
+                if sub == "sessions":
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                if sub == "upload":
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Uploaded", stderr="")
+                if sub == "exec":
+                    captured_boot_scripts.append(stdin_text or "")
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout="CLOUD_SMOKE_PASSED\nTRAINING_COMPLETED\nTRAIN_EXIT_CODE=0\n",
+                        stderr="",
+                    )
+                if sub == "stop":
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Stopped", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(runner_mod, "ALLOC_RETRY_SLEEP_SECONDS", 0.0),
+                mock.patch.object(runner_mod, "HANDOVER_SLEEP_SECONDS", 0.0),
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_run_cmd),
+            ):
+                rc = runner_mod.main(["--session", "exp-45", "--workspace", ws_dir, "--reset-done-flag"])
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(new_attempts["n"], 2)
+            self.assertEqual(len(captured_boot_scripts), 1)
+            self.assertIn('"RELAY_ROUND": "1"', captured_boot_scripts[0])
+            self.assertIn('"RESET_DONE_FLAG": "1"', captured_boot_scripts[0])
+
+            # Issue #81: train.py with RELAY_ROUND=2 and an empty remote dir (no RESET_DONE_FLAG) MUST abort and raise RuntimeError
+            missing_ckpt = os.path.join(td, "no_ckpt.pt")
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "SMOKE_TEST": "0",
+                        "RELAY_ROUND": "2",
+                        "RESET_DONE_FLAG": "0",
+                        "RELAY_GDRIVE_DIR": "gdrive:colab_relay/empty_new",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    train_mod.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(["rclone", "lsf"], 0, stdout="", stderr=""),
+                ),
+            ):
+                with self.assertRaises(RuntimeError) as ctx_empty:
+                    train_mod.rclone_pull_checkpoint(missing_ckpt)
+                self.assertIn("no_ckpt.pt", str(ctx_empty.exception))
+
+            # Explicit RESET_DONE_FLAG=1 allows starting fresh when intentionally reset
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "SMOKE_TEST": "0",
+                        "RELAY_ROUND": "2",
+                        "RESET_DONE_FLAG": "1",
+                        "RELAY_GDRIVE_DIR": "gdrive:colab_relay/empty_new",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    train_mod.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(["rclone", "lsf"], 0, stdout="", stderr=""),
+                ),
+            ):
+                self.assertFalse(train_mod.rclone_pull_checkpoint(missing_ckpt))
+
+            # train.py: if remote HAS prior training artifacts (results/ or _prev.pt) but checkpoint.pt is missing, MUST fail fast
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "SMOKE_TEST": "0",
+                        "RELAY_ROUND": "2",
+                        "RESET_DONE_FLAG": "0",
+                        "RELAY_GDRIVE_DIR": "gdrive:colab_relay/resuming_job",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    train_mod.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(["rclone", "lsf"], 0, stdout="results/\n", stderr=""),
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    train_mod.rclone_pull_checkpoint(missing_ckpt)
+
+    def test_issue_46_relay_runner_aborts_when_old_instance_stop_fails_or_remains_on_server(self):
+        for fail_mode in ("stop_nonzero", "still_in_billing_list"):
+            with self.subTest(fail_mode=fail_mode), tempfile.TemporaryDirectory() as td:
+                ws_dir = os.path.join(td, "ws")
+                os.makedirs(ws_dir, exist_ok=True)
+                Path(ws_dir, "train.py").write_text("print('ok')\n", encoding="utf-8")
+                rclone_conf = os.path.join(td, "rclone.conf")
+                Path(rclone_conf).write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+                locks_file = os.path.join(td, "locks.json")
+
+                new_calls = []
+                vm_allocated = {"live": False}
+
+                def fake_run(cmd, timeout=300, stdin_text=None):
+                    prog = os.path.basename(cmd[0]).lower()
+                    if "rclone" in prog:
+                        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                    sub = cmd[1]
+                    if sub == "new":
+                        new_calls.append(list(cmd))
+                        vm_allocated["live"] = True
+                        return subprocess.CompletedProcess(cmd, 0, stdout="Session READY", stderr="")
+                    if sub == "upload":
+                        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+                    if sub == "exec":
+                        return subprocess.CompletedProcess(
+                            cmd,
+                            0,
+                            stdout="CLOUD_SMOKE_PASSED\nHANDOVER_REQUESTED\nTRAIN_EXIT_CODE=0\n",
+                            stderr="",
+                        )
+                    if sub == "stop":
+                        if fail_mode == "stop_nonzero":
+                            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Error: runtime unassign HTTP 500")
+                        return subprocess.CompletedProcess(cmd, 0, stdout="Stop requested", stderr="")
+                    if sub == "status":
+                        if not vm_allocated["live"]:
+                            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No active session")
+                        if fail_mode == "still_in_billing_list":
+                            return subprocess.CompletedProcess(cmd, 0, stdout="[exp-46] Active (m-s-leak1)\nHardware: T4\n", stderr="")
+                        return subprocess.CompletedProcess(cmd, 0, stdout="[exp-46] Active\n", stderr="")
+                    if sub == "sessions":
+                        if vm_allocated["live"] and fail_mode == "still_in_billing_list":
+                            return subprocess.CompletedProcess(cmd, 0, stdout="exp-46  m-s-leak1  T4  Active\n", stderr="")
+                        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+                out_buf = io.StringIO()
+                orig_stop = runner_mod.stop_and_verify_session
+                with (
+                    mock.patch.object(runner_mod, "HANDOVER_SLEEP_SECONDS", 0.0),
+                    mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                    mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf),
+                    mock.patch.object(runner_mod, "register_workspace"),
+                    mock.patch.object(
+                        runner_mod,
+                        "stop_and_verify_session",
+                        side_effect=lambda cb, sn, **kw: orig_stop(cb, sn, max_retries=2, retry_delay=0.0, require_stop_rc_zero=kw.get("require_stop_rc_zero", True)),
+                    ),
+                    mock.patch.object(runner_mod, "run_cmd", side_effect=fake_run),
+                    redirect_stdout(out_buf),
+                ):
+                    rc = runner_mod.main(["--session", "exp-46", "--workspace", ws_dir])
+
+                printed = out_buf.getvalue()
+                self.assertEqual(rc, 1)
+                self.assertEqual(len(new_calls), 1, "Must NEVER allocate Round #2 VM when Round #1 VM stop is unverified")
+                self.assertNotIn("本棒安全交接完毕", printed)
+
+    def test_issue_47_hf_trainer_callback_backup_and_round2_resume_protocol(self):
+        skill_doc = (REPO_ROOT / ".agents/skills/colab-dl-relay/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("resolve_hf_resume_checkpoint", skill_doc)
+        self.assertIn("hf_checkpoints", skill_doc)
+
+        fake_transformers = types.ModuleType("transformers")
+
+        class DummyTrainerCallback:
+            pass
+
+        fake_transformers.TrainerCallback = DummyTrainerCallback
+
+        with tempfile.TemporaryDirectory() as td:
+            remote_store = os.path.join(td, "fake_gdrive_hf")
+            r1_out = os.path.join(td, "round1_hf_checkpoints")
+            r2_out = os.path.join(td, "round2_hf_checkpoints")
+            os.makedirs(os.path.join(r1_out, "checkpoint-5"), exist_ok=True)
+            os.makedirs(os.path.join(r1_out, "checkpoint-10"), exist_ok=True)
+            Path(r1_out, "checkpoint-5", "trainer_state.json").write_text(
+                json.dumps({"global_step": 5, "epoch": 0.5}), encoding="utf-8"
+            )
+            Path(r1_out, "checkpoint-10", "trainer_state.json").write_text(
+                json.dumps({"global_step": 10, "epoch": 1.0}), encoding="utf-8"
+            )
+
+            ctx1 = adapter_mod.ColabRelayContext(
+                model_name="hf-lora",
+                framework="huggingface",
+                total_epochs=3,
+                gdrive_dir="gdrive:colab_relay/hf_exp",
+                results_dir=os.path.join(td, "r1_results"),
+                checkpoint_path=os.path.join(td, "r1_unused_checkpoint.pt"),
+                hf_checkpoints_dir=r1_out,
+                done_flag_path=os.path.join(td, "r1_done.flag"),
+                smoke_test=False,
+                round_num=1,
+            )
+            ctx1.state_file = os.path.join(td, "r1_state.json")
+
+            def fake_rclone_r1(args, timeout=180):
+                if args[0] == "copy" and args[-1].endswith("/hf_checkpoints"):
+                    shutil.copytree(args[-2], remote_store, dirs_exist_ok=True)
+                return True
+
+            with (
+                mock.patch.dict(sys.modules, {"transformers": fake_transformers}),
+                mock.patch.object(ctx1, "_run_rclone", side_effect=fake_rclone_r1),
+            ):
+                cb = adapter_mod.make_hf_trainer_callback(ctx1)
+                fake_args = types.SimpleNamespace(output_dir=r1_out)
+                fake_state = types.SimpleNamespace(epoch=1.0, global_step=10, max_steps=30, log_history=[{"loss": 0.32}])
+                fake_ctrl = types.SimpleNamespace(should_save=False, should_training_stop=False)
+                cb.on_save(fake_args, fake_state, fake_ctrl)
+
+            self.assertTrue(os.path.isfile(os.path.join(remote_store, "checkpoint-10", "trainer_state.json")))
+
+            # Round 2: NO checkpoint.pt exists anywhere, only hf_checkpoints/checkpoint-*/trainer_state.json on Drive
+            ctx2 = adapter_mod.ColabRelayContext(
+                model_name="hf-lora",
+                framework="huggingface",
+                total_epochs=3,
+                gdrive_dir="gdrive:colab_relay/hf_exp",
+                results_dir=os.path.join(td, "r2_results"),
+                checkpoint_path=os.path.join(td, "r2_missing_checkpoint.pt"),
+                hf_checkpoints_dir=r2_out,
+                done_flag_path=os.path.join(td, "r2_done.flag"),
+                smoke_test=False,
+                round_num=2,
+            )
+            ctx2.state_file = os.path.join(td, "r2_state.json")
+
+            def fake_exists_r2(remote_dir, filename, timeout=90):
+                if filename == "hf_checkpoints":
+                    return True
+                return False
+
+            def fake_rclone_r2(args, timeout=180):
+                if args[0] == "copy" and args[3].endswith("/hf_checkpoints"):
+                    shutil.copytree(remote_store, args[4], dirs_exist_ok=True)
+                return True
+
+            with (
+                mock.patch.object(ctx2, "_rclone_remote_file_exists", side_effect=fake_exists_r2),
+                mock.patch.object(
+                    ctx2,
+                    "_rclone_list_remote_hf_trainer_states",
+                    return_value=["checkpoint-10/trainer_state.json", "checkpoint-5/trainer_state.json"],
+                ),
+                mock.patch.object(ctx2, "_run_rclone", side_effect=fake_rclone_r2),
+            ):
+                ctx2.prepare_cloud_workspace()
+                resume_dir = ctx2.resolve_hf_resume_checkpoint(r2_out)
+
+            self.assertIsNotNone(resume_dir)
+            self.assertEqual(os.path.basename(resume_dir), "checkpoint-10")
+            self.assertTrue(os.path.isfile(os.path.join(resume_dir, "trainer_state.json")))
+
+    def test_issue_48_custom_and_auto_session_names_in_bluegreen_state_switchover_and_gateway(self):
+        with tempfile.TemporaryDirectory() as td:
+            bg_file = os.path.join(td, "llm_bluegreen_state.json")
+            keys_file = os.path.join(td, "llm_api_keys.json")
+            sess_file = os.path.join(td, "sessions.json")
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(ws_dir, exist_ok=True)
+            parser = manager_mod.build_arg_parser()
+
+            # 1) Deploy blue slot with auto/custom session name `vm-custom-88aa` (not ending in -blue)
+            args_dep = parser.parse_args(
+                [
+                    "deploy",
+                    "--session-prefix",
+                    "prod",
+                    "--session-name",
+                    "vm-custom-88aa",
+                    "--slot",
+                    "blue",
+                    "--workspace",
+                    ws_dir,
+                    "--gpu",
+                    "G4",
+                    "--engine",
+                    "builtin",
+                    "--model-name",
+                    "Qwen-Custom",
+                ]
+            )
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(manager_mod, "api_keys_path", return_value=keys_file),
+                mock.patch.object(
+                    manager_mod,
+                    "provision_and_warmup_slot",
+                    return_value={"instant_tps": 55.0, "ttft_ms": 80.0, "role": "active"},
+                ),
+                mock.patch.object(manager_mod, "ensure_local_gateway"),
+            ):
+                rc_dep = manager_mod.cmd_deploy(args_dep)
+
+            self.assertEqual(rc_dep, 0)
+            st_after_deploy = json.loads(Path(bg_file).read_text(encoding="utf-8"))
+            self.assertEqual(st_after_deploy["active_session"], "vm-custom-88aa")
+            self.assertEqual(st_after_deploy["blue_session"], "vm-custom-88aa")
+            self.assertEqual(st_after_deploy["slots"]["blue"]["session_name"], "vm-custom-88aa")
+
+            # Gateway forced_slot="blue" and unified (None) both resolve to `vm-custom-88aa`
+            Path(sess_file).write_text(
+                json.dumps(
+                    {
+                        "vm-custom-88aa": {
+                            "endpoint": "m-s-custom88",
+                            "url": "https://custom.colab.dev",
+                            "token": "tok-88",
+                            "kernel_id": "k-88",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(gateway_mod, "state_path", return_value=bg_file),
+                mock.patch.object(gateway_mod, "sessions_path", return_value=sess_file),
+                mock.patch.object(gateway_mod, "api_keys_path", return_value=keys_file),
+            ):
+                sl_b, _, sess_b = gateway_mod.resolve_slot_session(forced_slot="blue")
+                sl_u, _, sess_u = gateway_mod.resolve_slot_session(forced_slot=None)
+            self.assertEqual(sl_b, "blue")
+            self.assertEqual(sess_b["session_name"], "vm-custom-88aa")
+            self.assertEqual(sess_u["session_name"], "vm-custom-88aa")
+
+            # 2) Switchover from blue -> green with custom green name `vm-green-custom-99bb`
+            role_calls = []
+            stopped_sessions = []
+
+            def fake_run_sw(cmd, timeout=300, stdin_text=None):
+                sub = cmd[1]
+                if sub == "stop":
+                    stopped_sessions.append(cmd[-1])
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Stopped", stderr="")
+                if sub == "status":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No active session")
+                if sub == "sessions":
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                if sub == "exec":
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout='DRAIN_STATUS {"active_streams": 0, "active_requests": 0}\n', stderr=""
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            args_sw = parser.parse_args(
+                [
+                    "switchover",
+                    "--workspace",
+                    ws_dir,
+                    "--new-session-name",
+                    "vm-green-custom-99bb",
+                    "--drain-timeout",
+                    "2",
+                ]
+            )
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(manager_mod, "api_keys_path", return_value=keys_file),
+                mock.patch.object(
+                    manager_mod,
+                    "provision_and_warmup_slot",
+                    return_value={"instant_tps": 61.0, "ttft_ms": 75.0, "role": "warming"},
+                ),
+                mock.patch.object(manager_mod, "set_remote_slot_role", side_effect=lambda s, r: role_calls.append((s, r))),
+                mock.patch.object(manager_mod, "run_cmd", side_effect=fake_run_sw),
+            ):
+                rc_sw = manager_mod.cmd_switchover(args_sw)
+
+            self.assertEqual(rc_sw, 0)
+            self.assertIn(("vm-green-custom-99bb", "active"), role_calls)
+            self.assertIn(("vm-custom-88aa", "draining"), role_calls)
+            self.assertEqual(stopped_sessions, ["vm-custom-88aa"])
+            st_after_sw = json.loads(Path(bg_file).read_text(encoding="utf-8"))
+            self.assertEqual(st_after_sw["active_slot"], "green")
+            self.assertEqual(st_after_sw["active_session"], "vm-green-custom-99bb")
+            self.assertEqual(st_after_sw["green_session"], "vm-green-custom-99bb")
+            self.assertIsNone(st_after_sw["blue_session"])
+            self.assertEqual(st_after_sw["slots"]["green"]["session_name"], "vm-green-custom-99bb")
+
+    def test_issue_49_switchover_drains_in_flight_sse_streams_before_stopping_old_slot(self):
+        # 1) Verify Sidecar tracks active_streams & active_requests > 0 throughout SSE streaming until EOF
+        first_chunk_sent = threading.Event()
+        allow_stream_finish = threading.Event()
+
+        class SlowStreamingBackend(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def do_POST(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b'data: {"choices":[{"delta":{"content":"Part1"}}]}\n\n')
+                self.wfile.flush()
+                first_chunk_sent.set()
+                allow_stream_finish.wait(timeout=5.0)
+                self.wfile.write(b'data: {"choices":[{"delta":{"content":"Part2"}}]}\n\ndata: [DONE]\n\n')
+                self.wfile.flush()
+
+        backend_srv = sidecar_mod.ThreadingHTTPServer(("127.0.0.1", 0), SlowStreamingBackend)
+        backend_port = backend_srv.server_address[1]
+        threading.Thread(target=backend_srv.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                llm_state_file = os.path.join(td, "llm_state.json")
+                tracker = sidecar_mod.LlmTelemetryTracker(
+                    slot="blue",
+                    role="active",
+                    engine="vllm",
+                    model_name="qwen",
+                    listen_port=0,
+                    backend_url=f"http://127.0.0.1:{backend_port}",
+                    state_file=llm_state_file,
+                )
+                sidecar_srv = sidecar_mod.ThreadingHTTPServer(("127.0.0.1", 0), sidecar_mod.make_handler(tracker))
+                sidecar_port = sidecar_srv.server_address[1]
+                threading.Thread(target=sidecar_srv.serve_forever, daemon=True).start()
+                try:
+                    stream_done = threading.Event()
+                    stream_body = []
+
+                    def _client():
+                        conn = http.client.HTTPConnection("127.0.0.1", sidecar_port, timeout=5)
+                        conn.request(
+                            "POST",
+                            "/v1/chat/completions",
+                            body=b'{"stream":true,"messages":[{"role":"user","content":"hi"}]}',
+                            headers={"Content-Type": "application/json"},
+                        )
+                        resp = conn.getresponse()
+                        stream_body.append(resp.read().decode("utf-8", errors="ignore"))
+                        conn.close()
+                        stream_done.set()
+
+                    threading.Thread(target=_client, daemon=True).start()
+                    self.assertTrue(first_chunk_sent.wait(timeout=3.0))
+
+                    # While SSE is still open, state file and /pilot/health MUST report active_streams=1 & active_requests=1
+                    mid_state = json.loads(Path(llm_state_file).read_text(encoding="utf-8"))
+                    self.assertEqual(mid_state["active_streams"], 1)
+                    self.assertEqual(mid_state["active_requests"], 1)
+
+                    allow_stream_finish.set()
+                    self.assertTrue(stream_done.wait(timeout=3.0))
+                    end_state = json.loads(Path(llm_state_file).read_text(encoding="utf-8"))
+                    self.assertEqual(end_state["active_streams"], 0)
+                    self.assertEqual(end_state["active_requests"], 0)
+                finally:
+                    sidecar_srv.shutdown()
+                    sidecar_srv.server_close()
+        finally:
+            allow_stream_finish.set()
+            backend_srv.shutdown()
+            backend_srv.server_close()
+
+        # 2) Verify cmd_switchover polls draining slot until active_streams == 0 BEFORE calling `colab stop`
+        with tempfile.TemporaryDirectory() as td:
+            bg_file = os.path.join(td, "bg.json")
+            keys_file = os.path.join(td, "keys.json")
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(ws_dir, exist_ok=True)
+            Path(bg_file).write_text(
+                json.dumps({"session_prefix": "llm", "active_slot": "blue", "active_session": "llm-blue", "gpu": "T4"}),
+                encoding="utf-8",
+            )
+
+            events = []
+            drain_counts = [2, 1, 0]
+
+            def fake_run_drain(cmd, timeout=300, stdin_text=None):
+                sub = cmd[1]
+                if sub == "exec":
+                    cnt = drain_counts.pop(0) if drain_counts else 0
+                    events.append(f"drain_poll:{cnt}")
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout=f'DRAIN_STATUS {{"active_streams": {cnt}, "active_requests": {cnt}}}\n',
+                        stderr="",
+                    )
+                if sub == "stop":
+                    events.append(f"stop:{cmd[-1]}")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Stopped", stderr="")
+                if sub == "status":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No active session")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            parser = manager_mod.build_arg_parser()
+            args_sw = parser.parse_args(
+                [
+                    "switchover",
+                    "--workspace",
+                    ws_dir,
+                    "--drain-timeout",
+                    "5",
+                    "--drain-poll-interval",
+                    "0.03",
+                    "--gateway-port",
+                    "18098",
+                ]
+            )
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(manager_mod, "api_keys_path", return_value=keys_file),
+                mock.patch.object(
+                    manager_mod,
+                    "provision_and_warmup_slot",
+                    return_value={"instant_tps": 50.0, "ttft_ms": 90.0, "role": "warming"},
+                ),
+                mock.patch.object(
+                    manager_mod,
+                    "set_remote_slot_role",
+                    side_effect=lambda s, r: events.append(f"role:{s}={r}"),
+                ),
+                mock.patch.object(manager_mod, "run_cmd", side_effect=fake_run_drain),
+            ):
+                rc = manager_mod.cmd_switchover(args_sw)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                events,
+                [
+                    "role:llm-green=active",
+                    "role:llm-blue=draining",
+                    "drain_poll:2",
+                    "drain_poll:1",
+                    "drain_poll:0",
+                    "stop:llm-blue",
+                ],
+            )
+
+            # 3) Verify --drain-timeout expiration with stuck stream respects deadline & policy
+            t_start = time.monotonic()
+            stop_on_keep = []
+
+            def fake_run_stuck(cmd, timeout=300, stdin_text=None):
+                if cmd[1] == "exec":
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout='DRAIN_STATUS {"active_streams": 1, "active_requests": 1}\n', stderr=""
+                    )
+                if cmd[1] == "stop":
+                    stop_on_keep.append(cmd[-1])
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            Path(bg_file).write_text(
+                json.dumps({"session_prefix": "llm", "active_slot": "blue", "active_session": "llm-blue", "gpu": "T4"}),
+                encoding="utf-8",
+            )
+            args_keep_policy = parser.parse_args(
+                [
+                    "switchover",
+                    "--workspace",
+                    ws_dir,
+                    "--drain-timeout",
+                    "0.12",
+                    "--drain-poll-interval",
+                    "0.04",
+                    "--drain-timeout-policy",
+                    "keep",
+                    "--gateway-port",
+                    "18098",
+                ]
+            )
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(manager_mod, "api_keys_path", return_value=keys_file),
+                mock.patch.object(
+                    manager_mod,
+                    "provision_and_warmup_slot",
+                    return_value={"instant_tps": 50.0, "ttft_ms": 90.0, "role": "warming"},
+                ),
+                mock.patch.object(manager_mod, "set_remote_slot_role"),
+                mock.patch.object(manager_mod, "run_cmd", side_effect=fake_run_stuck),
+                mock.patch.object(sys, "stderr", io.StringIO()),
+            ):
+                rc_keep_pol = manager_mod.cmd_switchover(args_keep_policy)
+
+            self.assertEqual(rc_keep_pol, 1)
+            self.assertGreaterEqual(time.monotonic() - t_start, 0.11)
+            self.assertEqual(stop_on_keep, [])
+            st_timeout = json.loads(Path(bg_file).read_text(encoding="utf-8"))
+            self.assertTrue(st_timeout.get("drain_timed_out"))
+            self.assertIn("llm-blue", st_timeout.get("unreleased_sessions", []))
+
+    def test_issue_50_switchover_old_slot_stop_failure_returns_nonzero_and_preserves_active_new_slot(self):
+        with tempfile.TemporaryDirectory() as td:
+            bg_file = os.path.join(td, "bg.json")
+            keys_file = os.path.join(td, "keys.json")
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(ws_dir, exist_ok=True)
+            Path(bg_file).write_text(
+                json.dumps({"session_prefix": "llm", "active_slot": "blue", "active_session": "llm-blue", "gpu": "T4"}),
+                encoding="utf-8",
+            )
+
+            def fake_run_stop_fail(cmd, timeout=300, stdin_text=None):
+                if cmd[1] == "exec":
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout='DRAIN_STATUS {"active_streams": 0, "active_requests": 0}\n', stderr=""
+                    )
+                if cmd[1] == "stop":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="HTTP 500 unassign failed")
+                if cmd[1] == "status":
+                    return subprocess.CompletedProcess(cmd, 0, stdout="[llm-blue] Active (m-s-blue1)\nHardware: T4\n", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            parser = manager_mod.build_arg_parser()
+            args_sw = parser.parse_args(
+                ["switchover", "--workspace", ws_dir, "--drain-timeout", "1", "--gateway-port", "18098"]
+            )
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            orig_stop = manager_mod.stop_and_verify_colab_session
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(manager_mod, "api_keys_path", return_value=keys_file),
+                mock.patch.object(
+                    manager_mod,
+                    "provision_and_warmup_slot",
+                    return_value={"instant_tps": 48.0, "ttft_ms": 85.0, "role": "warming"},
+                ),
+                mock.patch.object(manager_mod, "set_remote_slot_role"),
+                mock.patch.object(
+                    manager_mod,
+                    "stop_and_verify_colab_session",
+                    side_effect=lambda cb, sn, **kw: orig_stop(cb, sn, max_retries=1, retry_delay=0.0, require_stop_rc_zero=True),
+                ),
+                mock.patch.object(manager_mod, "run_cmd", side_effect=fake_run_stop_fail),
+                redirect_stdout(out_buf),
+                mock.patch.object(sys, "stderr", err_buf),
+            ):
+                rc = manager_mod.cmd_switchover(args_sw)
+
+            self.assertEqual(rc, 1)
+            combined_out = out_buf.getvalue() + "\n" + err_buf.getvalue()
+            self.assertNotIn("已彻底释放", combined_out)
+            saved_st = json.loads(Path(bg_file).read_text(encoding="utf-8"))
+            self.assertEqual(saved_st["active_slot"], "green")
+            self.assertEqual(saved_st["active_session"], "llm-green")
+            self.assertEqual(saved_st["phase"], "serving")
+            self.assertFalse(saved_st["old_slot_released"])
+            self.assertIn("llm-blue", saved_st["unreleased_sessions"])
+            self.assertIn("llm-blue", saved_st["last_error"])
+
+    def test_issue_51_stop_with_session_prefix_does_not_touch_other_active_prefix_or_gateway(self):
+        with tempfile.TemporaryDirectory() as td:
+            bg_file = os.path.join(td, "llm_bluegreen_state.json")
+            prod_state = {
+                "session_prefix": "production",
+                "active_slot": "blue",
+                "active_session": "production-blue",
+                "blue_session": "production-blue",
+                "slots": {"blue": {"session_name": "production-blue", "role": "active"}},
+                "phase": "serving",
+            }
+            Path(bg_file).write_text(json.dumps(prod_state), encoding="utf-8")
+
+            stopped_names = []
+            gw_stop_calls = []
+
+            def fake_run_exp_fail(cmd, timeout=300, stdin_text=None):
+                if cmd[1] == "stop":
+                    stopped_names.append(cmd[-1])
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Error: failed to stop experiment VM")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            parser = manager_mod.build_arg_parser()
+            args_stop_exp = parser.parse_args(["stop", "--session-prefix", "experiment"])
+            orig_stop = manager_mod.stop_and_verify_colab_session
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(manager_mod, "stop_local_gateway", side_effect=lambda: gw_stop_calls.append(1)),
+                mock.patch.object(
+                    manager_mod,
+                    "stop_and_verify_colab_session",
+                    side_effect=lambda cb, sn, **kw: orig_stop(cb, sn, max_retries=1, retry_delay=0.0, require_stop_rc_zero=False),
+                ),
+                mock.patch.object(manager_mod, "run_cmd", side_effect=fake_run_exp_fail),
+            ):
+                rc_fail = manager_mod.cmd_stop(args_stop_exp)
+
+            self.assertEqual(rc_fail, 1)
+            self.assertNotIn("production-blue", stopped_names)
+            self.assertEqual(stopped_names, ["experiment-blue", "experiment-green"])
+            self.assertEqual(gw_stop_calls, [], "Must NOT stop shared local gateway used by production")
+            self.assertTrue(os.path.exists(bg_file), "Must NOT delete production state file")
+            preserved = json.loads(Path(bg_file).read_text(encoding="utf-8"))
+            self.assertEqual(preserved["active_session"], "production-blue")
+
+            # Even when experiment-* stops cleanly, production state & shared gateway remain untouched
+            def fake_run_exp_ok(cmd, timeout=300, stdin_text=None):
+                if cmd[1] == "stop":
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Stopped", stderr="")
+                if cmd[1] == "status":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No active session")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(manager_mod, "stop_local_gateway", side_effect=lambda: gw_stop_calls.append(1)),
+                mock.patch.object(manager_mod, "run_cmd", side_effect=fake_run_exp_ok),
+            ):
+                rc_ok = manager_mod.cmd_stop(args_stop_exp)
+
+            self.assertEqual(rc_ok, 0)
+            self.assertEqual(gw_stop_calls, [])
+            self.assertTrue(os.path.exists(bg_file))
+
+    def test_issue_53_final_weights_download_failure_returns_nonzero_and_rerun_redownloads(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(ws_dir, exist_ok=True)
+            Path(ws_dir, "train.py").write_text("print('ok')\n", encoding="utf-8")
+            rclone_conf = os.path.join(td, "rclone.conf")
+            Path(rclone_conf).write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+            locks_file = os.path.join(td, "locks.json")
+            final_ckpt_path = os.path.join(ws_dir, "checkpoint_final.pt")
+
+            remote_completed = {"flag": False}
+            allow_download = {"ok": False}
+            colab_new_count = {"n": 0}
+
+            def fake_run(cmd, timeout=300, stdin_text=None):
+                prog = os.path.basename(cmd[0]).lower()
+                if "rclone" in prog:
+                    if "lsf" in cmd:
+                        out = "TRAINING_COMPLETED.flag\ncheckpoint.pt\n" if remote_completed["flag"] else ""
+                        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+                    if "copyto" in cmd:
+                        if not allow_download["ok"]:
+                            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="network reset during download")
+                        Path(cmd[-1]).write_bytes(b"verified-final-model-weights")
+                        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+                sub = cmd[1]
+                if sub == "new":
+                    colab_new_count["n"] += 1
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Session READY", stderr="")
+                if sub == "exec":
+                    remote_completed["flag"] = True
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout="TRAINING_COMPLETED\nTRAIN_EXIT_CODE=0\n", stderr=""
+                    )
+                if sub == "status":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No active session")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            buf1 = io.StringIO()
+            with (
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_run),
+                redirect_stdout(buf1),
+            ):
+                rc1 = runner_mod.main(["--session", "exp-53", "--workspace", ws_dir])
+
+            self.assertEqual(rc1, 1)
+            self.assertFalse(os.path.exists(final_ckpt_path))
+            self.assertNotIn("最终模型已保存至", buf1.getvalue())
+            receipt1 = json.loads(Path(ws_dir, ".colab_dl_relay_status.json").read_text(encoding="utf-8"))
+            self.assertTrue(receipt1["training_completed"])
+            self.assertFalse(receipt1["weights_downloaded"])
+
+            # Re-run on the same directory when remote flag already exists -> must re-download without allocating new VM
+            allow_download["ok"] = True
+            buf2 = io.StringIO()
+            with (
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_run),
+                redirect_stdout(buf2),
+            ):
+                rc2 = runner_mod.main(["--session", "exp-53", "--workspace", ws_dir])
+
+            self.assertEqual(rc2, 0)
+            self.assertEqual(colab_new_count["n"], 1, "Re-run must only backfill download without provisioning a new VM")
+            self.assertTrue(os.path.isfile(final_ckpt_path))
+            self.assertGreater(os.path.getsize(final_ckpt_path), 0)
+            receipt2 = json.loads(Path(ws_dir, ".colab_dl_relay_status.json").read_text(encoding="utf-8"))
+            self.assertTrue(receipt2["weights_downloaded"])
+
+    def test_issue_61_relay_rclone_sh_returns_nonzero_on_python_traceback_even_when_exec_rc_zero(self):
+        sh_path = REPO_ROOT / "relay_rclone.sh"
+        sh_bytes = sh_path.read_bytes()
+        self.assertNotIn(b"\r", sh_bytes)
+        sh_text = sh_bytes.decode("utf-8")
+        self.assertNotIn('exit "${EXEC_RC:-1}"', sh_text)
+
+        git_bash = r"C:\Program Files\Git\bin\bash.exe"
+        bash_bin = git_bash if (os.name == "nt" and os.path.exists(git_bash)) else shutil.which("bash")
+        if not bash_bin:
+            return
+        probe = subprocess.run([bash_bin, "--version"], capture_output=True, text=True, timeout=10)
+        if probe.returncode != 0:
+            return
+
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = os.path.join(td, "bin")
+            os.makedirs(bin_dir, exist_ok=True)
+            shutil.copy2(sh_path, os.path.join(td, "relay_rclone.sh"))
+            Path(td, "train.py").write_text("raise RuntimeError('boom')\n", encoding="utf-8")
+            rclone_conf = os.path.join(td, "rclone.conf")
+            Path(rclone_conf).write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+            stop_marker = os.path.join(td, "stopped.txt")
+
+            Path(bin_dir, "rclone").write_bytes(b"#!/usr/bin/env bash\nexit 0\n")
+            colab_mock = (
+                "#!/usr/bin/env bash\n"
+                'if [[ "$1" == "stop" ]]; then echo stopped >> "$STOP_MARKER"; exit 0; fi\n'
+                'if [[ "$1" == "exec" && "$*" == *"--timeout 600"* ]]; then echo "RCLONE_READY"; exit 0; fi\n'
+                'if [[ "$1" == "exec" ]]; then\n'
+                '  echo "Traceback (most recent call last):"\n'
+                '  echo "RuntimeError: CUDA OOM"\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n"
+            )
+            Path(bin_dir, "colab").write_bytes(colab_mock.encode("utf-8"))
+            os.chmod(os.path.join(bin_dir, "rclone"), 0o755)
+            os.chmod(os.path.join(bin_dir, "colab"), 0o755)
+
+            runner_sh = (
+                "#!/usr/bin/env bash\n"
+                "chmod +x ./bin/rclone ./bin/colab 2>/dev/null || true\n"
+                'export PATH="$PWD/bin:$PATH"\n'
+                'export LOCAL_RCLONE_CONF="./rclone.conf"\n'
+                'export STOP_MARKER="./stopped.txt"\n'
+                'export SESSION="bash-test-61"\n'
+                "exec bash ./relay_rclone.sh\n"
+            )
+            Path(td, "run_test.sh").write_bytes(runner_sh.encode("utf-8"))
+
+            res = subprocess.run(
+                [bash_bin, "./run_test.sh"],
+                cwd=td,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            combined = (res.stdout or "") + "\n" + (res.stderr or "")
+            self.assertEqual(res.returncode, 1, f"relay_rclone.sh must exit 1 on Traceback when EXEC_RC=0:\n{combined}")
+            self.assertIn("熔断止损", combined)
+            self.assertTrue(os.path.exists(stop_marker))
+
+    def test_issue_62_benchmark_propagates_remote_exec_failure_and_missing_results(self):
+        parser = manager_mod.build_arg_parser()
+        args = parser.parse_args(["benchmark", "--session-name", "llm-blue", "--requests", "2"])
+
+        with tempfile.TemporaryDirectory() as td:
+            bg_file = os.path.join(td, "bg.json")
+            Path(bg_file).write_text(json.dumps({"model_name": "Qwen-Test"}), encoding="utf-8")
+
+            # 1) Non-zero colab exec returncode -> non-zero exit
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(
+                    manager_mod,
+                    "run_cmd",
+                    return_value=subprocess.CompletedProcess(["colab", "exec"], 2, stdout="", stderr="exec error"),
+                ),
+            ):
+                self.assertNotEqual(manager_mod.cmd_benchmark(args), 0)
+
+            # 2) colab exec returns 0, but no BENCH_RESULT / Traceback -> non-zero exit
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(
+                    manager_mod,
+                    "run_cmd",
+                    return_value=subprocess.CompletedProcess(
+                        ["colab", "exec"], 0, stdout="Traceback (most recent call last):\nConnectionRefusedError", stderr=""
+                    ),
+                ),
+            ):
+                self.assertEqual(manager_mod.cmd_benchmark(args), 1)
+
+            # 3) colab exec returns 0 with 0 tokens -> non-zero exit
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(
+                    manager_mod,
+                    "run_cmd",
+                    return_value=subprocess.CompletedProcess(
+                        ["colab", "exec"],
+                        0,
+                        stdout='BENCH_RESULT {"ok_requests": 0, "bench_tokens": 0, "state": {"total_completion_tokens": 0}}\n',
+                        stderr="",
+                    ),
+                ),
+            ):
+                self.assertEqual(manager_mod.cmd_benchmark(args), 1)
+
+            # 4) Valid benchmark result -> returns 0
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(
+                    manager_mod,
+                    "run_cmd",
+                    return_value=subprocess.CompletedProcess(
+                        ["colab", "exec"],
+                        0,
+                        stdout='BENCH_RESULT {"ok_requests": 2, "bench_tokens": 36, "state": {"total_completion_tokens": 36, "instant_tps": 44.2}}\n',
+                        stderr="",
+                    ),
+                ),
+            ):
+                self.assertEqual(manager_mod.cmd_benchmark(args), 0)
+
+    def test_issue_63_smoke_test_dl_rejects_unread_checkpoint_and_missing_done_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake_rclone = os.path.join(td, "rclone.exe" if os.name == "nt" else "rclone")
+            Path(fake_rclone).write_bytes(b"stub")
+            fake_conf = os.path.join(td, "rclone.conf")
+            Path(fake_conf).write_text("[gdrive]\ntype = drive\ntoken = {}\n", encoding="utf-8")
+
+            # Case 1: Fake script writes dummy bytes in Pass #1, hardcodes epoch=2 in Pass #2 without reading ckpt or writing done flag
+            fake_unread = os.path.join(td, "fake_unread.py")
+            Path(fake_unread).write_text(
+                "import json, os\n"
+                "p = int(os.environ.get('SMOKE_PASS', '1'))\n"
+                "if p == 1:\n"
+                "    open(os.environ['CHECKPOINT_PATH'], 'wb').write(b'dummy-bytes')\n"
+                "    open(os.environ['TRAINING_STATE_FILE'], 'w').write(json.dumps({'current_epoch': 1, 'loss': 0.9}))\n"
+                "else:\n"
+                "    open(os.environ['TRAINING_STATE_FILE'], 'w').write(json.dumps({'current_epoch': 2, 'loss': 0.5}))\n",
+                encoding="utf-8",
+            )
+
+            # Case 2: Reads & parses checkpoint JSON, updates epoch=2, but omits done flag file
+            fake_no_flag = os.path.join(td, "fake_no_flag.py")
+            Path(fake_no_flag).write_text(
+                "import json, os\n"
+                "p = int(os.environ.get('SMOKE_PASS', '1'))\n"
+                "if p == 1:\n"
+                "    open(os.environ['CHECKPOINT_PATH'], 'w', encoding='utf-8').write(json.dumps({'epoch': 1}))\n"
+                "    open(os.environ['TRAINING_STATE_FILE'], 'w').write(json.dumps({'current_epoch': 1, 'loss': 0.9}))\n"
+                "else:\n"
+                "    ck = json.loads(open(os.environ['CHECKPOINT_PATH'], 'r', encoding='utf-8').read())\n"
+                "    open(os.environ['TRAINING_STATE_FILE'], 'w').write(json.dumps({'current_epoch': ck['epoch'] + 1, 'loss': 0.4}))\n",
+                encoding="utf-8",
+            )
+
+            # Case 3: Opens checkpoint in binary mode and ignores contents (passes read audit, caught by corrupt probe!)
+            fake_ignored_read = os.path.join(td, "fake_ignored_read.py")
+            Path(fake_ignored_read).write_text(
+                "import json, os\n"
+                "p = int(os.environ.get('SMOKE_PASS', '1'))\n"
+                "if p == 1:\n"
+                "    open(os.environ['CHECKPOINT_PATH'], 'wb').write(b'anything')\n"
+                "    open(os.environ['TRAINING_STATE_FILE'], 'w').write(json.dumps({'current_epoch': 1, 'loss': 0.9}))\n"
+                "else:\n"
+                "    _ = open(os.environ['CHECKPOINT_PATH'], 'rb').read()\n"
+                "    open(os.environ['TRAINING_STATE_FILE'], 'w').write(json.dumps({'current_epoch': 2, 'loss': 0.4}))\n"
+                "    open(os.environ['DONE_FLAG_PATH'], 'w').write('DONE')\n",
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(smoke_mod, "find_rclone", return_value=fake_rclone),
+                mock.patch.object(smoke_mod, "find_rclone_conf", return_value=fake_conf),
+            ):
+                self.assertEqual(smoke_mod.main(["--script", fake_unread, "--skip-rclone-net"]), 1)
+                self.assertEqual(smoke_mod.main(["--script", fake_no_flag, "--skip-rclone-net"]), 1)
+                self.assertEqual(smoke_mod.main(["--script", fake_ignored_read, "--skip-rclone-net"]), 1)
+                self.assertEqual(smoke_mod.main(["--script", str(REPO_ROOT / "train.py"), "--skip-rclone-net"]), 0)
+
+    def test_issue_68_cuda_engine_presets_rejected_on_cpu_and_tpu_before_provisioning(self):
+        with tempfile.TemporaryDirectory() as td:
+            bg_file = os.path.join(td, "bg.json")
+            keys_file = os.path.join(td, "keys.json")
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(ws_dir, exist_ok=True)
+            parser = manager_mod.build_arg_parser()
+
+            cli_calls = []
+
+            def fail_if_called(cmd, *args, **kwargs):
+                cli_calls.append(list(cmd))
+                raise AssertionError(f"Cloud CLI must not be invoked for incompatible hardware/engine: {cmd}")
+
+            for bad_gpu in ("CPU", "V5E1", "V6E1"):
+                for cuda_eng in ("vllm", "llama.cpp", "transformers"):
+                    with self.subTest(gpu=bad_gpu, engine=cuda_eng):
+                        args_bad = parser.parse_args(
+                            [
+                                "deploy",
+                                "--session-name",
+                                f"bad-{bad_gpu.lower()}",
+                                "--slot",
+                                "standalone",
+                                "--workspace",
+                                ws_dir,
+                                "--gpu",
+                                bad_gpu,
+                                "--engine",
+                                cuda_eng,
+                                "--model-name",
+                                "Qwen-7B",
+                            ]
+                        )
+                        err_buf = io.StringIO()
+                        with (
+                            mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                            mock.patch.object(manager_mod, "api_keys_path", return_value=keys_file),
+                            mock.patch.object(manager_mod, "run_cmd", side_effect=fail_if_called),
+                            mock.patch.object(sys, "stderr", err_buf),
+                        ):
+                            rc = manager_mod.cmd_deploy(args_bad)
+                        self.assertEqual(rc, 1)
+                        self.assertEqual(cli_calls, [])
+                        self.assertIn("不兼容", err_buf.getvalue())
+
+            # Explicit --llama-cpp-cpu ONLY exempts llama.cpp on CPU (NEVER transformers or vllm)
+            self.assertIsNone(manager_mod.validate_hardware_engine_compatibility("CPU", "llama.cpp", allow_cpu_llama_cpp=True))
+            self.assertIsNotNone(manager_mod.validate_hardware_engine_compatibility("CPU", "transformers", allow_cpu_llama_cpp=True))
+            self.assertIsNotNone(manager_mod.validate_hardware_engine_compatibility("CPU", "vllm", allow_cpu_llama_cpp=True))
+            args_tf_cpu = parser.parse_args(
+                [
+                    "deploy",
+                    "--session-name",
+                    "bad-tf-cpu",
+                    "--slot",
+                    "standalone",
+                    "--workspace",
+                    ws_dir,
+                    "--gpu",
+                    "CPU",
+                    "--engine",
+                    "transformers",
+                    "--llama-cpp-cpu",
+                    "--model-name",
+                    "Qwen-7B",
+                ]
+            )
+            with (
+                mock.patch.object(manager_mod, "bg_state_path", return_value=bg_file),
+                mock.patch.object(manager_mod, "api_keys_path", return_value=keys_file),
+                mock.patch.object(manager_mod, "run_cmd", side_effect=fail_if_called),
+                mock.patch.object(sys, "stderr", io.StringIO()),
+            ):
+                self.assertEqual(manager_mod.cmd_deploy(args_tf_cpu), 1)
+            self.assertEqual(cli_calls, [])
+
+            self.assertIsNone(manager_mod.validate_hardware_engine_compatibility("CPU", "builtin"))
+            self.assertIsNone(manager_mod.validate_hardware_engine_compatibility("G4", "vllm"))
+            self.assertIsNone(manager_mod.validate_hardware_engine_compatibility("T4", "llama.cpp"))
+
+    def test_issue_47_53_hf_trainer_final_download_fallback_and_rerun_verification(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws_dir = os.path.join(td, "ws_hf")
+            os.makedirs(ws_dir, exist_ok=True)
+            Path(ws_dir, "train.py").write_text("print('hf')\n", encoding="utf-8")
+            rclone_conf = os.path.join(td, "rclone.conf")
+            Path(rclone_conf).write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+            locks_file = os.path.join(td, "locks.json")
+
+            remote_hf = os.path.join(td, "remote_hf_checkpoints")
+            os.makedirs(os.path.join(remote_hf, "checkpoint-20"), exist_ok=True)
+            Path(remote_hf, "checkpoint-20", "trainer_state.json").write_text(
+                json.dumps({"global_step": 20, "epoch": 2.0}), encoding="utf-8"
+            )
+
+            mode = {"lsf_err": False, "hf_copy_ok": True, "done": False}
+            new_vm_calls = {"n": 0}
+            hf_copy_calls = {"n": 0}
+
+            def fake_run(cmd, timeout=300, stdin_text=None):
+                prog = os.path.basename(cmd[0]).lower()
+                if "rclone" in prog:
+                    if "lsf" in cmd:
+                        if mode["lsf_err"] and "--files-only" not in cmd:
+                            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="googleapi: Error 401: Invalid Credentials")
+                        if "--files-only" in cmd:
+                            out = "training_done.flag\n" if mode["done"] else ""
+                            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+                        out = "training_done.flag\nhf_checkpoints/\n" if mode["done"] else ""
+                        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+                    if "copyto" in cmd:
+                        # HF Trainer never produces checkpoint.pt on Drive
+                        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="file not found")
+                    if "copy" in cmd and cmd[-2].endswith("/hf_checkpoints"):
+                        hf_copy_calls["n"] += 1
+                        if not mode["hf_copy_ok"]:
+                            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="rclone hf copy failed")
+                        shutil.copytree(remote_hf, cmd[-1], dirs_exist_ok=True)
+                        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+                sub = cmd[1]
+                if sub == "new":
+                    new_vm_calls["n"] += 1
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Session READY", stderr="")
+                if sub == "exec":
+                    mode["done"] = True
+                    return subprocess.CompletedProcess(cmd, 0, stdout="TRAINING_COMPLETED\nTRAIN_EXIT_CODE=0\n", stderr="")
+                if sub == "status":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No active session")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            # 1) When rclone lsf fails with auth/network error (cannot confirm checkpoint.pt absent), MUST return 1
+            mode["lsf_err"] = True
+            with (
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_run),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(runner_mod.main(["--session", "hf-job", "--workspace", ws_dir]), 1)
+
+            # 2) When remote has training_done.flag + hf_checkpoints/ (no checkpoint.pt), re-run backfills hf_checkpoints and exits 0
+            mode["lsf_err"] = False
+            mode["hf_copy_ok"] = True
+            with (
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_run),
+                redirect_stdout(io.StringIO()),
+            ):
+                rc_backfill = runner_mod.main(["--session", "hf-job", "--workspace", ws_dir])
+
+            self.assertEqual(rc_backfill, 0)
+            self.assertEqual(new_vm_calls["n"], 1, "Backfill re-run must not allocate a second VM")
+            self.assertEqual(hf_copy_calls["n"], 1)
+            local_ts = os.path.join(ws_dir, "hf_checkpoints", "checkpoint-20", "trainer_state.json")
+            self.assertTrue(os.path.isfile(local_ts))
+            receipt = json.loads(Path(ws_dir, ".colab_dl_relay_status.json").read_text(encoding="utf-8"))
+            self.assertTrue(receipt["weights_downloaded"])
+            self.assertTrue(receipt["local_weights_path"].endswith("checkpoint-20"))
+
+            # 3) Subsequent re-run sees local hf_checkpoints/checkpoint-20 ready -> skips download and returns 0 immediately
+            with (
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_run),
+                redirect_stdout(io.StringIO()),
+            ):
+                rc_cached = runner_mod.main(["--session", "hf-job", "--workspace", ws_dir])
+
+            self.assertEqual(rc_cached, 0)
+            self.assertEqual(hf_copy_calls["n"], 1, "Local hf_checkpoints already valid; should not re-download")
+
+    def test_issue_79_switchover_rejects_same_target_session_before_warmup_without_stopping_service(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(ws_dir, exist_ok=True)
+            cfg_dir = os.path.join(td, "colab-cli")
+            os.makedirs(cfg_dir, exist_ok=True)
+            bg_state_file = os.path.join(cfg_dir, "llm_bluegreen_state.json")
+            initial_state = {
+                "session_prefix": "llm",
+                "active_slot": "blue",
+                "active_session": "vm-shared",
+                "blue_session": "vm-shared",
+                "green_session": None,
+                "slots": {
+                    "blue": {"session_name": "vm-shared", "role": "active", "model_name": "Qwen/Qwen2.5-7B-Instruct"}
+                },
+                "phase": "serving",
+                "engine": "builtin",
+                "model_name": "builtin-mock",
+                "gpu": "T4",
+                "high_mem": True,
+            }
+            Path(bg_state_file).write_text(json.dumps(initial_state, ensure_ascii=False), encoding="utf-8")
+
+            invoked_cmds = []
+
+            def forbid_subproc(cmd, *args, **kwargs):
+                invoked_cmds.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            parser = manager_mod.build_arg_parser()
+            for candidate_argv in (
+                ["switchover", "--workspace", ws_dir, "--session-name", "vm-shared"],
+                ["switchover", "--workspace", ws_dir, "--session-name", "VM-SHARED"],
+                ["switchover", "--workspace", ws_dir, "--session-prefix", "other-cluster", "--session-name", "vm-shared"],
+            ):
+                args_sw = parser.parse_args(candidate_argv)
+                err_buf = io.StringIO()
+                with (
+                    mock.patch.object(manager_mod, "bg_state_path", return_value=bg_state_file),
+                    mock.patch.object(
+                        manager_mod,
+                        "provision_and_warmup_slot",
+                        side_effect=AssertionError("provision_and_warmup_slot must NOT be called"),
+                    ),
+                    mock.patch.object(manager_mod, "run_cmd", side_effect=forbid_subproc),
+                    redirect_stderr(err_buf),
+                ):
+                    rc = manager_mod.cmd_switchover(args_sw)
+
+                self.assertEqual(rc, 1, f"switchover must fail before warmup for {candidate_argv}")
+                self.assertIn("vm-shared", err_buf.getvalue().lower())
+                self.assertEqual(invoked_cmds, [], "must not invoke colab new/exec/stop when target matches active session")
+                after_st = json.loads(Path(bg_state_file).read_text(encoding="utf-8"))
+                self.assertEqual(after_st["phase"], "serving")
+                self.assertEqual(after_st["active_session"], "vm-shared")
+
+    def test_issue_80_legacy_bare_gdrive_checkpoint_detected_and_migrated_with_real_rclone(self):
+        rclone_exe = runner_mod.find_bin("rclone")
+        if not os.path.exists(rclone_exe) and not shutil.which(rclone_exe):
+            self.skipTest("rclone binary not available")
+
+        with tempfile.TemporaryDirectory() as td:
+            drive_root = os.path.join(td, "drive_storage")
+            legacy_dir = os.path.join(drive_root, "colab_relay")
+            os.makedirs(legacy_dir, exist_ok=True)
+
+            # Create valid Epoch 7 PyTorch checkpoint at legacy `gdrive:colab_relay/checkpoint.pt`
+            legacy_ckpt = os.path.join(legacy_dir, "checkpoint.pt")
+            import torch
+
+            torch.save({"epoch": 7, "loss": 0.1234}, legacy_ckpt)
+
+            rclone_conf_alias = os.path.join(td, "rclone_alias.conf")
+            drive_norm = drive_root.replace("\\", "/")
+            Path(rclone_conf_alias).write_text(
+                f"[gdrive]\ntype = alias\nremote = {drive_norm}\n",
+                encoding="utf-8",
+            )
+
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(ws_dir, exist_ok=True)
+            Path(ws_dir, "train.py").write_text("print('ok')\n", encoding="utf-8")
+            locks_file = os.path.join(td, "locks.json")
+            colab_calls = []
+
+            def fake_colab_only(cmd, timeout=300, stdin_text=None):
+                prog = os.path.basename(cmd[0]).lower()
+                if "rclone" in prog:
+                    return subprocess.run(
+                        cmd,
+                        input=stdin_text,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout,
+                    )
+                colab_calls.append(list(cmd))
+                if cmd[1] == "status":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No active session")
+                if cmd[1] == "exec":
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout="CLOUD_SMOKE_PASSED\nTRAINING_COMPLETED\nTRAIN_EXIT_CODE=0\n", stderr=""
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK", stderr="")
+
+            # 1) Default run without confirmation MUST stop before allocating VM and prompt about legacy migration
+            out_unconfirmed = io.StringIO()
+            with (
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf_alias),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_colab_only),
+                redirect_stdout(out_unconfirmed),
+            ):
+                rc1 = runner_mod.main(["--session", "legacy-run", "--workspace", ws_dir])
+
+            self.assertEqual(rc1, 1, "Must block silent from-scratch start when legacy root checkpoint exists")
+            self.assertEqual(colab_calls, [], "Must abort BEFORE calling colab new")
+            self.assertIn("gdrive:colab_relay", out_unconfirmed.getvalue())
+            self.assertIn("gdrive:colab_relay/legacy-run", out_unconfirmed.getvalue())
+            self.assertIn("--migrate-legacy-gdrive", out_unconfirmed.getvalue())
+            self.assertTrue(os.path.isfile(legacy_ckpt), "Legacy checkpoint must remain untouched before confirmation")
+
+            # 2) Passing --migrate-legacy-gdrive migrates checkpoint.pt via real rclone into gdrive:colab_relay/legacy-run
+            out_migrated = io.StringIO()
+            with (
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf_alias),
+                mock.patch.object(runner_mod, "register_workspace"),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_colab_only),
+                redirect_stdout(out_migrated),
+            ):
+                rc2 = runner_mod.main(["--session", "legacy-run", "--workspace", ws_dir, "--migrate-legacy-gdrive"])
+
+            self.assertEqual(rc2, 0, f"Migrated run failed: {out_migrated.getvalue()}")
+            migrated_ckpt = os.path.join(drive_root, "colab_relay", "legacy-run", "checkpoint.pt")
+            self.assertTrue(os.path.isfile(migrated_ckpt), "Checkpoint must be migrated to isolated subdirectory")
+            self.assertFalse(os.path.exists(legacy_ckpt), "Legacy root checkpoint moved cleanly")
+
+            # Verify train.py pulls the Epoch 7 checkpoint from gdrive:colab_relay/legacy-run via real rclone
+            pulled_local = os.path.join(td, "pulled", "checkpoint.pt")
+            with (
+                mock.patch.object(train_mod, "SMOKE_TEST", False),
+                mock.patch.object(train_mod, "GDRIVE_DIR", "gdrive:colab_relay/legacy-run"),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "SMOKE_TEST": "0",
+                        "SMOKE_SKIP_RCLONE": "0",
+                        "RELAY_ROUND": "1",
+                        "RCLONE_CONFIG": rclone_conf_alias,
+                        "RELAY_GDRIVE_DIR": "gdrive:colab_relay/legacy-run",
+                        "PATH": os.path.dirname(rclone_exe) + os.pathsep + os.environ.get("PATH", ""),
+                    },
+                    clear=False,
+                ),
+            ):
+                ok_pull = train_mod.rclone_pull_checkpoint(pulled_local)
+            self.assertTrue(ok_pull)
+            loaded = train_mod.load_checkpoint_safely(pulled_local)
+            self.assertEqual(loaded["epoch"], 7)
+
+    def test_issue_81_round2_empty_remote_directory_aborts_with_real_rclone(self):
+        rclone_exe = runner_mod.find_bin("rclone")
+        if not os.path.exists(rclone_exe) and not shutil.which(rclone_exe):
+            self.skipTest("rclone binary not available")
+
+        with tempfile.TemporaryDirectory() as td:
+            drive_root = os.path.join(td, "drive_storage")
+            empty_job_dir = os.path.join(drive_root, "colab_relay", "wiped-round2")
+            os.makedirs(empty_job_dir, exist_ok=True)
+
+            rclone_conf_alias = os.path.join(td, "rclone_alias.conf")
+            drive_norm = drive_root.replace("\\", "/")
+            Path(rclone_conf_alias).write_text(
+                f"[gdrive]\ntype = alias\nremote = {drive_norm}\n",
+                encoding="utf-8",
+            )
+
+            run_cwd = os.path.join(td, "run_cwd")
+            os.makedirs(run_cwd, exist_ok=True)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "SMOKE_TEST": "0",
+                    "RELAY_ROUND": "2",
+                    "RESET_DONE_FLAG": "0",
+                    "GDRIVE_DIR": "gdrive:colab_relay/wiped-round2",
+                    "RELAY_GDRIVE_DIR": "gdrive:colab_relay/wiped-round2",
+                    "RCLONE_CONFIG": rclone_conf_alias,
+                    "PATH": os.path.dirname(rclone_exe) + os.pathsep + env.get("PATH", ""),
+                }
+            )
+            res = subprocess.run(
+                [sys.executable, "-B", str(REPO_ROOT / "train.py")],
+                cwd=run_cwd,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            self.assertNotEqual(res.returncode, 0, "train.py must abort when RELAY_ROUND=2 finds empty cloud directory")
+            combined = (res.stdout or "") + "\n" + (res.stderr or "")
+            self.assertIn("checkpoint.pt", combined)
+            self.assertFalse(os.path.exists(os.path.join(run_cwd, "checkpoint.pt")), "Must not train from epoch 0")
+
+    def test_issue_86_detached_relay_resolves_relative_workspace_and_reports_invalid_workspace(self):
+        rclone_exe = runner_mod.find_bin("rclone")
+        if not os.path.exists(rclone_exe) and not shutil.which(rclone_exe):
+            self.skipTest("rclone binary not available")
+
+        with tempfile.TemporaryDirectory() as td:
+            parent_dir = os.path.join(td, "parent")
+            proj_dir = os.path.join(parent_dir, "project")
+            os.makedirs(proj_dir, exist_ok=True)
+            Path(proj_dir, "train.py").write_text("print('TRAINING_COMPLETED')\n", encoding="utf-8")
+            Path(proj_dir, "checkpoint_final.pt").write_bytes(b"READY_WEIGHTS")
+
+            drive_root = os.path.join(td, "drive_storage")
+            job_drive = os.path.join(drive_root, "colab_relay", "det-rel")
+            os.makedirs(job_drive, exist_ok=True)
+            Path(job_drive, "training_done.flag").write_text("done\n", encoding="utf-8")
+
+            rclone_conf_alias = os.path.join(td, "rclone_alias.conf")
+            drive_norm = drive_root.replace("\\", "/")
+            Path(rclone_conf_alias).write_text(
+                f"[gdrive]\ntype = alias\nremote = {drive_norm}\n",
+                encoding="utf-8",
+            )
+
+            home_dir = os.path.join(td, "fake_home")
+            os.makedirs(home_dir, exist_ok=True)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "RCLONE_CONFIG": rclone_conf_alias,
+                    "USERPROFILE": home_dir,
+                    "HOME": home_dir,
+                    "PATH": os.path.dirname(rclone_exe) + os.pathsep + env.get("PATH", ""),
+                }
+            )
+            runner_script = str(REPO_ROOT / ".agents" / "skills" / "colab-dl-relay" / "scripts" / "dl_relay_runner.py")
+
+            res = subprocess.run(
+                [sys.executable, runner_script, "--session", "det-rel", "--workspace", "project", "--detach"],
+                cwd=parent_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+            self.assertEqual(res.returncode, 0, f"Detach parent failed: {res.stdout}\n{res.stderr}")
+            self.assertIn("已在后台启动", res.stdout)
+
+            # Wait up to 5s for the detached child to write `.colab_dl_relay_status.json` inside `parent/project/`
+            receipt_file = os.path.join(proj_dir, ".colab_dl_relay_status.json")
+            deadline = time.time() + 5.0
+            while time.time() < deadline and not os.path.exists(receipt_file):
+                time.sleep(0.1)
+
+            log_path = os.path.join(proj_dir, ".colab_dl_relay.log")
+            log_text = Path(log_path).read_text(encoding="utf-8", errors="replace") if os.path.exists(log_path) else ""
+            self.assertNotIn("找不到训练脚本", log_text, f"Detached child resolved wrong path:\n{log_text}")
+            self.assertNotIn(os.path.join("project", "project"), log_text)
+            self.assertTrue(os.path.isfile(receipt_file), f"Detached child did not complete; log:\n{log_text}")
+            receipt = json.loads(Path(receipt_file).read_text(encoding="utf-8"))
+            self.assertTrue(receipt["training_completed"])
+            self.assertTrue(receipt["weights_downloaded"])
+
+            # Verify detached child registered relative `train.py` (not absolute path) in workspaces.json
+            ws_reg_path = os.path.join(home_dir, ".config", "colab-cli", "workspaces.json")
+            if os.path.exists(ws_reg_path):
+                ws_reg = json.loads(Path(ws_reg_path).read_text(encoding="utf-8"))
+                self.assertEqual(ws_reg.get("det-rel", {}).get("active_script"), "train.py")
+
+            # Verify pre-detach GDrive lock conflict fails fast in parent without overwriting existing .colab_dl_relay.pid
+            locks_path = os.path.join(home_dir, ".config", "colab-cli", "dl_relay_locks.json")
+            os.makedirs(os.path.dirname(locks_path), exist_ok=True)
+            Path(locks_path).write_text(
+                json.dumps(
+                    {
+                        "gdrive:colab_relay/shared-lock": {
+                            "session": "sess-live",
+                            "pid": os.getpid(),
+                            "workspace": proj_dir,
+                            "updated_at": time.time(),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            pid_file = os.path.join(proj_dir, ".colab_dl_relay.pid")
+            Path(pid_file).write_text("999999", encoding="utf-8")
+            res_locked = subprocess.run(
+                [
+                    sys.executable,
+                    runner_script,
+                    "--session",
+                    "sess-intruder",
+                    "--workspace",
+                    "project",
+                    "--gdrive-dir",
+                    "gdrive:colab_relay/shared-lock",
+                    "--detach",
+                ],
+                cwd=parent_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+            self.assertNotEqual(res_locked.returncode, 0, "Conflicting GDrive lock must fail in --detach parent")
+            self.assertIn("sess-live", res_locked.stdout + res_locked.stderr)
+            self.assertEqual(Path(pid_file).read_text(encoding="utf-8"), "999999", "Must not overwrite .colab_dl_relay.pid")
+
+    def test_instance_keep_alive_profile_registered_by_cli_scripts(self):
+        runner_mod = load_module(
+            "dl_relay_runner_ka_test",
+            REPO_ROOT / ".agents" / "skills" / "colab-dl-relay" / "scripts" / "dl_relay_runner.py",
+        )
+        mgr_mod = load_module(
+            "llm_bluegreen_manager_ka_test",
+            REPO_ROOT / ".agents" / "skills" / "colab-llm-bluegreen" / "scripts" / "llm_bluegreen_manager.py",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            cfg_dir = os.path.join(td, "cfg")
+            ws_dir = os.path.join(td, "ws")
+            os.makedirs(cfg_dir, exist_ok=True)
+            os.makedirs(ws_dir, exist_ok=True)
+            with (
+                mock.patch.object(runner_mod, "colab_cfg_dir", return_value=cfg_dir),
+                mock.patch.object(mgr_mod, "colab_cfg_dir", return_value=cfg_dir),
+            ):
+                runner_mod.register_workspace("dl-vm-1", ws_dir, "train.py", "DL training")
+                mgr_mod.register_workspace("llm-vm-1", ws_dir, "LLM deploy")
+                prof_file = os.path.join(cfg_dir, "pilot_session_profiles.json")
+                data = json.loads(Path(prof_file).read_text(encoding="utf-8"))
+                self.assertEqual(
+                    data["dl-vm-1"]["keep_alive"],
+                    {"enabled": True, "interval_seconds": 90, "kernel_ping": True},
+                )
+                self.assertEqual(
+                    data["llm-vm-1"]["keep_alive"],
+                    {"enabled": True, "interval_seconds": 90, "kernel_ping": True},
+                )
+                # User customization must NOT be overwritten by subsequent register_workspace calls
+                data["dl-vm-1"]["keep_alive"]["interval_seconds"] = 300
+                data["dl-vm-1"]["keep_alive"]["enabled"] = False
+                Path(prof_file).write_text(json.dumps(data), encoding="utf-8")
+                runner_mod.register_workspace("dl-vm-1", ws_dir, "train.py", "DL training")
+                after = json.loads(Path(prof_file).read_text(encoding="utf-8"))
+                self.assertEqual(after["dl-vm-1"]["keep_alive"]["interval_seconds"], 300)
+                self.assertEqual(after["dl-vm-1"]["keep_alive"]["enabled"], False)
+
+    def test_dl_relay_grab_modes_fallback_gpus_and_env_overrides(self):
+        runner_mod = load_module(
+            "dl_relay_runner_grab_test",
+            REPO_ROOT / ".agents" / "skills" / "colab-dl-relay" / "scripts" / "dl_relay_runner.py",
+        )
+        # 1. parse_fallback_gpus deduplicates and rejects invalid models
+        self.assertEqual(
+            runner_mod.parse_fallback_gpus("A100", "g4, L4, a100, G4"),
+            ["A100", "G4", "L4"],
+        )
+        with self.assertRaises(ValueError):
+            runner_mod.parse_fallback_gpus("T4", "G4,RTX4090")
+
+        # 2. build_detached_child_cmd forwards grab policy flags
+        parsed = runner_mod.build_parser().parse_args(
+            [
+                "--session",
+                "grab-exp",
+                "--workspace",
+                ".",
+                "--grab-mode",
+                "budget",
+                "--grab-timeout-minutes",
+                "90",
+                "--grab-retry-seconds",
+                "12",
+                "--fallback-gpus",
+                "G4,L4",
+            ]
+        )
+        child_cmd = runner_mod.build_detached_child_cmd(
+            parsed, "/abs/ws", "/abs/ws/train.py", "gdrive:colab_relay/grab-exp"
+        )
+        self.assertIn("--grab-mode", child_cmd)
+        self.assertIn("budget", child_cmd)
+        self.assertIn("90.0", child_cmd)
+        self.assertIn("--grab-retry-seconds", child_cmd)
+        self.assertIn("12.0", child_cmd)
+        self.assertIn("--fallback-gpus", child_cmd)
+        self.assertIn("G4,L4", child_cmd)
+
+        # 3. run_cmd injects COLAB_CLI_ASSIGN_RETRIES=0 and GPU(60s)/TPU(300s) COLAB_CLI_REQUEST_TIMEOUT
+        captured_envs = []
+
+        def fake_subproc_run(cmd, **kwargs):
+            captured_envs.append((list(cmd), dict(kwargs.get("env") or {})))
+            return subprocess.CompletedProcess(cmd, 0, stdout="Session READY", stderr="")
+
+        with mock.patch.object(runner_mod.subprocess, "run", side_effect=fake_subproc_run):
+            runner_mod.run_cmd(["colab", "new", "-s", "vm-gpu", "--gpu", "A100"])
+            runner_mod.run_cmd(["colab", "new", "-s", "vm-tpu", "--tpu", "v6e1"])
+
+        self.assertEqual(captured_envs[0][1].get("COLAB_CLI_ASSIGN_RETRIES"), "0")
+        self.assertEqual(captured_envs[0][1].get("COLAB_CLI_REQUEST_TIMEOUT"), "60")
+        self.assertEqual(captured_envs[1][1].get("COLAB_CLI_ASSIGN_RETRIES"), "0")
+        self.assertEqual(captured_envs[1][1].get("COLAB_CLI_REQUEST_TIMEOUT"), "300")
+
+        # 4. --grab-mode fast + --fallback-gpus G4 rotates immediately on A100 503 and completes on G4
+        with tempfile.TemporaryDirectory() as td:
+            ws_dir = os.path.join(td, "ws")
+            cfg_dir = os.path.join(td, "cfg")
+            os.makedirs(ws_dir, exist_ok=True)
+            os.makedirs(cfg_dir, exist_ok=True)
+            Path(os.path.join(ws_dir, "train.py")).write_text("print('ok')\n", encoding="utf-8")
+            rclone_conf = os.path.join(td, "rclone.conf")
+            Path(rclone_conf).write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+            locks_file = os.path.join(td, "locks.json")
+            tried_gpus = []
+
+            def fake_run(cmd, timeout=300, stdin_text=None):
+                prog = os.path.basename(cmd[0]).lower()
+                if "rclone" in prog:
+                    if "copyto" in cmd:
+                        Path(cmd[-1]).write_bytes(b"weights-ok")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                sub = cmd[1]
+                if sub == "new":
+                    gpu_idx = cmd.index("--gpu") + 1
+                    gpu_name = cmd[gpu_idx]
+                    tried_gpus.append(gpu_name)
+                    if gpu_name == "A100":
+                        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="HTTP 503 Service Unavailable")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Session READY", stderr="")
+                if sub == "status":
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No active session")
+                if sub == "sessions":
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                if sub == "upload":
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Uploaded", stderr="")
+                if sub == "exec":
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout="CLOUD_SMOKE_PASSED\nTRAINING_COMPLETED\nTRAIN_EXIT_CODE=0\n",
+                        stderr="",
+                    )
+                if sub == "stop":
+                    return subprocess.CompletedProcess(cmd, 0, stdout="Stopped", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(runner_mod, "colab_cfg_dir", return_value=cfg_dir),
+                mock.patch.object(runner_mod, "relay_locks_path", return_value=locks_file),
+                mock.patch.object(runner_mod, "find_rclone_conf", return_value=rclone_conf),
+                mock.patch.object(runner_mod, "run_cmd", side_effect=fake_run),
+                redirect_stdout(io.StringIO()),
+            ):
+                rc = runner_mod.main(
+                    [
+                        "--session",
+                        "exp-fallback",
+                        "--workspace",
+                        ws_dir,
+                        "--gpu",
+                        "A100",
+                        "--grab-mode",
+                        "fast",
+                        "--fallback-gpus",
+                        "G4",
+                        "--reset-done-flag",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual(tried_gpus, ["A100", "G4"])
+
+
+class Issue94ProfileLockTests(unittest.TestCase):
+    @staticmethod
+    def _spawn_external_lock_writer(
+        prof_file: str,
+        ready_flag: str,
+        hold_seconds: float,
+        update_payload: dict | None = None,
+    ) -> subprocess.Popen:
+        child_code = """
+import json, os, sys, time
+prof_file, ready_flag, hold_s, payload_raw = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
+lock_file = f"{prof_file}.lock"
+os.makedirs(os.path.dirname(os.path.abspath(prof_file)), exist_ok=True)
+lf = open(lock_file, "a+b")
+try:
+    if os.name == "nt":
+        import msvcrt
+        lf.seek(0)
+        msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    with open(ready_flag, "w", encoding="utf-8") as rf:
+        rf.write("LOCKED")
+    time.sleep(hold_s)
+    if payload_raw != "null":
+        patch = json.loads(payload_raw)
+        data = {}
+        if os.path.exists(prof_file):
+            with open(prof_file, "r", encoding="utf-8") as f:
+                raw_txt = f.read().strip()
+                if raw_txt:
+                    data = json.loads(raw_txt)
+        for k, v in patch.items():
+            cur = data.get(k) if isinstance(data.get(k), dict) else {}
+            cur.update(v)
+            data[k] = cur
+        tmp = f"{prof_file}.{os.getpid()}.ext.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, prof_file)
+finally:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            lf.seek(0)
+            msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    lf.close()
+"""
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                child_code,
+                prof_file,
+                ready_flag,
+                str(hold_seconds),
+                json.dumps(update_payload),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def test_issue_94_concurrent_external_lock_preserves_other_instance_updates(self):
+        for label, mod in (("dl_relay_runner", runner_mod), ("llm_bluegreen_manager", manager_mod)):
+            with self.subTest(module=label):
+                with tempfile.TemporaryDirectory() as td:
+                    cfg_dir = os.path.join(td, "cfg")
+                    os.makedirs(cfg_dir, exist_ok=True)
+                    prof_file = os.path.join(cfg_dir, "pilot_session_profiles.json")
+                    ready_flag = os.path.join(td, "locked.flag")
+
+                    Path(prof_file).write_text(
+                        json.dumps(
+                            {
+                                "vm-existing": {
+                                    "boot_mode": "relay",
+                                    "accelerator": "G4",
+                                    "keep_alive": {"enabled": True, "interval_seconds": 90, "kernel_ping": True},
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    proc = self._spawn_external_lock_writer(
+                        prof_file,
+                        ready_flag,
+                        hold_seconds=0.30,
+                        update_payload={
+                            "vm-existing": {
+                                "keep_alive": {"enabled": False, "interval_seconds": 600, "kernel_ping": False}
+                            }
+                        },
+                    )
+                    try:
+                        deadline = time.monotonic() + 5.0
+                        while time.monotonic() < deadline and not os.path.exists(ready_flag):
+                            time.sleep(0.01)
+                        self.assertTrue(os.path.exists(ready_flag), "External lock writer did not signal readiness")
+
+                        t0 = time.monotonic()
+                        with mock.patch.object(mod, "colab_cfg_dir", return_value=cfg_dir):
+                            ok = mod.ensure_session_keep_alive_profile("vm-new")
+                        elapsed = time.monotonic() - t0
+                        out, err = proc.communicate(timeout=5)
+                        self.assertEqual(proc.returncode, 0, f"Child failed: {out}\n{err}")
+                        self.assertTrue(ok)
+                        self.assertGreaterEqual(elapsed, 0.15)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.communicate()
+
+                    final_data = json.loads(Path(prof_file).read_text(encoding="utf-8"))
+                    self.assertEqual(final_data["vm-existing"]["boot_mode"], "relay")
+                    self.assertEqual(final_data["vm-existing"]["accelerator"], "G4")
+                    self.assertEqual(
+                        final_data["vm-existing"]["keep_alive"],
+                        {"enabled": False, "interval_seconds": 600, "kernel_ping": False},
+                    )
+                    self.assertEqual(
+                        final_data["vm-new"]["keep_alive"],
+                        {"enabled": True, "interval_seconds": 90, "kernel_ping": True},
+                    )
+
+    def test_issue_94_real_multiprocess_stress_across_runner_manager_and_external_writer(self):
+        with tempfile.TemporaryDirectory() as td:
+            home_dir = os.path.join(td, "home")
+            cfg_dir = os.path.join(home_dir, ".config", "colab-cli")
+            os.makedirs(cfg_dir, exist_ok=True)
+            prof_file = os.path.join(cfg_dir, "pilot_session_profiles.json")
+            Path(prof_file).write_text(
+                json.dumps(
+                    {
+                        "vm-paused": {
+                            "boot_mode": "llm",
+                            "keep_alive": {"enabled": True, "interval_seconds": 90, "kernel_ping": True},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env["HOME"] = home_dir
+            env["USERPROFILE"] = home_dir
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+            runner_path = str(REPO_ROOT / ".agents" / "skills" / "colab-dl-relay" / "scripts" / "dl_relay_runner.py")
+            manager_path = str(REPO_ROOT / ".agents" / "skills" / "colab-llm-bluegreen" / "scripts" / "llm_bluegreen_manager.py")
+
+            py_worker_code = """
+import importlib.util, sys
+mod_path, sess = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location("wmod", mod_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+ok = mod.ensure_session_keep_alive_profile(sess)
+sys.exit(0 if ok else 2)
+"""
+            ext_worker_code = """
+import json, os, sys, time
+prof_file = sys.argv[1]
+lock_file = f"{prof_file}.lock"
+lf = open(lock_file, "a+b")
+try:
+    if os.name == "nt":
+        import msvcrt
+        lf.seek(0)
+        msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    time.sleep(0.05)
+    with open(prof_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    cur = data.get("vm-paused") or {}
+    cur["keep_alive"] = {"enabled": False, "interval_seconds": 600, "kernel_ping": False}
+    data["vm-paused"] = cur
+    tmp = f"{prof_file}.{os.getpid()}.ext.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, prof_file)
+finally:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            lf.seek(0)
+            msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    lf.close()
+"""
+            procs = []
+            for i in range(4):
+                procs.append(
+                    subprocess.Popen(
+                        [sys.executable, "-c", py_worker_code, runner_path, f"dl-vm-{i}"],
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                )
+                procs.append(
+                    subprocess.Popen(
+                        [sys.executable, "-c", py_worker_code, manager_path, f"llm-vm-{i}"],
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                )
+            procs.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", ext_worker_code, prof_file],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+
+            try:
+                for p in procs:
+                    out, err = p.communicate(timeout=20)
+                    self.assertEqual(p.returncode, 0, f"Worker failed rc={p.returncode}: {out}\n{err}")
+            finally:
+                for p in procs:
+                    if p.poll() is None:
+                        p.kill()
+                        p.communicate()
+
+            final_data = json.loads(Path(prof_file).read_text(encoding="utf-8"))
+            for i in range(4):
+                self.assertIn(f"dl-vm-{i}", final_data)
+                self.assertIn(f"llm-vm-{i}", final_data)
+            self.assertEqual(final_data["vm-paused"]["boot_mode"], "llm")
+            self.assertEqual(
+                final_data["vm-paused"]["keep_alive"],
+                {"enabled": False, "interval_seconds": 600, "kernel_ping": False},
+            )
+
+    def test_issue_94_lock_timeout_and_corrupt_file_fail_closed(self):
+        for label, mod in (("dl_relay_runner", runner_mod), ("llm_bluegreen_manager", manager_mod)):
+            with self.subTest(module=label):
+                with tempfile.TemporaryDirectory() as td:
+                    cfg_dir = os.path.join(td, "cfg")
+                    os.makedirs(cfg_dir, exist_ok=True)
+                    prof_file = os.path.join(cfg_dir, "pilot_session_profiles.json")
+                    ready_flag = os.path.join(td, "locked.flag")
+                    seed_raw = json.dumps({"vm-safe": {"keep_alive": {"enabled": False, "interval_seconds": 180}}})
+                    Path(prof_file).write_text(seed_raw, encoding="utf-8")
+
+                    proc = self._spawn_external_lock_writer(prof_file, ready_flag, hold_seconds=0.6, update_payload=None)
+                    try:
+                        deadline = time.monotonic() + 5.0
+                        while time.monotonic() < deadline and not os.path.exists(ready_flag):
+                            time.sleep(0.01)
+                        self.assertTrue(os.path.exists(ready_flag))
+
+                        with mock.patch.object(mod, "colab_cfg_dir", return_value=cfg_dir):
+                            with self.assertRaises(TimeoutError):
+                                with mod._session_profiles_lock(prof_file, timeout=0.15):
+                                    pass
+                            ok_timeout = mod.ensure_session_keep_alive_profile("vm-timeout", lock_timeout=0.15)
+                        self.assertFalse(ok_timeout)
+                        self.assertEqual(Path(prof_file).read_text(encoding="utf-8"), seed_raw)
+                    finally:
+                        proc.communicate(timeout=5)
+
+                    # Corrupt non-empty JSON must fail closed without overwriting
+                    corrupt_raw = "{broken-json-not-closed"
+                    Path(prof_file).write_text(corrupt_raw, encoding="utf-8")
+                    with mock.patch.object(mod, "colab_cfg_dir", return_value=cfg_dir):
+                        ok_corrupt = mod.ensure_session_keep_alive_profile("vm-corrupt", lock_timeout=1.0)
+                    self.assertFalse(ok_corrupt)
+                    self.assertEqual(Path(prof_file).read_text(encoding="utf-8"), corrupt_raw)
 
 
 if __name__ == "__main__":

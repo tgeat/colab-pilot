@@ -1,6 +1,17 @@
-import { createContext, ReactNode, useCallback, useContext, useEffect, useState } from "react";
+import {
+  createContext,
+  type ReactNode,
+  type RefObject,
+  useCallback,
+  useContext,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
 import { X } from "lucide-react";
 import { pct } from "../format";
+import { computeNextFocusTrapIndex } from "../chatUtils";
 
 /* ───────── Google Colab 官方图标 ───────── */
 export function ColabIcon({ size = 20, className }: { size?: number; className?: string }) {
@@ -25,7 +36,7 @@ export function ColabIcon({ size = 20, className }: { size?: number; className?:
 }
 
 /* ───────── Toast ───────── */
-type ToastKind = "info" | "success" | "error" | "warn";
+export type ToastKind = "info" | "success" | "error" | "warn";
 interface ToastItem { id: number; kind: ToastKind; text: string }
 const ToastCtx = createContext<(text: string, kind?: ToastKind) => void>(() => {});
 export const useToast = () => useContext(ToastCtx);
@@ -42,7 +53,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const push = useCallback((text: string, kind: ToastKind = "info") => {
     const id = Date.now() + Math.random();
     setItems((s) => [...s, { id, kind, text }]);
-    setTimeout(() => setItems((s) => s.filter((t) => t.id !== id)), kind === "error" ? 7000 : 4200);
+    setTimeout(
+      () => setItems((s) => s.filter((t) => t.id !== id)),
+      kind === "error" || kind === "warn" ? 7000 : 4200,
+    );
   }, []);
   return (
     <ToastCtx.Provider value={push}>
@@ -59,6 +73,155 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   );
 }
 
+/* ───────── 无障碍弹窗焦点锁定 (Focus Trap #70) ───────── */
+const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not(:disabled)",
+  'input:not(:disabled):not([type="hidden"])',
+  "select:not(:disabled)",
+  "textarea:not(:disabled)",
+  "summary",
+  '[tabindex]:not([tabindex="-1"])',
+].join(", ");
+
+function getVisibleFocusableElements(container: HTMLElement): HTMLElement[] {
+  const nodes = Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
+  return nodes.filter((el) => {
+    if (el.hasAttribute("disabled") || el.getAttribute("aria-hidden") === "true") {
+      return false;
+    }
+    const closedDetails = el.closest("details:not([open])");
+    if (closedDetails && container.contains(closedDetails)) {
+      const firstSummary = closedDetails.querySelector(":scope > summary");
+      if (el !== firstSummary) return false;
+    }
+    return el.offsetParent !== null || el.getClientRects().length > 0;
+  });
+}
+
+function getOverlayPriority(modal: HTMLElement): number {
+  const overlay = modal.closest<HTMLElement>(".overlay");
+  if (!overlay) return 100;
+  if (overlay.classList.contains("overlay-topmost")) return 180;
+  const computed =
+    typeof window !== "undefined"
+      ? Number.parseInt(window.getComputedStyle(overlay).zIndex, 10)
+      : Number.NaN;
+  return Number.isFinite(computed) ? computed : 100;
+}
+
+export function isTopmostModal(container: HTMLElement): boolean {
+  const allModals = Array.from(document.querySelectorAll<HTMLElement>(".overlay .modal"));
+  if (allModals.length === 0) return true;
+  let best = allModals[0];
+  let bestZ = getOverlayPriority(best);
+  for (let i = 1; i < allModals.length; i++) {
+    const z = getOverlayPriority(allModals[i]);
+    if (z >= bestZ) {
+      best = allModals[i];
+      bestZ = z;
+    }
+  }
+  return best === container;
+}
+
+export function useModalFocusTrap(
+  open: boolean,
+  modalRef: RefObject<HTMLElement | null>,
+  initialFocusRef?: RefObject<HTMLElement | null>,
+) {
+  const initialFocusRefHolder = useRef(initialFocusRef);
+  initialFocusRefHolder.current = initialFocusRef;
+
+  useEffect(() => {
+    if (!open) return;
+    const prevActive = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+    const focusInitial = () => {
+      const modalEl = modalRef.current;
+      if (!modalEl) return;
+      if (modalEl.contains(document.activeElement)) return;
+
+      const preferred = initialFocusRefHolder.current?.current;
+      if (preferred && !preferred.hasAttribute("disabled")) {
+        preferred.focus();
+        return;
+      }
+      const bodyEl = modalEl.querySelector<HTMLElement>(".modal-body");
+      const bodyFocusables = bodyEl ? getVisibleFocusableElements(bodyEl) : [];
+      if (bodyFocusables.length > 0) {
+        bodyFocusables[0].focus();
+        return;
+      }
+      const allFocusables = getVisibleFocusableElements(modalEl);
+      if (allFocusables.length > 0) {
+        allFocusables[0].focus();
+        return;
+      }
+      modalEl.focus();
+    };
+
+    const rafId = window.requestAnimationFrame(focusInitial);
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Tab") return;
+      const modalEl = modalRef.current;
+      if (!modalEl || !isTopmostModal(modalEl)) return;
+
+      const focusables = getVisibleFocusableElements(modalEl);
+      if (focusables.length === 0) {
+        e.preventDefault();
+        modalEl.focus();
+        return;
+      }
+
+      const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      const currentIdx = active && modalEl.contains(active) ? focusables.indexOf(active) : -1;
+      if (
+        currentIdx === -1 ||
+        (!e.shiftKey && currentIdx === focusables.length - 1) ||
+        (e.shiftKey && currentIdx === 0)
+      ) {
+        e.preventDefault();
+        const nextIdx = computeNextFocusTrapIndex(focusables.length, currentIdx, e.shiftKey);
+        if (nextIdx >= 0 && focusables[nextIdx]) {
+          focusables[nextIdx].focus();
+        }
+      }
+    };
+
+    const onFocusIn = (e: FocusEvent) => {
+      const modalEl = modalRef.current;
+      if (!modalEl || !isTopmostModal(modalEl)) return;
+      const target = e.target;
+      if (target instanceof Node && !modalEl.contains(target)) {
+        const focusables = getVisibleFocusableElements(modalEl);
+        if (focusables.length > 0) {
+          focusables[0].focus();
+        } else {
+          modalEl.focus();
+        }
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown, true);
+    document.addEventListener("focusin", onFocusIn, true);
+
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      window.removeEventListener("keydown", onKeyDown, true);
+      document.removeEventListener("focusin", onFocusIn, true);
+      if (prevActive && document.contains(prevActive) && typeof prevActive.focus === "function") {
+        try {
+          prevActive.focus();
+        } catch {
+          // ignore
+        }
+      }
+    };
+  }, [open, modalRef]);
+}
+
 /* ───────── Modal ───────── */
 export function Modal(props: {
   open: boolean;
@@ -68,27 +231,48 @@ export function Modal(props: {
   icon?: ReactNode;
   iconBg?: string;
   wide?: boolean;
+  topPriority?: boolean;
   footer?: ReactNode;
   children: ReactNode;
   closable?: boolean;
 }) {
   const closable = props.closable !== false;
+  const modalRef = useRef<HTMLDivElement | null>(null);
+  const titleId = useId();
+  const onCloseRef = useRef(props.onClose);
+  onCloseRef.current = props.onClose;
+
+  useModalFocusTrap(props.open, modalRef);
+
   useEffect(() => {
     if (!props.open || !closable) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        const modalEl = modalRef.current;
+        if (modalEl && !isTopmostModal(modalEl)) return;
         e.preventDefault();
-        props.onClose();
+        e.stopImmediatePropagation();
+        onCloseRef.current();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [props.open, closable, props.onClose]);
+  }, [props.open, closable]);
 
   if (!props.open) return null;
   return (
-    <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && closable && props.onClose()}>
-      <div className={`modal ${props.wide ? "wide" : ""}`}>
+    <div
+      className={`overlay ${props.topPriority ? "overlay-topmost" : ""}`.trim()}
+      onMouseDown={(e) => e.target === e.currentTarget && closable && props.onClose()}
+    >
+      <div
+        ref={modalRef}
+        className={`modal ${props.wide ? "wide" : ""}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+      >
         <div className="modal-head">
           {props.icon && (
             <div className="modal-icon" style={{ background: props.iconBg ?? "var(--primary-50)" }}>
@@ -96,11 +280,11 @@ export function Modal(props: {
             </div>
           )}
           <div style={{ flex: 1 }}>
-            <h3>{props.title}</h3>
+            <h3 id={titleId}>{props.title}</h3>
             {props.sub && <div className="sub">{props.sub}</div>}
           </div>
           {closable && (
-            <button className="icon-btn" onClick={props.onClose} aria-label="关闭">
+            <button type="button" className="icon-btn" onClick={props.onClose} aria-label="关闭">
               <X size={16} />
             </button>
           )}

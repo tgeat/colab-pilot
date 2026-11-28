@@ -100,6 +100,8 @@ while true; do
     set +e
     colab exec -s "$SESSION" --timeout 86400 \
         --env "GDRIVE_DIR=${GDRIVE_DIR}" \
+        --env "RELAY_GDRIVE_DIR=${GDRIVE_DIR}" \
+        --env "RELAY_SESSION=${SESSION}" \
         --env "RELAY_ROUND=${ROUND}" \
         --env "RESET_DONE_FLAG=${ROUND_RESET_FLAG}" \
         -f train.py 2>&1 | tee "$ROUND_LOG"
@@ -126,8 +128,11 @@ while true; do
     rm -f "$CLEAN_LOG"
 
     if [[ "$EXEC_RC" -ne 0 || "$HAS_FATAL_ERROR" -eq 1 ]]; then
-        echo "❌ [熔断止损] 第 ${ROUND} 棒 train.py 发生异常或崩溃 (exit=${EXEC_RC})，已销毁实例并终止接力循环！" >&2
-        exit "${EXEC_RC:-1}"
+        echo "❌ [熔断止损] 第 ${ROUND} 棒 train.py 发生异常或崩溃 (exit=${EXEC_RC}, fatal=${HAS_FATAL_ERROR})，已销毁实例并终止接力循环！" >&2
+        if [[ "$EXEC_RC" -ne 0 ]]; then
+            exit "$EXEC_RC"
+        fi
+        exit 1
     fi
 
     if [[ "$HAS_COMPLETED" -eq 1 ]]; then
@@ -157,5 +162,5 @@ done
 
 # 训练全部结束后，将最终权重从网盘拉回本机备份
 echo "📥 正在将最终训练好的 checkpoint.pt 下载回本机当前目录..."
-rclone copy -- "${GDRIVE_DIR}/checkpoint.pt" ./ --multi-thread-streams=16 -P
+rclone copy --multi-thread-streams=16 -P -- "${GDRIVE_DIR}/checkpoint.pt" ./
 echo "✅ 全部流程执行完毕！"

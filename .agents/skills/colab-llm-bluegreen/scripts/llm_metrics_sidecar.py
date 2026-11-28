@@ -86,6 +86,7 @@ class LlmTelemetryTracker:
         self.online = True
         self.backend_healthy = True if builtin_engine else False
         self.active_streams = 0
+        self.active_requests = 0
         self.total_requests = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
@@ -130,13 +131,17 @@ class LlmTelemetryTracker:
                 except Exception:
                     pass
 
-    def on_request_start(self, prompt_tokens_est: int = 0) -> int:
+    def on_request_start(self, prompt_tokens_est: int = 0, is_stream: bool = True) -> int:
         with self.lock:
-            self.active_streams += 1
+            self.active_requests += 1
+            if is_stream:
+                self.active_streams += 1
             self.total_requests += 1
             self.total_prompt_tokens += max(0, prompt_tokens_est)
             self.last_request_at = time.time()
-            return self.total_requests
+            req_total = self.total_requests
+        self.write_state_file(record_history=False, check_health=False)
+        return req_total
 
     def on_first_token(self, ttft_ms: float) -> None:
         with self.lock:
@@ -156,12 +161,14 @@ class LlmTelemetryTracker:
                 if cur_tps > self.peak_tps:
                     self.peak_tps = cur_tps
 
-    def on_request_end(self, ok: bool = True) -> None:
+    def on_request_end(self, ok: bool = True, is_stream: bool = True) -> None:
         with self.lock:
-            self.active_streams = max(0, self.active_streams - 1)
+            self.active_requests = max(0, self.active_requests - 1)
+            if is_stream:
+                self.active_streams = max(0, self.active_streams - 1)
             if not ok:
                 self.error_count += 1
-        self.write_state_file()
+        self.write_state_file(record_history=False, check_health=False)
 
     def _compute_rolling_tps_locked(self, now: float) -> float:
         cutoff_60 = now - 60.0
@@ -225,6 +232,7 @@ class LlmTelemetryTracker:
                 "ttft_ms": self.last_ttft_ms,
                 "avg_ttft_ms": self.avg_ttft_ms,
                 "active_streams": self.active_streams,
+                "active_requests": self.active_requests,
                 "total_requests": self.total_requests,
                 "total_prompt_tokens": self.total_prompt_tokens,
                 "total_completion_tokens": self.total_completion_tokens,
@@ -236,8 +244,9 @@ class LlmTelemetryTracker:
                 "timestamp": now,
             }
 
-    def write_state_file(self, record_history: bool = False) -> Dict[str, Any]:
-        self.check_backend_health()
+    def write_state_file(self, record_history: bool = False, check_health: bool = True) -> Dict[str, Any]:
+        if check_health:
+            self.check_backend_health()
         snap = self.snapshot(record_history=record_history)
         try:
             # 每线程独立 tmp 文件名 + 写锁，避免并发写入同一 tmp 导致 JSON 截断/交错
@@ -291,6 +300,7 @@ def make_handler(tracker: LlmTelemetryTracker):
                         "model_name": snap["model_name"],
                         "instant_tps": snap["instant_tps"],
                         "active_streams": snap["active_streams"],
+                        "active_requests": snap["active_requests"],
                     },
                 )
                 return
@@ -352,7 +362,8 @@ def make_handler(tracker: LlmTelemetryTracker):
             prompt_est = max(8, len(raw_body) // 6)
 
             req_start = time.time()
-            tracker.on_request_start(prompt_tokens_est=prompt_est)
+            tracker.on_request_start(prompt_tokens_est=prompt_est, is_stream=is_stream)
+            req_ok = False
 
             tokens_to_emit = [
                 f"[{tracker.slot.upper()}/{tracker.engine}] ",
@@ -413,14 +424,13 @@ def make_handler(tracker: LlmTelemetryTracker):
 
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
-                    tracker.on_request_end(ok=True)
+                    req_ok = True
                 else:
                     time.sleep(0.04)
                     tracker.on_first_token((time.time() - req_start) * 1000.0)
                     full_text = "".join(tokens_to_emit)
                     time.sleep(0.25)
                     tracker.on_tokens_emitted(len(tokens_to_emit), 0.25, len(tokens_to_emit))
-                    tracker.on_request_end(ok=True)
                     self._send_json(
                         200,
                         {
@@ -442,8 +452,11 @@ def make_handler(tracker: LlmTelemetryTracker):
                             },
                         },
                     )
+                    req_ok = True
             except Exception:
-                tracker.on_request_end(ok=False)
+                req_ok = False
+            finally:
+                tracker.on_request_end(ok=req_ok, is_stream=is_stream)
 
         def _proxy_request(self, method: str) -> None:
             parsed = urlparse(tracker.backend_url)
@@ -457,12 +470,26 @@ def make_handler(tracker: LlmTelemetryTracker):
             body = self.rfile.read(length) if length > 0 else None
 
             is_completion = "/completions" in self.path or "/api/generate" in self.path or "/api/chat" in self.path
+            is_tracked = not self.path.startswith(("/pilot/", "/health"))
+            stream_flag = is_completion
+            if is_completion and body:
+                try:
+                    parsed_req = json.loads(body.decode("utf-8", errors="ignore"))
+                    if isinstance(parsed_req, dict) and "stream" in parsed_req:
+                        stream_flag = bool(parsed_req.get("stream"))
+                except Exception:
+                    pass
+
             req_start = time.time()
-            if is_completion:
-                tracker.on_request_start(prompt_tokens_est=max(4, length // 6))
+            if is_tracked:
+                tracker.on_request_start(
+                    prompt_tokens_est=max(4, length // 6) if is_completion else 0,
+                    is_stream=stream_flag,
+                )
 
             conn: Optional[http.client.HTTPConnection] = None
             headers_sent = False
+            req_ok = False
             try:
                 conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
                 conn = conn_cls(host, port, timeout=600)
@@ -476,6 +503,11 @@ def make_handler(tracker: LlmTelemetryTracker):
 
                 ctype = resp.getheader("Content-Type", "")
                 is_sse = "text/event-stream" in ctype.lower()
+                if is_sse and is_tracked and not stream_flag:
+                    with tracker.lock:
+                        tracker.active_streams += 1
+                    stream_flag = True
+                    tracker.write_state_file(record_history=False, check_health=False)
 
                 self.send_response(resp.status)
                 for k, v in resp.getheaders():
@@ -554,11 +586,9 @@ def make_handler(tracker: LlmTelemetryTracker):
                     self.wfile.write(raw_resp)
                     self.wfile.flush()
 
-                if is_completion:
-                    tracker.on_request_end(ok=(200 <= resp.status < 400))
+                req_ok = 200 <= resp.status < 400
             except Exception as e:
-                if is_completion:
-                    tracker.on_request_end(ok=False)
+                req_ok = False
                 if not headers_sent:
                     try:
                         self._send_json(502, {"error": f"Backend engine unreachable: {e}"})
@@ -572,6 +602,8 @@ def make_handler(tracker: LlmTelemetryTracker):
                         conn.close()
                     except Exception:
                         pass
+                if is_tracked:
+                    tracker.on_request_end(ok=req_ok, is_stream=stream_flag)
 
     return SidecarHandler
 

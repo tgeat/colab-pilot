@@ -12,6 +12,7 @@ export interface EnvStatus {
   rclone_conf: string;
   rclone_conf_ok: boolean;
   token_ok: boolean;
+  adc_ok?: boolean;
   workspace: string;
   sessions_path: string;
   history_dir: string;
@@ -35,6 +36,26 @@ export interface GdriveStatus {
   files: GdriveFile[];
 }
 
+export interface GrabConfig {
+  mode: "fast" | "standard" | "persistent" | string;
+  retry_seconds: number;
+  fallback_gpus?: string[];
+}
+
+export interface GrabStatus {
+  active: boolean;
+  mode: string;
+  attempt: number;
+  max_attempts: number | null;
+  budget_minutes: number | null;
+  retry_seconds: number;
+  started_at: number;
+  next_retry_at: number | null;
+  target_gpu: string;
+  phase: "requesting" | "waiting_retry" | "allocated" | "cancelled" | "failed" | string;
+  last_error: string | null;
+}
+
 export interface RelayConfig {
   gpu_type: string;
   high_mem: boolean;
@@ -43,6 +64,10 @@ export interface RelayConfig {
   backup_interval_minutes: number;
   total_epochs: number;
   reset_done_flag: boolean;
+  grab_mode?: "budget" | "persistent" | "fast" | "standard" | string;
+  grab_timeout_minutes?: number;
+  grab_retry_seconds?: number;
+  fallback_gpus?: string[];
 }
 
 export interface RelayStatus {
@@ -56,6 +81,12 @@ export interface RelayStatus {
   config: RelayConfig;
   logs: string[];
   child_pid: number | null;
+  training_completed?: boolean;
+  weights_downloaded?: boolean;
+  download_error?: string | null;
+  local_weights_path?: string | null;
+  last_error?: string | null;
+  grab_status?: GrabStatus | null;
 }
 
 export interface WorkspaceInfo {
@@ -90,6 +121,12 @@ export interface RecentSessionView {
   exec_count: number;
   file_op_count: number;
   last_summary: string;
+  boot_mode?: "general" | "llm" | "relay" | null;
+  llm_config?: CreateVmLlmConfig | null;
+  relay_config?: RelayConfig | null;
+  keep_alive?: KeepAliveConfig | null;
+  grab_config?: GrabConfig | null;
+  profile_saved?: boolean;
 }
 
 export interface ProcInfo {
@@ -168,10 +205,22 @@ export interface LlmTelemetry {
   handover_in_seconds?: number;
 }
 
+export interface LlmBlueGreenSlotInfo {
+  session_name?: string | null;
+  role?: string | null;
+  model_name?: string | null;
+  endpoint?: string | null;
+}
+
 export interface LlmBlueGreenState {
   session_prefix?: string;
   active_slot?: string;
   standby_slot?: string | null;
+  active_session?: string | null;
+  standby_session?: string | null;
+  blue_session?: string | null;
+  green_session?: string | null;
+  slots?: Record<string, LlmBlueGreenSlotInfo>;
   phase?: string;
   engine?: string;
   model_name?: string;
@@ -271,6 +320,36 @@ export interface CreateVmEnvConfig {
   env_vars?: string | null;
 }
 
+export interface KeepAliveConfig {
+  enabled: boolean;
+  interval_seconds: number;
+  kernel_ping: boolean;
+}
+
+export interface KeepAliveStatus {
+  enabled: boolean;
+  interval_seconds: number;
+  kernel_ping: boolean;
+  state: "active" | "paused" | "error" | "idle" | string;
+  last_ok_at: number | null;
+  last_attempt_at: number | null;
+  /** Result of the authenticated runtime connection check. */
+  tunnel_ok: boolean;
+  kernel_ping_state:
+    | "ok"
+    | "skipped_busy"
+    | "skipped_no_kernel"
+    | "disabled"
+    | "error"
+    | "pending"
+    | string;
+  success_count: number;
+  consecutive_failures: number;
+  last_error: string | null;
+  profile_saved?: boolean;
+  persistence_error?: string | null;
+}
+
 export interface CreateVmRequest {
   name: string | null;
   accelerator: string;
@@ -283,6 +362,8 @@ export interface CreateVmRequest {
   relay_config: RelayConfig | null;
   llm_config?: CreateVmLlmConfig | null;
   env_config?: CreateVmEnvConfig | null;
+  keep_alive?: KeepAliveConfig | null;
+  grab_config?: GrabConfig | null;
 }
 
 export interface VmView {
@@ -304,14 +385,22 @@ export interface VmView {
   telemetry_age: number | null;
   telemetry_error: string | null;
   deploy_error?: string | null;
+  server_state_unknown?: boolean;
   relay: RelayStatus | null;
   busy: string | null;
   ssh?: VmSshInfo | null;
   llm_api?: LlmApiAccessInfo | null;
+  keep_alive?: KeepAliveStatus | null;
+  grab_status?: GrabStatus | null;
 }
 
 export interface Overview {
   timestamp: number;
+  seq?: number;
+  last_ok_timestamp?: number | null;
+  is_stale?: boolean;
+  stale_reason?: string | null;
+  server_list_known?: boolean;
   auth_ok: boolean;
   error: string | null;
   ccu: Ccu | null;
@@ -331,6 +420,19 @@ export interface TerminateReceipt {
   steps: string[];
   ccu: Ccu | null;
   error: string | null;
+}
+
+export interface StopRelayResult {
+  supervisor_stopped: boolean;
+  destroy_vm: boolean;
+  kernel_interrupted: boolean;
+  kernel_interrupt_error: string | null;
+  terminate_receipt: TerminateReceipt | null;
+}
+
+export interface CloseRequestedRelayPayload {
+  active_vms: string[];
+  unsaved_script?: boolean;
 }
 
 export interface WorkspaceFiles {
@@ -390,4 +492,20 @@ export const DEFAULT_RELAY: RelayConfig = {
   backup_interval_minutes: 30,
   total_epochs: 500,
   reset_done_flag: false,
+  grab_mode: "budget",
+  grab_timeout_minutes: 60,
+  grab_retry_seconds: 20,
+  fallback_gpus: [],
+};
+
+export const DEFAULT_KEEP_ALIVE: KeepAliveConfig = {
+  enabled: true,
+  interval_seconds: 90,
+  kernel_ping: true,
+};
+
+export const DEFAULT_GRAB_CONFIG: GrabConfig = {
+  mode: "fast",
+  retry_seconds: 15,
+  fallback_gpus: [],
 };

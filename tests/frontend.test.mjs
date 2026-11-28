@@ -47,8 +47,15 @@ const formatUrl = transpileToDataUrl("src/format.ts");
 const chatUtilsUrl = transpileToDataUrl("src/chatUtils.ts", {
   "./format": formatUrl,
 });
+const mockTauriCoreSource = [
+  "export const invokeCalls = [];",
+  "export async function invoke(cmd, args) {",
+  "  invokeCalls.push({ cmd, args });",
+  "  return null;",
+  "}",
+].join("\n");
 const mockTauriCoreUrl = `data:text/javascript;base64,${Buffer.from(
-  "export async function invoke() { return null; }\n",
+  mockTauriCoreSource,
   "utf8",
 ).toString("base64")}`;
 const apiUrl = transpileToDataUrl("src/api.ts", {
@@ -57,6 +64,7 @@ const apiUrl = transpileToDataUrl("src/api.ts", {
 
 const formatMod = await import(formatUrl);
 const chatUtils = await import(chatUtilsUrl);
+const mockTauriCore = await import(mockTauriCoreUrl);
 const apiMod = await import(apiUrl);
 
 test("fmtBytes handles sub-byte, zero, negative, NaN, and extreme sizes without undefined unit (L-2)", () => {
@@ -108,21 +116,17 @@ test("isSafeMarkdownUrl blocks dangerous URI schemes and allows http/https/mailt
 });
 
 test("extractThinkParts and stripThinkBlocks handle partial streaming tags and multi-blocks (L-5, H-9)", () => {
-  // Partial `<th` while streaming must not flash raw tag in mainText
   const partial = chatUtils.extractThinkParts("<th", true);
   assert.equal(partial.mainText, "");
 
-  // Unclosed `<think>` while streaming
   const unclosed = chatUtils.extractThinkParts("<think>step 1", true);
   assert.equal(unclosed.thinkText, "step 1");
   assert.equal(unclosed.mainText, "");
 
-  // Multiple `<think>` blocks
   const multi = chatUtils.extractThinkParts("<think>first</think>Hello <think>second</think>world!");
   assert.equal(multi.thinkText, "first\n\nsecond");
   assert.equal(multi.mainText, "Hello world!");
 
-  // stripThinkBlocks returns empty string when only thinking exists
   assert.equal(chatUtils.stripThinkBlocks("<think>only reasoning</think>"), "");
   assert.equal(chatUtils.stripThinkBlocks("<think>plan</think>\nFinal answer"), "Final answer");
 });
@@ -186,7 +190,6 @@ test("resolveBlueGreenStatus reports offline when 0 VMs are on_server and isolat
   assert.equal(emptyStatus.clusterState, "offline");
   assert.equal(emptyStatus.anyOnlineVm, false);
 
-  // Unrelated VM with slot="blue" must NOT be hijacked into `qwen` blue-green cluster (H-4)
   const unrelatedVm = {
     name: "other-blue",
     on_server: true,
@@ -197,7 +200,6 @@ test("resolveBlueGreenStatus reports offline when 0 VMs are on_server and isolat
   assert.equal(isolatedStatus.clusterState, "offline");
   assert.equal(isolatedStatus.anyOnlineVm, true);
 
-  // Matching `qwen-blue` VM online -> clusterState === "online"
   const matchingVm = {
     name: "qwen-blue",
     on_server: true,
@@ -298,7 +300,7 @@ test("isLlmVmReady and hasAnyReadyLlmVm reject bare, deploying, warming, or fail
   assert.equal(chatUtils.hasAnyReadyLlmVm([bareVm, healthyLlmVm]), true);
 });
 
-test("all 14 IPC methods are exported, zero colab console remnants remain, and new-VM controls are wired", () => {
+test("all 16 IPC methods are exported, zero colab console remnants remain, and new-VM controls are wired", () => {
   const expectedIpcMethods = [
     "getOverview",
     "refreshNow",
@@ -314,6 +316,8 @@ test("all 14 IPC methods are exported, zero colab console remnants remain, and n
     "openVmSshTerminal",
     "rotateLlmApiKey",
     "deployLlmOnVm",
+    "confirmAppClose",
+    "dismissRelayStatus",
   ];
   for (const fn of expectedIpcMethods) {
     assert.equal(typeof apiMod.api[fn], "function", `api.${fn} must be a function`);
@@ -324,6 +328,7 @@ test("all 14 IPC methods are exported, zero colab console remnants remain, and n
   assert.match(appSrc, /<CreateVmDialog/);
   assert.match(appSrc, /<ScriptDialog/);
   assert.match(appSrc, /<StopRelayDialog/);
+  assert.match(appSrc, /<CloseAppRelayDialog/);
   assert.match(vmCardSrc, /vm\.telemetry_error/);
   assert.match(vmCardSrc, /vm\.deploy_error/);
   assert.match(vmCardSrc, /<RelayPanel/);
@@ -337,6 +342,8 @@ test("all 14 IPC methods are exported, zero colab console remnants remain, and n
   for (const file of srcFiles) {
     const content = fs.readFileSync(file, "utf8");
     assert.doesNotMatch(content, /colab\s+console/i, `${path.basename(file)} must not reference removed colab console`);
+    // #75: must never recommend invalid `colab auth login`
+    assert.doesNotMatch(content, /colab\s+auth\s+login/i, `${path.basename(file)} must not contain invalid colab auth login`);
   }
 });
 
@@ -357,4 +364,1581 @@ test("tauri.conf.json enforces non-null CSP and Cargo.toml has empty default fea
     "utf8",
   );
   assert.match(scriptDlg, /closable=\{!saving\}/);
+});
+
+// ───────────────────── Issues #40 & #41 ─────────────────────
+test("Issues #40 & #41: evaluateStopRelayOutcome prevents false destroy success and reports kernel interrupt failures", () => {
+  // #40: destroy=true with verified_unassigned=false MUST NOT claim VM was destroyed
+  const failedDestroy = apiMod.evaluateStopRelayOutcome("train-01", true, {
+    supervisor_stopped: true,
+    destroy_vm: true,
+    kernel_interrupted: false,
+    kernel_interrupt_error: null,
+    terminate_receipt: {
+      name: "train-01",
+      endpoint: "ep-b",
+      verified_unassigned: false,
+      remaining_endpoints: ["ep-b"],
+      steps: ["unassign returned 500"],
+      ccu: null,
+      error: "服务端仍存在活跃端点 ep-b",
+    },
+  });
+  assert.equal(failedDestroy.ok, false);
+  assert.equal(failedDestroy.toastKind, "error");
+  assert.equal(failedDestroy.keepDialogOpen, true);
+  assert.doesNotMatch(failedDestroy.message, /已关闭.*并销毁云端实例/);
+  assert.match(failedDestroy.message, /停费核验未通过/);
+  assert.match(failedDestroy.message, /ep-b/);
+
+  // #40: destroy=true with verified_unassigned=true succeeds
+  const verifiedDestroy = apiMod.evaluateStopRelayOutcome("train-01", true, {
+    supervisor_stopped: true,
+    destroy_vm: true,
+    kernel_interrupted: true,
+    kernel_interrupt_error: null,
+    terminate_receipt: {
+      name: "train-01",
+      endpoint: "ep-b",
+      verified_unassigned: true,
+      remaining_endpoints: [],
+      steps: ["verified"],
+      ccu: { balance: 80, burn_rate_hourly: 0, assignments_count: 0 },
+      error: null,
+    },
+  });
+  assert.equal(verifiedDestroy.ok, true);
+  assert.equal(verifiedDestroy.toastKind, "success");
+  assert.equal(verifiedDestroy.keepDialogOpen, false);
+  assert.match(verifiedDestroy.message, /已关闭 \[train-01\] 接力并销毁云端实例/);
+
+  // #41: destroy=false with kernel_interrupted=false warns training may still run
+  const failedKeep = apiMod.evaluateStopRelayOutcome("train-01", false, {
+    supervisor_stopped: true,
+    destroy_vm: false,
+    kernel_interrupted: false,
+    kernel_interrupt_error: "colab restart-kernel 超时 (90s)",
+    terminate_receipt: null,
+  });
+  assert.equal(failedKeep.ok, false);
+  assert.equal(failedKeep.toastKind, "warn");
+  assert.equal(failedKeep.keepDialogOpen, true);
+  assert.match(failedKeep.message, /未能确认中断.*云端 Kernel/);
+  assert.match(failedKeep.message, /colab restart-kernel 超时/);
+  assert.match(failedKeep.message, /继续运行/);
+
+  // #41: destroy=false with kernel_interrupted=true confirms interruption
+  const okKeep = apiMod.evaluateStopRelayOutcome("train-01", false, {
+    supervisor_stopped: true,
+    destroy_vm: false,
+    kernel_interrupted: true,
+    kernel_interrupt_error: null,
+    terminate_receipt: null,
+  });
+  assert.equal(okKeep.ok, true);
+  assert.equal(okKeep.keepDialogOpen, false);
+  assert.match(okKeep.message, /云端训练已中断/);
+
+  // Legacy TerminateReceipt compatibility
+  const legacyFail = apiMod.evaluateStopRelayOutcome("train-01", true, {
+    name: "train-01",
+    endpoint: "ep-legacy",
+    verified_unassigned: false,
+    remaining_endpoints: ["ep-legacy"],
+    steps: [],
+    ccu: null,
+    error: "still assigned",
+  });
+  assert.equal(legacyFail.ok, false);
+  assert.equal(legacyFail.keepDialogOpen, true);
+
+  // App.tsx must not unconditionally toast "已关闭...并销毁云端实例" inside handleStopRelay
+  const appSrc = fs.readFileSync(path.join(repoRoot, "src", "App.tsx"), "utf8");
+  assert.doesNotMatch(appSrc, /已关闭\s*\[\$\{vm\.name\}\]\s*接力并销毁云端实例/);
+});
+
+// ───────────────────── Issue #42 & #72 & #73 IPC Contracts ─────────────────────
+test("Issues #42, #72, #73: api passes workspacePath, vmName, confirmAppClose mode, and dismissRelayStatus name", async () => {
+  mockTauriCore.invokeCalls.length = 0;
+
+  await apiMod.api.readWorkspaceFiles("D:/ws_b", "vm-custom");
+  await apiMod.api.saveWorkspaceFiles("print(1)", "torch", "D:/ws_b", "vm-custom");
+  await apiMod.api.startRelay("vm-custom", { gpu_type: "T4", high_mem: true, gdrive_dir: "gdrive:colab_relay", max_session_hours: 20, backup_interval_minutes: 30, total_epochs: 10, reset_done_flag: false }, "D:/ws_b");
+  await apiMod.api.stopRelay("vm-custom", false);
+  await apiMod.api.confirmAppClose("shutdown_vms");
+  await apiMod.api.dismissRelayStatus("vm-offline");
+
+  assert.deepEqual(mockTauriCore.invokeCalls[0], {
+    cmd: "read_workspace_files",
+    args: { workspacePath: "D:/ws_b", vmName: "vm-custom" },
+  });
+  assert.deepEqual(mockTauriCore.invokeCalls[1], {
+    cmd: "save_workspace_files",
+    args: { trainPy: "print(1)", requirementsTxt: "torch", workspacePath: "D:/ws_b", vmName: "vm-custom" },
+  });
+  assert.equal(mockTauriCore.invokeCalls[2].cmd, "start_relay");
+  assert.equal(mockTauriCore.invokeCalls[2].args.workspacePath, "D:/ws_b");
+  assert.deepEqual(mockTauriCore.invokeCalls[3], {
+    cmd: "stop_relay",
+    args: { name: "vm-custom", destroyVm: false },
+  });
+  assert.deepEqual(mockTauriCore.invokeCalls[4], {
+    cmd: "confirm_app_close",
+    args: { mode: "shutdown_vms" },
+  });
+  assert.deepEqual(mockTauriCore.invokeCalls[5], {
+    cmd: "dismiss_relay_status",
+    args: { name: "vm-offline" },
+  });
+});
+
+// ───────────────────── Issues #43 & #75 ─────────────────────
+test("Issues #43 & #75: ADC without OAuth token blocks blind billing VM creation and guides colab auth / colab status", () => {
+  const blockedAdc = chatUtils.checkCreateVmAuthGuard("adc", { token_ok: false, adc_ok: true });
+  assert.equal(blockedAdc.blocked, true);
+  assert.equal(blockedAdc.level, "danger");
+  assert.match(blockedAdc.message, /colab auth/);
+  assert.match(blockedAdc.message, /colab status/);
+  assert.doesNotMatch(blockedAdc.message, /colab auth login/);
+
+  const warnOauthMissing = chatUtils.checkCreateVmAuthGuard("oauth2", { token_ok: false, adc_ok: false });
+  assert.equal(warnOauthMissing.blocked, false);
+  assert.equal(warnOauthMissing.level, "warn");
+  assert.match(warnOauthMissing.message, /colab auth/);
+
+  const warnAdcWithOauth = chatUtils.checkCreateVmAuthGuard("adc", { token_ok: true, adc_ok: true });
+  assert.equal(warnAdcWithOauth.blocked, false);
+  assert.equal(warnAdcWithOauth.level, "warn");
+  assert.match(warnAdcWithOauth.message, /监控与关机停费核验仍依赖.*Colab OAuth/);
+
+  const cleanOauth = chatUtils.checkCreateVmAuthGuard("oauth2", { token_ok: true, adc_ok: false });
+  assert.equal(cleanOauth.blocked, false);
+  assert.equal(cleanOauth.message, null);
+});
+
+// ───────────────────── Issue #44 ─────────────────────
+test("Issue #44: default gdrive:colab_relay isolates per-VM subdirectory and detects running custom-dir collision", () => {
+  assert.equal(chatUtils.isDefaultBareGdriveDir("gdrive:colab_relay"), true);
+  assert.equal(chatUtils.isDefaultBareGdriveDir("  gdrive:colab_relay/// "), true);
+  assert.equal(chatUtils.isDefaultBareGdriveDir("gdrive:colab_relay/exp1"), false);
+
+  const dirA = chatUtils.resolveEffectiveRelayGdriveDir("gdrive:colab_relay", "exp-a");
+  const dirB = chatUtils.resolveEffectiveRelayGdriveDir("gdrive:colab_relay", "exp-b");
+  assert.equal(dirA, "gdrive:colab_relay/exp-a");
+  assert.equal(dirB, "gdrive:colab_relay/exp-b");
+  assert.notEqual(dirA, dirB);
+
+  const runningVms = [
+    {
+      name: "exp-a",
+      on_server: true,
+      relay: {
+        running: true,
+        config: { gdrive_dir: "gdrive:shared_yolo/" },
+      },
+    },
+    {
+      name: "exp-default",
+      on_server: true,
+      relay: {
+        running: true,
+        config: { gdrive_dir: "gdrive:colab_relay" },
+      },
+    },
+  ];
+
+  // Different VM using default bare gdrive:colab_relay will NOT collide with exp-default
+  assert.equal(
+    chatUtils.findConflictingRelayVm("gdrive:colab_relay", "exp-new", runningVms),
+    undefined,
+  );
+  // Different VM manually pointing to occupied gdrive:shared_yolo triggers collision warning
+  const conflict = chatUtils.findConflictingRelayVm("gdrive:shared_yolo", "exp-new", runningVms);
+  assert.equal(conflict?.name, "exp-a");
+  // Same VM checking its own dir is not a conflict
+  assert.equal(
+    chatUtils.findConflictingRelayVm("gdrive:shared_yolo", "exp-a", runningVms),
+    undefined,
+  );
+});
+
+// ───────────────────── Issues #48 & #64 ─────────────────────
+test("Issues #48 & #64: blue-green resolves real session names, blocks warming targets, and syncs vanished targets", () => {
+  const autoNamedBlue = {
+    name: "colab-t4-auto-01",
+    accelerator: "T4",
+    on_server: true,
+    busy: null,
+    telemetry: {
+      llm: { online: true, backend_healthy: true, slot: "blue", role: "draining", model_name: "Qwen2.5-7B" },
+    },
+  };
+  const customNamedGreen = {
+    name: "prod-deepseek-node",
+    accelerator: "A100",
+    on_server: true,
+    busy: null,
+    telemetry: {
+      llm: { online: true, backend_healthy: true, slot: "green", role: "active", model_name: "DeepSeek-R1-14B" },
+    },
+  };
+  const warmingNode = {
+    name: "standby-node",
+    accelerator: "L4",
+    on_server: true,
+    busy: null,
+    telemetry: {
+      llm: { online: true, backend_healthy: true, slot: "blue", role: "warming", model_name: "Qwen3-8B" },
+    },
+  };
+
+  const bgState = {
+    session_prefix: "llm",
+    active_slot: "green",
+    active_session: "prod-deepseek-node",
+    blue_session: "colab-t4-auto-01",
+    green_session: "prod-deepseek-node",
+    slots: {
+      blue: { session_name: "colab-t4-auto-01", model_name: "Qwen2.5-7B" },
+      green: { session_name: "prod-deepseek-node", model_name: "DeepSeek-R1-14B" },
+    },
+    model_name: "Fallback-Model",
+  };
+
+  // #48: matches real session names without requiring -blue / -green suffixes
+  const status = chatUtils.resolveBlueGreenStatus(bgState, [autoNamedBlue, customNamedGreen]);
+  assert.equal(status.blueVm?.name, "colab-t4-auto-01");
+  assert.equal(status.greenVm?.name, "prod-deepseek-node");
+  assert.equal(status.activeSlot, "green");
+  assert.equal(status.activeVm?.name, "prod-deepseek-node");
+  assert.equal(status.clusterState, "online");
+
+  // #48: auto routing submits real active session name and its real model name
+  const autoTarget = chatUtils.resolveChatTargetState("auto", bgState, [autoNamedBlue, customNamedGreen]);
+  assert.equal(autoTarget.canSend, true);
+  assert.equal(autoTarget.submitTargetVm, "prod-deepseek-node");
+  assert.equal(autoTarget.submitModel, "DeepSeek-R1-14B");
+
+  // #64: warming node is NOT ready, labeled with warming notice, and blocked from sending
+  assert.equal(chatUtils.isLlmVmReady(warmingNode), false);
+  assert.match(chatUtils.formatChatOptionLabel(warmingNode, bgState), /预热中，暂不可对话/);
+  const warmingSelected = chatUtils.resolveChatTargetState("standby-node", bgState, [
+    warmingNode,
+    customNamedGreen,
+  ]);
+  assert.equal(warmingSelected.canSend, false);
+  assert.equal(warmingSelected.submitTargetVm, null);
+  assert.match(warmingSelected.disabledReason, /预热中/);
+
+  // #64: vanished target VM resets selection to "auto" and never submits stale disappeared VM name
+  const vanishedTarget = chatUtils.resolveChatTargetState("deleted-blue-vm", bgState, [customNamedGreen]);
+  assert.equal(vanishedTarget.targetDisappeared, true);
+  assert.equal(vanishedTarget.disappearedVmName, "deleted-blue-vm");
+  assert.equal(vanishedTarget.effectiveSelectValue, "auto");
+  assert.equal(vanishedTarget.submitTargetVm, "prod-deepseek-node");
+});
+
+// ───────────────────── Issue #52, #53, #54 ─────────────────────
+test("Issues #52, #53, #54: CPU relay preserved, download failure distinguished from completed, and session hours bounded 0.1~23.5", () => {
+  const createDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "CreateVmDialog.tsx"),
+    "utf8",
+  );
+  const relayPanelSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "RelayPanel.tsx"),
+    "utf8",
+  );
+
+  // #52: CPU must never be rewritten to T4
+  assert.doesNotMatch(createDlgSrc, /acc\s*===\s*"CPU"\s*\?\s*"T4"/);
+  assert.doesNotMatch(relayPanelSrc, /vm\.accelerator\s*!==\s*"CPU"/);
+  assert.match(relayPanelSrc, /"CPU"/);
+
+  // #53: training_completed=true + weights_downloaded=false (or download_failed) shows error + retry, NEVER green checkpoint recovered
+  const dlFailed = chatUtils.resolveRelayCompletionView({
+    vm_name: "exp-1",
+    running: false,
+    round: 2,
+    phase: "download_failed",
+    phase_label: "权重下载失败",
+    started_at: null,
+    round_started_at: null,
+    config: {},
+    logs: [],
+    child_pid: null,
+    training_completed: true,
+    weights_downloaded: false,
+    download_error: "rclone copyto exited 1",
+  });
+  assert.equal(dlFailed.isDownloadFailed, true);
+  assert.equal(dlFailed.isCompletedAndDownloaded, false);
+  assert.equal(dlFailed.canRetryDownload, true);
+  assert.doesNotMatch(dlFailed.sub, /已从 Google Drive 回收最终 checkpoint/);
+  assert.match(dlFailed.sub, /下载到本地失败/);
+
+  const dlSuccess = chatUtils.resolveRelayCompletionView({
+    vm_name: "exp-1",
+    running: false,
+    round: 2,
+    phase: "completed",
+    phase_label: "已完成",
+    started_at: null,
+    round_started_at: null,
+    config: {},
+    logs: [],
+    child_pid: null,
+    training_completed: true,
+    weights_downloaded: true,
+    download_error: null,
+    local_weights_path: "D:/ws/checkpoint_final.pt",
+  });
+  assert.equal(dlSuccess.isDownloadFailed, false);
+  assert.equal(dlSuccess.isCompletedAndDownloaded, true);
+  assert.match(dlSuccess.sub, /已从 Google Drive 回收最终 checkpoint/);
+
+  // #54: session hours strictly bounded to [0.1, 23.5]
+  assert.equal(chatUtils.isValidRelaySessionHours(0.1), true);
+  assert.equal(chatUtils.isValidRelaySessionHours(22.5), true);
+  assert.equal(chatUtils.isValidRelaySessionHours(23.5), true);
+  assert.equal(chatUtils.isValidRelaySessionHours(0), false);
+  assert.equal(chatUtils.isValidRelaySessionHours(0.05), false);
+  assert.equal(chatUtils.isValidRelaySessionHours(24), false);
+  assert.equal(chatUtils.isValidRelaySessionHours(36), false);
+  assert.equal(chatUtils.isValidRelaySessionHours(48), false);
+  assert.equal(chatUtils.isValidRelaySessionHours(""), false);
+  assert.doesNotMatch(relayPanelSrc, /Math\.min\(48/);
+});
+
+// ───────────────────── Issues #56 & #57 & #59 ─────────────────────
+test("Issues #56, #57, #59: missing CCU shows 未知 (never green 0.00 CU/h), stale cache banner & toast wired, API key rotation guarded", () => {
+  // #56: missing ccu -> "未知", never "0.00 CU/h" or "ok"
+  const missingWithActive = formatMod.formatBurnRate(null, true);
+  assert.equal(missingWithActive.text, "未知");
+  assert.equal(missingWithActive.cls, "warn");
+  assert.equal(missingWithActive.known, false);
+
+  const missingIdle = formatMod.formatBurnRate(undefined, false);
+  assert.equal(missingIdle.text, "未知");
+  assert.equal(missingIdle.cls, "dim");
+  assert.notEqual(missingIdle.cls, "ok");
+
+  const missingNan = formatMod.formatBurnRate({ balance: 10, burn_rate_hourly: Number.NaN, assignments_count: 1 }, true);
+  assert.equal(missingNan.text, "未知");
+
+  const validZero = formatMod.formatBurnRate({ balance: 50, burn_rate_hourly: 0, assignments_count: 0 }, false);
+  assert.equal(validZero.text, "0.00 CU/h");
+  assert.equal(validZero.cls, "ok");
+
+  const validActive = formatMod.formatBurnRate({ balance: 50, burn_rate_hourly: 1.96, assignments_count: 1 }, true);
+  assert.equal(validActive.text, "1.96 CU/h");
+  assert.equal(validActive.cls, "warn");
+
+  const headerSrc = fs.readFileSync(path.join(repoRoot, "src", "components", "Header.tsx"), "utf8");
+  const deleteDlgSrc = fs.readFileSync(path.join(repoRoot, "src", "components", "DeleteVmDialog.tsx"), "utf8");
+  assert.match(headerSrc, /formatBurnRate/);
+  assert.match(deleteDlgSrc, /formatBurnRate/);
+
+  // #57 & #59 in App.tsx
+  const appSrc = fs.readFileSync(path.join(repoRoot, "src", "App.tsx"), "utf8");
+  assert.match(appSrc, /ov\.is_stale/);
+  assert.match(appSrc, /ov\.last_ok_timestamp/);
+  assert.match(appSrc, /最新查询失败/);
+  assert.match(appSrc, /轮换 API Key 失败/);
+});
+
+// ───────────────────── Issues #58 & #71 ─────────────────────
+test("Issues #58 & #71: ScriptDialog disables save on read failure and guards unsaved edits before closing", () => {
+  const scriptDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "ScriptDialog.tsx"),
+    "utf8",
+  );
+  assert.match(scriptDlgSrc, /loadedOk/);
+  assert.match(scriptDlgSrc, /loadError/);
+  assert.match(scriptDlgSrc, /const canSave = !saving && !loading && loadedOk && !loadError/);
+  assert.match(scriptDlgSrc, /origTrain/);
+  assert.match(scriptDlgSrc, /origReq/);
+  assert.match(scriptDlgSrc, /isDirty/);
+  assert.match(scriptDlgSrc, /confirmDiscard/);
+  assert.match(scriptDlgSrc, /有未保存的修改，确定放弃编辑并关闭吗/);
+});
+
+// ───────────────────── Issue #65 ─────────────────────
+test("Issue #65: idle LLM displays 0.0 tok/s realtime rate and labels last_request_tps separately", () => {
+  const idleTps = formatMod.formatRealtimeTps({
+    instantTps: 0,
+    lastRequestTps: 42.6,
+    peakTps: 50.0,
+    activeStreams: 0,
+  });
+  assert.equal(idleTps.realtimeTps, 0);
+  assert.equal(idleTps.realtimeText, "0.0 tok/s");
+  assert.equal(idleTps.isIdle, true);
+  assert.equal(idleTps.lastRequestText, "上次请求: 42.6 tok/s");
+
+  const activeTps = formatMod.formatRealtimeTps({
+    instantTps: 35.2,
+    lastRequestTps: 42.6,
+    activeStreams: 1,
+  });
+  assert.equal(activeTps.realtimeTps, 35.2);
+  assert.equal(activeTps.isIdle, false);
+
+  const idlePill = chatUtils.resolveVmStatusPillSpec(
+    {
+      name: "llm-blue",
+      on_server: true,
+      busy: null,
+      telemetry: { llm: { online: true, backend_healthy: true, instant_tps: 0, last_request_tps: 42.6 } },
+    },
+    false,
+  );
+  assert.equal(idlePill.text, "LLM · 0.0 tok/s (空闲)");
+
+  for (const rel of ["src/App.tsx", "src/components/LlmChatModal.tsx", "src/components/VmCard.tsx"]) {
+    const content = fs.readFileSync(path.join(repoRoot, rel), "utf8");
+    assert.doesNotMatch(content, /instant_tps\)\s*\|\|\s*num\([^)]*last_request_tps/);
+    assert.doesNotMatch(content, /instantTps\s*>\s*0\s*\?\s*instantTps\s*:\s*lastTps/);
+  }
+});
+
+// ───────────────────── Issues #66, #67, #68, #69, #70 ─────────────────────
+test("Issues #66, #67, #68, #69, #70: modal scroll layout, general GDrive opt-in, CUDA hardware matrix, multiline envVars, and focus trap", () => {
+  // #66: CSS modal 3-part layout & adv-config-box no overflow:hidden squash
+  const css = fs.readFileSync(path.join(repoRoot, "src", "styles.css"), "utf8");
+  assert.match(css, /\.modal-body\s*>\s*\*\s*\{\s*flex-shrink:\s*0;\s*\}/);
+  const advBoxMatch = css.match(/\.adv-config-box\s*\{([^}]*)\}/);
+  assert.ok(advBoxMatch, ".adv-config-box rule must exist");
+  assert.match(advBoxMatch[1], /flex-shrink:\s*0/);
+  assert.doesNotMatch(advBoxMatch[1], /overflow:\s*hidden/);
+
+  // #67: general mode does not require GDrive by default
+  assert.equal(
+    chatUtils.requiresGdriveConfig({
+      bootMode: "general",
+      syncRclone: false,
+      mountGdrive: false,
+      gdriveModelPath: "",
+    }),
+    false,
+  );
+  assert.equal(
+    chatUtils.requiresGdriveConfig({
+      bootMode: "relay",
+      syncRclone: false,
+      mountGdrive: false,
+    }),
+    true,
+  );
+  assert.equal(
+    chatUtils.requiresGdriveConfig({
+      bootMode: "llm",
+      syncRclone: false,
+      mountGdrive: false,
+      gdriveModelPath: "gdrive:models/qwen",
+    }),
+    true,
+  );
+
+  // #68: CUDA engines (vllm, llama.cpp, transformers) rejected on CPU and TPU, allowed on NVIDIA GPUs
+  for (const cudaEng of ["vllm", "llama.cpp", "transformers"]) {
+    for (const nonCudaHw of ["CPU", "V5E1", "V6E1"]) {
+      assert.equal(
+        chatUtils.isLlmEngineCompatibleWithAccelerator(cudaEng, nonCudaHw),
+        false,
+        `${cudaEng} must be incompatible with ${nonCudaHw}`,
+      );
+    }
+    for (const nvidiaHw of ["T4", "L4", "G4", "A100", "H100"]) {
+      assert.equal(
+        chatUtils.isLlmEngineCompatibleWithAccelerator(cudaEng, nvidiaHw),
+        true,
+        `${cudaEng} must be compatible with ${nvidiaHw}`,
+      );
+    }
+  }
+  assert.equal(chatUtils.isLlmEngineCompatibleWithAccelerator("ollama", "CPU"), true);
+  assert.equal(chatUtils.isLlmEngineCompatibleWithAccelerator("builtin", "V5E1"), true);
+
+  // #69: envVars uses multiline <textarea>
+  const createDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "CreateVmDialog.tsx"),
+    "utf8",
+  );
+  assert.match(createDlgSrc, /v:\s*"transformers"[^\n]*requiresCuda:\s*true/);
+  assert.match(createDlgSrc, /const \[syncRclone, setSyncRclone\] = useState\(false\)/);
+  assert.match(createDlgSrc, /<textarea[\s\S]{0,120}value=\{envVars\}/);
+
+  // #70: Focus trap cycling & dialog ARIA attributes
+  assert.equal(chatUtils.computeNextFocusTrapIndex(4, 3, false), 0);
+  assert.equal(chatUtils.computeNextFocusTrapIndex(4, 0, true), 3);
+  assert.equal(chatUtils.computeNextFocusTrapIndex(4, -1, false), 0);
+  assert.equal(chatUtils.computeNextFocusTrapIndex(4, -1, true), 3);
+  assert.equal(chatUtils.computeNextFocusTrapIndex(4, 1, false), 2);
+  assert.equal(chatUtils.computeNextFocusTrapIndex(4, 2, true), 1);
+
+  const uiSrc = fs.readFileSync(path.join(repoRoot, "src", "components", "ui.tsx"), "utf8");
+  const chatModalSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "LlmChatModal.tsx"),
+    "utf8",
+  );
+  assert.match(uiSrc, /role="dialog"/);
+  assert.match(uiSrc, /aria-modal="true"/);
+  assert.match(uiSrc, /useModalFocusTrap/);
+  assert.match(chatModalSrc, /role="dialog"/);
+  assert.match(chatModalSrc, /aria-modal="true"/);
+  assert.match(chatModalSrc, /useModalFocusTrap/);
+});
+
+// ───────────────────── Issues #73, #74, #76 ─────────────────────
+test("Issues #73, #74, #76: offline relay card preserved, recent session avoids prefix guessing, and relay status/drawer toggle works", () => {
+  // #74: unverified history session with `llm-` prefix MUST NOT guess "llm" boot_mode
+  const unverifiedRecent = chatUtils.buildPresetFromRecentSession({
+    session_name: "llm-debug-shell",
+    workspace_name: "ws",
+    workspace_path: "D:/ws",
+    endpoint: null,
+    accelerator: "T4",
+    machine_shape: "HIGH_RAM",
+    created_at: null,
+    terminated_at: null,
+    last_event_at: "2026-11-19T12:00:00Z",
+    exec_count: 1,
+    file_op_count: 0,
+    last_summary: "exec",
+    profile_saved: false,
+  });
+  assert.equal(unverifiedRecent.boot_mode, "general");
+  assert.equal(unverifiedRecent.unverified_history_profile, true);
+
+  // #74: saved profile restores exact boot_mode & relay_config
+  const savedRelayRecent = chatUtils.buildPresetFromRecentSession({
+    session_name: "cpu-train-job",
+    workspace_name: "ws",
+    workspace_path: "D:/ws2",
+    endpoint: null,
+    accelerator: "CPU",
+    machine_shape: "STANDARD",
+    created_at: null,
+    terminated_at: null,
+    last_event_at: "2026-11-19T12:00:00Z",
+    exec_count: 3,
+    file_op_count: 2,
+    last_summary: "train",
+    profile_saved: true,
+    boot_mode: "relay",
+    relay_config: {
+      gpu_type: "CPU",
+      high_mem: false,
+      gdrive_dir: "gdrive:colab_relay/cpu-train-job",
+      max_session_hours: 18,
+      backup_interval_minutes: 20,
+      total_epochs: 80,
+      reset_done_flag: false,
+    },
+  });
+  assert.equal(savedRelayRecent.boot_mode, "relay");
+  assert.equal(savedRelayRecent.accelerator, "CPU");
+  assert.equal(savedRelayRecent.relay_config?.gpu_type, "CPU");
+  assert.equal(savedRelayRecent.unverified_history_profile, false);
+
+  // #76: active relay without remote telemetry yet MUST NOT report "空闲"
+  const activeRelayPill = chatUtils.resolveVmStatusPillSpec(
+    {
+      name: "relay-vm",
+      on_server: true,
+      busy: null,
+      running_task: null,
+      telemetry: null,
+      relay: {
+        vm_name: "relay-vm",
+        running: true,
+        round: 1,
+        phase: "installing_env",
+        phase_label: "安装环境",
+        started_at: 1000,
+        round_started_at: 1000,
+        config: {},
+        logs: [],
+        child_pid: 123,
+      },
+    },
+    false,
+  );
+  assert.notEqual(activeRelayPill.text, "空闲");
+  assert.equal(activeRelayPill.text, "安装环境");
+
+  // #73: offline relay record card status & clear action
+  const offlineFailedPill = chatUtils.resolveVmStatusPillSpec(
+    {
+      name: "relay-failed-vm",
+      on_server: false,
+      busy: null,
+      running_task: null,
+      telemetry: null,
+      relay: {
+        vm_name: "relay-failed-vm",
+        running: false,
+        round: 1,
+        phase: "error",
+        phase_label: "训练异常",
+        started_at: 1000,
+        round_started_at: 1000,
+        config: {},
+        logs: ["Traceback: RuntimeError"],
+        child_pid: null,
+        last_error: "RuntimeError",
+      },
+    },
+    false,
+  );
+  assert.equal(offlineFailedPill.text, "接力失败 · 实例已下线");
+
+  const vmCardSrc = fs.readFileSync(path.join(repoRoot, "src", "components", "VmCard.tsx"), "utf8");
+  assert.doesNotMatch(vmCardSrc, /Boolean\(vm\.relay\?\.running\)\s*\|\|\s*relayExpanded/);
+  assert.match(vmCardSrc, /const showRelayDrawer = relayExpanded;/);
+  assert.match(vmCardSrc, /清除记录/);
+});
+
+// ───────────────────── Issues #78, #80, #82, #83, #87 ─────────────────────
+test("Issue #78: server list failure keeps offline relay card in billing-unknown state until confirmed unassigned", () => {
+  // 1) Overview unknown detection works for both explicit server_list_known=false and simulated error without cache
+  assert.equal(chatUtils.isOverviewServerListUnknown(null), true);
+  assert.equal(
+    chatUtils.isOverviewServerListUnknown({
+      timestamp: 2000,
+      server_list_known: false,
+      error: "503 Service Unavailable",
+      is_stale: false,
+    }),
+    true,
+  );
+  assert.equal(
+    chatUtils.isOverviewServerListUnknown({
+      timestamp: 2000,
+      error: "network error",
+      is_stale: false,
+    }),
+    true,
+  );
+  assert.equal(
+    chatUtils.isOverviewServerListUnknown({
+      timestamp: 2000,
+      server_list_known: true,
+      error: null,
+      is_stale: false,
+    }),
+    false,
+  );
+  assert.equal(
+    chatUtils.isOverviewServerListUnknown({
+      timestamp: 2000,
+      server_list_known: true,
+      error: null,
+      is_stale: true,
+      stale_reason: "timeout within 60s cache",
+    }),
+    false,
+  );
+
+  // 2) Offline relay pill reports 计费状态未知 when server list failed, and 实例已下线/已释放 only after confirmation
+  const offlineRelayVm = {
+    name: "relay-job",
+    on_server: false,
+    busy: null,
+    running_task: null,
+    telemetry: null,
+    relay: {
+      vm_name: "relay-job",
+      running: false,
+      round: 2,
+      phase: "error",
+      phase_label: "OOM",
+      started_at: 1000,
+      round_started_at: 1000,
+      config: {},
+      logs: ["err"],
+      child_pid: null,
+      last_error: "OOM",
+    },
+  };
+  const pillUnknown = chatUtils.resolveVmStatusPillSpec(offlineRelayVm, false, true);
+  assert.match(pillUnknown.text, /计费状态未知/);
+  assert.doesNotMatch(pillUnknown.text, /已下线|已释放/);
+
+  const pillConfirmed = chatUtils.resolveVmStatusPillSpec(offlineRelayVm, false, false);
+  assert.equal(pillConfirmed.text, "接力失败 · 实例已下线");
+
+  const headerSrc = fs.readFileSync(path.join(repoRoot, "src", "components", "Header.tsx"), "utf8");
+  const vmCardSrc = fs.readFileSync(path.join(repoRoot, "src", "components", "VmCard.tsx"), "utf8");
+  assert.match(headerSrc, /serverUnknown\s*\?\s*"未知"\s*:\s*ov\.server_count/);
+  assert.match(vmCardSrc, /isBillingUnknown[\s\S]{0,400}云端实例计费状态未知/);
+});
+
+test("Issue #82: mergeOverviewSnapshot ignores late older is_stale snapshots and preserves newer online VMs", () => {
+  const onlineVm = { name: "vm-online", on_server: true };
+  const freshSnap = {
+    timestamp: 2000,
+    seq: 5,
+    last_ok_timestamp: 2000,
+    is_stale: false,
+    stale_reason: null,
+    server_list_known: true,
+    auth_ok: true,
+    error: null,
+    ccu: { balance: 50, burn_rate_hourly: 1.96, assignments_count: 1 },
+    server_count: 1,
+    gdrive: null,
+    env: {},
+    vms: [onlineVm],
+    recent_sessions: [],
+  };
+
+  // 1) Late-arriving older stale snapshot (timestamp 1900 < 2000) MUST be completely ignored
+  const lateStale = {
+    ...freshSnap,
+    timestamp: 1900,
+    seq: undefined,
+    last_ok_timestamp: 1900,
+    is_stale: true,
+    stale_reason: "delayed timeout",
+    server_count: 0,
+    vms: [],
+  };
+  const afterLate = chatUtils.mergeOverviewSnapshot(freshSnap, lateStale);
+  assert.equal(afterLate, freshSnap);
+  assert.equal(afterLate.vms.length, 1);
+  assert.equal(afterLate.is_stale, false);
+
+  // 2) Same timestamp (2000) with older last_ok_timestamp (1950) MUST also be ignored
+  const sameSecOlderData = {
+    ...lateStale,
+    timestamp: 2000,
+    last_ok_timestamp: 1950,
+  };
+  assert.equal(chatUtils.mergeOverviewSnapshot(freshSnap, sameSecOlderData), freshSnap);
+
+  // 3) Out-of-order lower monotonic seq (seq 4 < 5) MUST be ignored even if timestamp matches
+  const lowerSeq = {
+    ...freshSnap,
+    seq: 4,
+    is_stale: true,
+    stale_reason: "out-of-order seq",
+    vms: [],
+  };
+  assert.equal(chatUtils.mergeOverviewSnapshot(freshSnap, lowerSeq), freshSnap);
+
+  // 4) Genuinely later query failure (timestamp 2010 > 2000) surfaces independent stale banner WITHOUT wiping online VMs
+  const laterFailure = {
+    ...freshSnap,
+    timestamp: 2010,
+    seq: 6,
+    last_ok_timestamp: 1900,
+    is_stale: true,
+    stale_reason: "503 upstream timeout",
+    server_count: 0,
+    vms: [],
+  };
+  const mergedLaterErr = chatUtils.mergeOverviewSnapshot(freshSnap, laterFailure);
+  assert.equal(mergedLaterErr.vms.length, 1);
+  assert.equal(mergedLaterErr.vms[0].name, "vm-online");
+  assert.equal(mergedLaterErr.last_ok_timestamp, 2000);
+  assert.equal(mergedLaterErr.is_stale, true);
+  assert.equal(mergedLaterErr.stale_reason, "503 upstream timeout");
+
+  // 5) Regression (#57 + #82): newer seq stale fallback whose timestamp was pinned to prev_ok_ts (2000)
+  //    after an 8s cached_fresh poll (timestamp 2003, seq 6, last_ok_timestamp 2000) MUST NOT be dropped!
+  const afterCachedPoll = {
+    ...freshSnap,
+    timestamp: 2003,
+    seq: 6,
+    last_ok_timestamp: 2000,
+    is_stale: false,
+    stale_reason: null,
+  };
+  const manualRefreshStaleFallback = {
+    ...freshSnap,
+    timestamp: 2000,
+    seq: 7,
+    last_ok_timestamp: 2000,
+    is_stale: true,
+    stale_reason: "502 Bad Gateway",
+  };
+  const mergedManualFail = chatUtils.mergeOverviewSnapshot(afterCachedPoll, manualRefreshStaleFallback);
+  assert.equal(mergedManualFail.is_stale, true);
+  assert.equal(mergedManualFail.stale_reason, "502 Bad Gateway");
+  assert.equal(mergedManualFail.seq, 7);
+  assert.equal(mergedManualFail.vms.length, 1);
+
+  // 6) #78 sanitization: resolveRelayCompletionView strips prior 停费核验通过 label when billingUnknown=true
+  const sanitizedView = chatUtils.resolveRelayCompletionView(
+    {
+      vm_name: "stopped-job",
+      running: false,
+      round: 1,
+      phase: "stopped",
+      phase_label: "已关闭接力并销毁云端实例（停费核验通过）",
+      started_at: 1000,
+      round_started_at: 1000,
+      config: {},
+      logs: [],
+      child_pid: null,
+      last_error: null,
+    },
+    true,
+  );
+  assert.doesNotMatch(sanitizedView.stateLabel, /停费核验通过|销毁云端实例|已释放/);
+  assert.match(sanitizedView.stateLabel, /云端计费状态未知/);
+});
+
+test("Issues #80, #83, #87: setScriptDirty IPC, legacy GDrive confirmation UI, and topmost window-close modal stacking", async () => {
+  mockTauriCore.invokeCalls.length = 0;
+  await apiMod.api.setScriptDirty(true);
+  await apiMod.api.confirmAppClose("force_exit");
+  await apiMod.api.startRelay(
+    "legacy-run",
+    {
+      gpu_type: "T4",
+      high_mem: true,
+      gdrive_dir: "gdrive:colab_relay",
+      max_session_hours: 20,
+      backup_interval_minutes: 30,
+      total_epochs: 10,
+      reset_done_flag: false,
+    },
+    "D:/ws",
+    "migrate",
+  );
+  assert.deepEqual(mockTauriCore.invokeCalls[0], {
+    cmd: "set_script_dirty",
+    args: { dirty: true },
+  });
+  assert.deepEqual(mockTauriCore.invokeCalls[1], {
+    cmd: "confirm_app_close",
+    args: { mode: "force_exit" },
+  });
+  assert.equal(mockTauriCore.invokeCalls[2].cmd, "start_relay");
+  assert.equal(mockTauriCore.invokeCalls[2].args.legacyGdriveAction, "migrate");
+
+  // #87: `.overlay.overlay-topmost` z-index strictly exceeds `.overlay` (100) and stays below `.toasts` (200)
+  const css = fs.readFileSync(path.join(repoRoot, "src", "styles.css"), "utf8");
+  const topmostMatch = css.match(/\.overlay\.overlay-topmost\s*\{\s*z-index:\s*(\d+)\s*;\s*\}/);
+  assert.ok(topmostMatch, ".overlay.overlay-topmost z-index rule must exist");
+  const topmostZ = Number(topmostMatch[1]);
+  assert.ok(topmostZ > 100 && topmostZ < 200, `Expected 100 < topmostZ < 200, got ${topmostZ}`);
+
+  // #87 & #83: CloseAppRelayDialog and CloseAppUnsavedScriptDialog must be rendered AFTER LlmChatModal & DeleteVmDialog in App.tsx
+  const appSrc = fs.readFileSync(path.join(repoRoot, "src", "App.tsx"), "utf8");
+  const chatIdx = appSrc.indexOf("<LlmChatModal");
+  const deleteIdx = appSrc.indexOf("<DeleteVmDialog");
+  const closeRelayIdx = appSrc.indexOf("<CloseAppRelayDialog");
+  const closeScriptIdx = appSrc.indexOf("<CloseAppUnsavedScriptDialog");
+  assert.ok(chatIdx > 0 && deleteIdx > 0 && closeRelayIdx > 0 && closeScriptIdx > 0);
+  assert.ok(
+    closeRelayIdx > chatIdx && closeRelayIdx > deleteIdx,
+    "CloseAppRelayDialog must appear after LlmChatModal and DeleteVmDialog in DOM order",
+  );
+  assert.ok(
+    closeScriptIdx > chatIdx && closeScriptIdx > deleteIdx,
+    "CloseAppUnsavedScriptDialog must appear after LlmChatModal and DeleteVmDialog in DOM order",
+  );
+  assert.match(appSrc, /close-requested-unsaved-script/);
+
+  const stopDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "StopRelayDialog.tsx"),
+    "utf8",
+  );
+  assert.match(stopDlgSrc, /export function CloseAppRelayDialog[\s\S]*?<Modal[\s\S]{0,80}topPriority/);
+  assert.match(stopDlgSrc, /export function CloseAppUnsavedScriptDialog[\s\S]*?<Modal[\s\S]{0,80}topPriority/);
+
+  const chatModalSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "LlmChatModal.tsx"),
+    "utf8",
+  );
+  assert.match(chatModalSrc, /if\s*\(modalEl\s*&&\s*!isTopmostModal\(modalEl\)\)\s*return;/);
+
+  const relayPanelSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "RelayPanel.tsx"),
+    "utf8",
+  );
+  assert.match(relayPanelSrc, /迁移旧断点并续训/);
+  assert.match(relayPanelSrc, /忽略旧断点全新开始/);
+  assert.match(relayPanelSrc, /legacyConfirmPending/);
+});
+
+test("Per-instance Keep-Alive: default creation config, interval validation, badge states, and IPC wiring", async () => {
+  assert.equal(chatUtils.isValidKeepAliveInterval(30), true);
+  assert.equal(chatUtils.isValidKeepAliveInterval(90), true);
+  assert.equal(chatUtils.isValidKeepAliveInterval(600), true);
+  assert.equal(chatUtils.isValidKeepAliveInterval(29), false);
+  assert.equal(chatUtils.isValidKeepAliveInterval(601), false);
+  assert.equal(chatUtils.isValidKeepAliveInterval(Number.NaN), false);
+
+  const badgeOff = chatUtils.resolveKeepAliveBadge(null);
+  assert.equal(badgeOff.tone, "muted");
+  assert.equal(badgeOff.label, "保活未开启");
+
+  const badgeBusy = chatUtils.resolveKeepAliveBadge({
+    enabled: true,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "active",
+    last_ok_at: 1795400000,
+    kernel_ping_state: "skipped_busy",
+    success_count: 5,
+    last_error: null,
+  });
+  assert.equal(badgeBusy.tone, "ok");
+  assert.match(badgeBusy.label, /保活运行中 \(90s\)/);
+  assert.match(badgeBusy.detail, /运行时连接正常/);
+  assert.match(badgeBusy.detail, /忙时已自动避让/);
+  assert.match(badgeBusy.detail, /累计 5 次/);
+
+  const badgeConnectionOnly = chatUtils.resolveKeepAliveBadge({
+    enabled: true,
+    state: "active",
+    interval_seconds: 90,
+    kernel_ping: false,
+    kernel_ping_state: "disabled",
+    last_ok_at: 1795400000,
+  });
+  assert.equal(badgeConnectionOnly.label, "连接检查运行中 (90s)");
+  assert.equal(badgeConnectionOnly.detail, "运行时连接正常 · Kernel 脉冲已关闭");
+
+  const badgeErr = chatUtils.resolveKeepAliveBadge({
+    enabled: true,
+    interval_seconds: 60,
+    kernel_ping: true,
+    state: "error",
+    last_ok_at: null,
+    kernel_ping_state: "error",
+    success_count: 0,
+    last_error: "运行时连接检查失败: HTTP 503",
+  });
+  assert.equal(badgeErr.tone, "bad");
+  assert.equal(badgeErr.label, "保活异常");
+  assert.match(badgeErr.detail, /HTTP 503/);
+
+  const restored = chatUtils.buildPresetFromRecentSession({
+    session_name: "a100-work",
+    workspace_name: "proj",
+    workspace_path: "C:/proj",
+    endpoint: "m-s-ka01",
+    accelerator: "A100",
+    machine_shape: "HIGH_RAM",
+    created_at: null,
+    terminated_at: null,
+    last_event_at: "2026-11-24T00:00:00Z",
+    exec_count: 1,
+    file_op_count: 0,
+    last_summary: "done",
+    boot_mode: "general",
+    keep_alive: { enabled: true, interval_seconds: 180, kernel_ping: false },
+    profile_saved: true,
+  });
+  assert.deepEqual(restored.keep_alive, {
+    enabled: true,
+    interval_seconds: 180,
+    kernel_ping: false,
+  });
+
+  mockTauriCore.invokeCalls.length = 0;
+  await apiMod.api.setVmKeepAlive("vm-a100", {
+    enabled: true,
+    interval_seconds: 90,
+    kernel_ping: true,
+  });
+  await apiMod.api.pingVmKeepAlive("vm-a100");
+  assert.deepEqual(mockTauriCore.invokeCalls[0], {
+    cmd: "set_vm_keep_alive",
+    args: {
+      name: "vm-a100",
+      config: { enabled: true, interval_seconds: 90, kernel_ping: true },
+    },
+  });
+  assert.deepEqual(mockTauriCore.invokeCalls[1], {
+    cmd: "ping_vm_keep_alive",
+    args: { name: "vm-a100" },
+  });
+
+  const createDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "CreateVmDialog.tsx"),
+    "utf8",
+  );
+  assert.match(createDlgSrc, /DEFAULT_KEEP_ALIVE/);
+  assert.match(createDlgSrc, /实例保活策略/);
+  assert.match(createDlgSrc, /keep_alive:\s*normalizeKeepAliveConfig\(/);
+
+  const vmCardSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "VmCard.tsx"),
+    "utf8",
+  );
+  assert.match(vmCardSrc, /function KeepAliveBar/);
+  assert.match(vmCardSrc, /立即保活/);
+});
+
+test("GPU grab policy modes, cancel_create_vm API, countdown formatter, and Relay handover prep", async () => {
+  assert.equal(chatUtils.isValidGrabRetrySeconds(15), true);
+  assert.equal(chatUtils.isValidGrabRetrySeconds(3), false);
+  assert.equal(chatUtils.isValidGrabRetrySeconds(301), false);
+  assert.equal(chatUtils.isValidRelayGrabTimeoutMinutes(60), true);
+  assert.equal(chatUtils.isValidRelayGrabTimeoutMinutes(0), false);
+  assert.equal(chatUtils.isValidRelayGrabTimeoutMinutes(1441), false);
+
+  const parsedFb = chatUtils.parseFallbackGpuInput("g4, L4, A100, g4, rtx4090", "A100");
+  assert.deepEqual(parsedFb.gpus, ["G4", "L4"]);
+  assert.deepEqual(parsedFb.invalid, ["rtx4090"]);
+
+  const waitingDesc = chatUtils.describeGrabStatus(
+    {
+      active: true,
+      mode: "persistent",
+      attempt: 3,
+      max_attempts: null,
+      budget_minutes: null,
+      retry_seconds: 15,
+      started_at: 1000,
+      next_retry_at: 1082,
+      target_gpu: "G4",
+      phase: "waiting_retry",
+      last_error: "云端 [A100] 算力当前库存暂时售罄",
+    },
+    1070,
+  );
+  assert.ok(waitingDesc);
+  assert.equal(waitingDesc.countdownSec, 12);
+  assert.equal(waitingDesc.elapsedSec, 70);
+  assert.match(waitingDesc.headline, /12 秒后自动发起第 4 次抢卡/);
+  assert.match(waitingDesc.subline, /一直抢卡模式/);
+
+  const pillSpec = chatUtils.resolveVmStatusPillSpec(
+    {
+      name: "grab-vm",
+      busy: "creating",
+      on_server: false,
+      grab_status: {
+        active: true,
+        mode: "persistent",
+        attempt: 5,
+        max_attempts: null,
+        budget_minutes: null,
+        retry_seconds: 15,
+        started_at: 1000,
+        next_retry_at: null,
+        target_gpu: "A100",
+        phase: "requesting",
+        last_error: null,
+      },
+    },
+    false,
+  );
+  assert.equal(pillSpec.cls, "pill-amber");
+  assert.equal(pillSpec.pulse, true);
+  assert.match(pillSpec.text, /一直抢卡中 · 第 5 次/);
+
+  mockTauriCore.invokeCalls.length = 0;
+  await apiMod.api.cancelCreateVm("grab-vm");
+  assert.deepEqual(mockTauriCore.invokeCalls[0], {
+    cmd: "cancel_create_vm",
+    args: { name: "grab-vm" },
+  });
+
+  const createDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "CreateVmDialog.tsx"),
+    "utf8",
+  );
+  assert.match(createDlgSrc, /开机抢卡策略/);
+  assert.match(createDlgSrc, /放弃抢卡/);
+  assert.match(createDlgSrc, /转入后台抢卡/);
+  assert.match(createDlgSrc, /换棒抢卡策略与时间预算/);
+
+  const relayPanelSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "RelayPanel.tsx"),
+    "utf8",
+  );
+  assert.match(relayPanelSrc, /抢卡策略/);
+  assert.match(relayPanelSrc, /备选卡型/);
+});
+
+// ───────────────────── Issues #91, #96, #97, #98 & Historical Gap Closures ─────────────────────
+test("Issues #91, #96, #97, #98: ping outcome, disabled interval normalization, persistence surfacing, and card custom interval", () => {
+  // #91: evaluatePingKeepAliveOutcome must treat !tunnel_ok / kernel error / last_error as error even when state === "paused"
+  const pausedTunnelFail = chatUtils.evaluatePingKeepAliveOutcome("vm-paused", {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: null,
+    last_attempt_at: 1795400000,
+    tunnel_ok: false,
+    kernel_ping_state: "disabled",
+    success_count: 0,
+    consecutive_failures: 1,
+    last_error: null,
+  });
+  assert.equal(pausedTunnelFail.ok, false);
+  assert.equal(pausedTunnelFail.toastKind, "error");
+  assert.doesNotMatch(pausedTunnelFail.message, /运行时连接正常/);
+
+  const pausedKernelFail = chatUtils.evaluatePingKeepAliveOutcome("vm-paused", {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: null,
+    last_attempt_at: 1795400000,
+    tunnel_ok: true,
+    kernel_ping_state: "error",
+    success_count: 0,
+    consecutive_failures: 1,
+    last_error: null,
+  });
+  assert.equal(pausedKernelFail.ok, false);
+  assert.equal(pausedKernelFail.toastKind, "error");
+  assert.doesNotMatch(pausedKernelFail.message, /运行时连接正常/);
+
+  const pausedLastErr = chatUtils.evaluatePingKeepAliveOutcome("vm-paused", {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: null,
+    last_attempt_at: 1795400000,
+    tunnel_ok: true,
+    kernel_ping_state: "ok",
+    success_count: 0,
+    consecutive_failures: 1,
+    last_error: "502 Bad Gateway",
+  });
+  assert.equal(pausedLastErr.ok, false);
+  assert.equal(pausedLastErr.toastKind, "error");
+  assert.match(pausedLastErr.message, /502 Bad Gateway/);
+
+  const pausedSingleShotOk = chatUtils.evaluatePingKeepAliveOutcome("vm-paused", {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: 1795400000,
+    last_attempt_at: 1795400000,
+    tunnel_ok: true,
+    kernel_ping_state: "ok",
+    success_count: 1,
+    consecutive_failures: 0,
+    last_error: null,
+  });
+  assert.equal(pausedSingleShotOk.ok, true);
+  assert.equal(pausedSingleShotOk.toastKind, "success");
+  assert.match(pausedSingleShotOk.message, /单次检查正常/);
+  assert.match(pausedSingleShotOk.message, /自动保活仍为关闭状态/);
+
+  const enabledOk = chatUtils.evaluatePingKeepAliveOutcome("vm-on", {
+    enabled: true,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "active",
+    last_ok_at: 1795400000,
+    last_attempt_at: 1795400000,
+    tunnel_ok: true,
+    kernel_ping_state: "skipped_no_kernel",
+    success_count: 1,
+    consecutive_failures: 0,
+    last_error: null,
+  });
+  assert.equal(enabledOk.ok, true);
+  assert.equal(enabledOk.toastKind, "success");
+  assert.match(enabledOk.message, /运行时连接正常/);
+  assert.match(enabledOk.message, /暂无活跃 Kernel/);
+
+  // #91: resolveKeepAliveBadge distinguishes fresh paused vs paused single-shot failure
+  const freshPaused = chatUtils.resolveKeepAliveBadge({
+    enabled: false,
+    state: "paused",
+    tunnel_ok: false,
+    last_attempt_at: null,
+    last_error: null,
+  });
+  assert.equal(freshPaused.tone, "muted");
+  assert.equal(freshPaused.label, "保活未开启");
+
+  const pausedPingErrBadge = chatUtils.resolveKeepAliveBadge({
+    enabled: false,
+    state: "paused",
+    tunnel_ok: false,
+    last_attempt_at: 1795400000,
+    last_error: null,
+  });
+  assert.equal(pausedPingErrBadge.tone, "bad");
+  assert.match(pausedPingErrBadge.label, /单次检查异常/);
+
+  // #96: normalizeKeepAliveConfig normalizes invalid intervals when disabled, preserves when enabled
+  assert.deepEqual(
+    chatUtils.normalizeKeepAliveConfig({ enabled: false, interval_seconds: 29, kernel_ping: true }),
+    { enabled: false, interval_seconds: 90, kernel_ping: true },
+  );
+  assert.deepEqual(
+    chatUtils.normalizeKeepAliveConfig({ enabled: false, interval_seconds: 601, kernel_ping: false }),
+    { enabled: false, interval_seconds: 90, kernel_ping: false },
+  );
+  assert.deepEqual(
+    chatUtils.normalizeKeepAliveConfig({
+      enabled: false,
+      interval_seconds: Number.NaN,
+      kernel_ping: true,
+    }),
+    { enabled: false, interval_seconds: 90, kernel_ping: true },
+  );
+  assert.deepEqual(
+    chatUtils.normalizeKeepAliveConfig({ enabled: false, interval_seconds: 180, kernel_ping: true }),
+    { enabled: false, interval_seconds: 180, kernel_ping: true },
+  );
+  assert.deepEqual(
+    chatUtils.normalizeKeepAliveConfig({ enabled: true, interval_seconds: 29, kernel_ping: true }),
+    { enabled: true, interval_seconds: 29, kernel_ping: true },
+  );
+
+  // #97: resolveKeepAliveBadge surfaces persistence failures even when last_ok_at is set or enabled is false
+  const activePersistFail = chatUtils.resolveKeepAliveBadge({
+    enabled: true,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "active",
+    last_ok_at: 1795400000,
+    kernel_ping_state: "ok",
+    profile_saved: false,
+    persistence_error: "Permission denied writing pilot_session_profiles.json",
+  });
+  assert.equal(activePersistFail.tone, "warn");
+  assert.notEqual(activePersistFail.tone, "ok");
+  assert.match(activePersistFail.label, /档案未保存/);
+  assert.match(activePersistFail.persistenceError, /Permission denied/);
+
+  const pausedPersistFail = chatUtils.resolveKeepAliveBadge({
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: null,
+    profile_saved: false,
+    persistence_error: null,
+  });
+  assert.equal(pausedPersistFail.tone, "warn");
+  assert.notEqual(pausedPersistFail.tone, "muted");
+  assert.match(pausedPersistFail.label, /档案未保存/);
+  assert.ok(pausedPersistFail.persistenceError);
+
+  // #98: parseKeepAliveIntervalInput & KEEP_ALIVE_PRESET_INTERVALS
+  assert.deepEqual([...chatUtils.KEEP_ALIVE_PRESET_INTERVALS], [60, 90, 180, 300]);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("30"), 30);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("473"), 473);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("600"), 600);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("29"), null);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("601"), null);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("47.5"), null);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput(""), null);
+  assert.equal(chatUtils.parseKeepAliveIntervalInput("abc"), null);
+
+  // Source wiring checks for App.tsx, CreateVmDialog.tsx, VmCard.tsx, types.ts
+  const typesSrc = fs.readFileSync(path.join(repoRoot, "src", "types.ts"), "utf8");
+  assert.match(typesSrc, /profile_saved\?:\s*boolean/);
+  assert.match(typesSrc, /persistence_error\?:\s*string \| null/);
+
+  const appSrc = fs.readFileSync(path.join(repoRoot, "src", "App.tsx"), "utf8");
+  assert.match(appSrc, /evaluatePingKeepAliveOutcome/);
+  assert.match(appSrc, /profile_saved === false/);
+  assert.match(appSrc, /persistence_error/);
+
+  const createDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "CreateVmDialog.tsx"),
+    "utf8",
+  );
+  assert.match(createDlgSrc, /normalizeKeepAliveConfig/);
+
+  const vmCardSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "VmCard.tsx"),
+    "utf8",
+  );
+  assert.doesNotMatch(vmCardSrc, /<select[^>]*className="ka-select"/);
+  assert.match(vmCardSrc, /type="number"[\s\S]*?className=\{`ka-interval-input/);
+  assert.match(vmCardSrc, /KEEP_ALIVE_PRESET_INTERVALS/);
+  assert.match(vmCardSrc, /重试保存策略/);
+  assert.match(vmCardSrc, /单次保活/);
+});
+
+test("Historical gap closures (#48, #59, #64, #66, #71)", async () => {
+  // #64: isLlmVmReady returns false when deploy_error is set even if stale telemetry.llm.online is true
+  const failedWithStaleLlm = {
+    name: "llm-stale",
+    on_server: true,
+    busy: null,
+    deploy_error: "vLLM exited with code 1",
+    telemetry: {
+      llm: { online: true, backend_healthy: true, role: "active" },
+    },
+  };
+  assert.equal(chatUtils.isLlmVmReady(failedWithStaleLlm), false);
+
+  // #66: .modal-head and .modal-foot flex-shrink: 0, .modal-body min-height: 0 and overflow-y: auto
+  const css = fs.readFileSync(path.join(repoRoot, "src", "styles.css"), "utf8");
+  assert.match(css, /\.modal-head\s*\{[^}]*flex-shrink:\s*0/);
+  assert.match(css, /\.modal-foot\s*\{[^}]*flex-shrink:\s*0/);
+  assert.match(css, /\.modal-body\s*\{[^}]*min-height:\s*0[^}]*overflow-y:\s*auto/);
+
+  // #59: api.rotateLlmApiKey IPC & App.tsx empty-key guard
+  mockTauriCore.invokeCalls.length = 0;
+  await apiMod.api.rotateLlmApiKey("llm-blue", "sk-custom-123");
+  assert.deepEqual(mockTauriCore.invokeCalls[0], {
+    cmd: "rotate_llm_api_key",
+    args: { vmName: "llm-blue", customKey: "sk-custom-123" },
+  });
+  const appSrc = fs.readFileSync(path.join(repoRoot, "src", "App.tsx"), "utf8");
+  assert.match(appSrc, /!updated \|\| typeof updated\.api_key !== "string" \|\| !updated\.api_key\.trim\(\)/);
+
+  // #71 & #48: ScriptDialog scrollIntoView on confirmDiscard & DeleteVmDialog checks vm.llm_api
+  const scriptDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "ScriptDialog.tsx"),
+    "utf8",
+  );
+  assert.match(scriptDlgSrc, /confirmDiscardRef\.current\?\.scrollIntoView/);
+
+  const deleteDlgSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "DeleteVmDialog.tsx"),
+    "utf8",
+  );
+  assert.match(deleteDlgSrc, /!!vm\.llm_api/);
+  assert.match(deleteDlgSrc, /vm\.busy === "deploying_llm"/);
+  assert.match(deleteDlgSrc, /vm\.telemetry\?\.threads\?\.llm_process/);
+});
+
+test("Iteration 2 regressions: resolveKeepAliveBadge combinatorial invariants, KeepAliveBar Escape/focus guards, and #48 explicit offline slot isolation", () => {
+  // 1) Explicit Challenger #91 / #97 badge regression cases
+  const activeLastOkWithTunnelAndKernelErr = chatUtils.resolveKeepAliveBadge({
+    enabled: true,
+    state: "active",
+    last_ok_at: 1699999900,
+    tunnel_ok: false,
+    last_attempt_at: 1700000000,
+    kernel_ping_state: "error",
+    last_error: "HTTP 503",
+  });
+  assert.equal(activeLastOkWithTunnelAndKernelErr.tone, "bad");
+  assert.match(activeLastOkWithTunnelAndKernelErr.detail, /HTTP 503/);
+
+  const activeLastOkWithLastErrorOnly = chatUtils.resolveKeepAliveBadge({
+    enabled: true,
+    state: "active",
+    last_ok_at: 1699999900,
+    tunnel_ok: true,
+    kernel_ping_state: "ok",
+    last_error: "HTTP 503",
+  });
+  assert.equal(activeLastOkWithLastErrorOnly.tone, "bad");
+  assert.match(activeLastOkWithLastErrorOnly.detail, /HTTP 503/);
+
+  const pausedKernelErrorOnly = chatUtils.resolveKeepAliveBadge({
+    enabled: false,
+    state: "paused",
+    tunnel_ok: true,
+    kernel_ping: true,
+    kernel_ping_state: "error",
+    last_error: null,
+  });
+  assert.equal(pausedKernelErrorOnly.tone, "bad");
+  assert.match(pausedKernelErrorOnly.label, /单次检查异常/);
+
+  const pausedFailAndPersistFail = chatUtils.resolveKeepAliveBadge({
+    enabled: false,
+    state: "error",
+    last_error: "503",
+    profile_saved: false,
+    persistence_error: "Permission denied",
+  });
+  assert.equal(pausedFailAndPersistFail.tone, "bad");
+  assert.match(pausedFailAndPersistFail.detail, /503/);
+  assert.match(pausedFailAndPersistFail.detail, /Permission denied/);
+  assert.equal(pausedFailAndPersistFail.persistenceError, "Permission denied");
+
+  const freshPaused = chatUtils.resolveKeepAliveBadge({
+    enabled: false,
+    state: "paused",
+    tunnel_ok: false,
+    last_attempt_at: null,
+    last_error: null,
+    kernel_ping_state: "disabled",
+  });
+  assert.equal(freshPaused.tone, "muted");
+  assert.equal(freshPaused.persistenceError, null);
+
+  // Combinatorial invariant check across failure & persistence matrix
+  for (const enabled of [true, false]) {
+    for (const state of ["active", "paused", "error", "idle"]) {
+      for (const tunnel_ok of [true, false]) {
+        for (const kernel_ping_state of ["ok", "error", "disabled", "skipped_busy"]) {
+          for (const last_error of [null, "HTTP 503"]) {
+            for (const last_attempt_at of [null, 1700000000]) {
+              for (const last_ok_at of [null, 1699999900]) {
+                for (const profile_saved of [true, false]) {
+                  for (const persistence_error of [null, "Permission denied"]) {
+                    const ka = {
+                      enabled,
+                      state,
+                      tunnel_ok,
+                      kernel_ping: true,
+                      kernel_ping_state,
+                      last_error,
+                      last_attempt_at,
+                      last_ok_at,
+                      profile_saved,
+                      persistence_error,
+                    };
+                    const badge = chatUtils.resolveKeepAliveBadge(ka);
+                    const expectedFail =
+                      state === "error" ||
+                      Boolean(last_error) ||
+                      kernel_ping_state === "error" ||
+                      (last_attempt_at !== null && tunnel_ok === false);
+                    const expectedPersistFail = !profile_saved || Boolean(persistence_error);
+                    if (expectedFail) {
+                      assert.equal(badge.tone, "bad", `Expected bad for ${JSON.stringify(ka)}`);
+                    }
+                    if (expectedPersistFail) {
+                      assert.notEqual(badge.tone, "ok");
+                      assert.notEqual(badge.tone, "muted");
+                      assert.ok(badge.persistenceError, `Expected persistenceError for ${JSON.stringify(ka)}`);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 2) KeepAliveBar Escape guard & intervalFocused reset when !enabled || busy || disabled
+  const vmCardSrc = fs.readFileSync(
+    path.join(repoRoot, "src", "components", "VmCard.tsx"),
+    "utf8",
+  );
+  assert.match(vmCardSrc, /const skipBlurCommitRef = useRef\(false\)/);
+  assert.match(
+    vmCardSrc,
+    /e\.key === "Escape"[\s\S]*?skipBlurCommitRef\.current = true;[\s\S]*?e\.currentTarget\.blur\(\)/,
+  );
+  assert.match(
+    vmCardSrc,
+    /onBlur=\{\(\) => \{[\s\S]*?if \(skipBlurCommitRef\.current\) \{[\s\S]*?skipBlurCommitRef\.current = false;[\s\S]*?return;/,
+  );
+  assert.match(
+    vmCardSrc,
+    /if \(!enabled \|\| busy \|\| disabled\) \{[\s\S]*?setIntervalFocused\(false\)/,
+  );
+
+  // 3) #48: explicit offline blue_session must NOT hijack `${prefix}-${slot}`
+  const customOfflineStatus = chatUtils.resolveBlueGreenStatus(
+    { session_prefix: "llm", blue_session: "custom-blue", active_slot: "blue" },
+    [
+      {
+        name: "llm-blue",
+        on_server: true,
+        telemetry: { llm: { online: true, backend_healthy: true, slot: "blue", role: "active" } },
+      },
+    ],
+  );
+  assert.equal(customOfflineStatus.blueVm, undefined);
+});
+
+test("M4 Tier-5 regressions: decoupled Rust KeepAliveStatus persistence_error vs runtime health (#97, #91)", () => {
+  // 1) Paused + never pinged + profile_saved: false -> warn badge (not error/bad), single persistence_error
+  const pausedNeverPingedUnsaved = {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: null,
+    last_attempt_at: null,
+    tunnel_ok: false,
+    kernel_ping_state: "disabled",
+    success_count: 0,
+    consecutive_failures: 0,
+    last_error: null,
+    profile_saved: false,
+    persistence_error: "disk read-only",
+  };
+  const badgePausedUnsaved = chatUtils.resolveKeepAliveBadge(pausedNeverPingedUnsaved);
+  assert.equal(badgePausedUnsaved.tone, "warn");
+  assert.equal(badgePausedUnsaved.label, "保活未开启 · 档案未保存");
+  assert.equal(badgePausedUnsaved.detail, "disk read-only");
+  assert.equal(badgePausedUnsaved.persistenceError, "disk read-only");
+
+  // 2) Paused + ping succeeded + profile_saved: false -> warn toast + warn badge without duplicating error
+  const pausedPingOkUnsaved = {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "paused",
+    last_ok_at: 1732630500,
+    last_attempt_at: 1732630500,
+    tunnel_ok: true,
+    kernel_ping_state: "ok",
+    success_count: 1,
+    consecutive_failures: 0,
+    last_error: null,
+    profile_saved: false,
+    persistence_error: "disk read-only",
+  };
+  const pingWarnOutcome = chatUtils.evaluatePingKeepAliveOutcome("vm-97", pausedPingOkUnsaved);
+  assert.equal(pingWarnOutcome.ok, true);
+  assert.equal(pingWarnOutcome.toastKind, "warn");
+  assert.match(pingWarnOutcome.message, /单次检查正常/);
+  assert.match(pingWarnOutcome.message, /保活档案未保存（disk read-only）/);
+  const badgePausedPingOkUnsaved = chatUtils.resolveKeepAliveBadge(pausedPingOkUnsaved);
+  assert.equal(badgePausedPingOkUnsaved.tone, "warn");
+  assert.equal(badgePausedPingOkUnsaved.label, "保活未开启 · 档案未保存");
+  assert.equal(badgePausedPingOkUnsaved.detail, "disk read-only");
+
+  // 3) Enabled + ping succeeded + profile_saved: false -> warn toast + warn badge
+  const enabledPingOkUnsaved = {
+    ...pausedPingOkUnsaved,
+    enabled: true,
+    state: "active",
+  };
+  const enabledWarnOutcome = chatUtils.evaluatePingKeepAliveOutcome("vm-97", enabledPingOkUnsaved);
+  assert.equal(enabledWarnOutcome.ok, true);
+  assert.equal(enabledWarnOutcome.toastKind, "warn");
+  const badgeEnabledUnsaved = chatUtils.resolveKeepAliveBadge(enabledPingOkUnsaved);
+  assert.equal(badgeEnabledUnsaved.tone, "warn");
+  assert.equal(badgeEnabledUnsaved.label, "保活运行中 (90s) · 档案未保存");
+  assert.equal(badgeEnabledUnsaved.detail, "disk read-only");
+
+  // 4) Runtime ping fails + profile_saved: false -> error toast + bad badge with clean deduplication
+  const pingErrUnsaved = {
+    enabled: false,
+    interval_seconds: 90,
+    kernel_ping: true,
+    state: "error",
+    last_ok_at: null,
+    last_attempt_at: 1732630500,
+    tunnel_ok: false,
+    kernel_ping_state: "error",
+    success_count: 0,
+    consecutive_failures: 1,
+    last_error: "HTTP 503",
+    profile_saved: false,
+    persistence_error: "disk read-only",
+  };
+  const pingErrOutcome = chatUtils.evaluatePingKeepAliveOutcome("vm-97", pingErrUnsaved);
+  assert.equal(pingErrOutcome.ok, false);
+  assert.equal(pingErrOutcome.toastKind, "error");
+  const badgePingErrUnsaved = chatUtils.resolveKeepAliveBadge(pingErrUnsaved);
+  assert.equal(badgePingErrUnsaved.tone, "bad");
+  assert.equal(badgePingErrUnsaved.detail, "HTTP 503；disk read-only");
+  assert.equal(badgePingErrUnsaved.persistenceError, "disk read-only");
+
+  const identicalErrBadge = chatUtils.resolveKeepAliveBadge({
+    ...pingErrUnsaved,
+    last_error: "disk read-only",
+    persistence_error: "disk read-only",
+  });
+  assert.equal(identicalErrBadge.detail, "disk read-only");
 });
